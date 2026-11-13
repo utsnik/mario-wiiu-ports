@@ -23,6 +23,8 @@
 
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <coreinit/dynload.h>
+#include <whb/log.h>
 
 namespace {
 
@@ -52,6 +54,12 @@ constexpr uint32_t kThreads = 16;
 constexpr uint32_t kIncSlots = 4096;
 constexpr uint32_t kStackStartOffset = 0x394;  // OSThread::stackStart (the top)
 constexpr uint32_t kStackEndOffset = 0x398;    // OSThread::stackEnd (the bottom)
+// Keep depth-exhausted as a sanity check after reaching the owning game object.
+constexpr uint32_t kHotCallerMaxDepth = 24;
+constexpr uint32_t kSlowSlots = 1024;
+constexpr uint32_t kSlowIncSlots = 1024;
+constexpr uint32_t kSlowHistBins = 32; // 2 ms bins, with the last bin open-ended
+constexpr uint32_t kSlowDrawDoneLr = 0x0c14ef80;
 
 struct Table {
 	uint32_t pc[kSlots];
@@ -69,6 +77,21 @@ struct Table {
 	// function and its callees cost together (inclusive).
 	uint32_t incPc[kIncSlots], incCount[kIncSlots];
 	uint32_t incDropped;
+};
+
+/* The slowprof tables deliberately keep only the two views needed by the
+ * diagnostic.  They are swapped at the frame boundary, so the alarm never
+ * writes a table that the main thread is merging. */
+struct SlowTable {
+	uint32_t pc[kSlowSlots], count[kSlowSlots];
+	uint32_t incPc[kSlowIncSlots], incCount[kSlowIncSlots];
+	uint32_t samples, dropped, incDropped;
+};
+
+struct SlowBucket {
+	uint32_t pc[kSlowSlots], count[kSlowSlots];
+	uint32_t incPc[kSlowIncSlots], incCount[kSlowIncSlots];
+	uint32_t frames, samples;
 };
 
 alignas(64) uint8_t s_alarm[0x80];
@@ -102,11 +125,80 @@ void learn_leaf_pc(uint32_t pc)
 }
 
 inline bool stack_addr(uint32_t a) { return a >= 0x10000000u && a < 0x50000000u && !(a & 3); }
+inline bool stack_word(uint32_t a, uint32_t bottom, uint32_t top)
+{
+	return (a & 7) == 0 && a >= bottom && a <= top - 8;
+}
 // OSGetSymbolName dereferences what it is given: only code addresses (system
 // RPLs and the game's text) may be named. A stray stack word faulted it.
 inline bool code_addr(uint32_t a) { return a >= 0x01000000u && a < 0x10000000u && !(a & 3); }
+inline bool code_addr_(uint32_t a) { return code_addr(a); }
 
-inline bool code_addr_(uint32_t a) { return a >= 0x01000000u && a < 0x10000000u && !(a & 3); }
+extern "C" void sms_wiiu_hotcaller_capture(uint32_t out[8]);
+
+uint32_t s_hotTextStart;
+uint32_t s_hotTextEnd;
+uint32_t s_hotTextState;  // 0 = unresolved, 1 = resolved, 2 = unavailable
+
+bool hotcaller_resolve_text_range()
+{
+	if (s_hotTextState == 1) return true;
+	if (s_hotTextState == 2) return false;
+
+	const uint32_t target = reinterpret_cast<uint32_t>(&sms_wiiu_hotcaller_capture);
+	const int32_t count = OSDynLoad_GetNumberOfRPLs();
+	OSDynLoad_NotifyData info;
+	for (int32_t i = 0; i < count; ++i) {
+		if (!OSDynLoad_GetRPLInfo(static_cast<uint32_t>(i), 1, &info)) continue;
+		const uint64_t end = static_cast<uint64_t>(info.textAddr) + info.textSize;
+		if (target < info.textAddr || static_cast<uint64_t>(target) >= end) continue;
+		s_hotTextStart = info.textAddr;
+		s_hotTextEnd = static_cast<uint32_t>(end);
+		s_hotTextState = 1;
+		WHBLogPrintf("SMS Wii U: [hotcaller5] text=%08x..%08x",
+		             unsigned(s_hotTextStart), unsigned(s_hotTextEnd));
+		return true;
+	}
+	s_hotTextState = 2;
+	WHBLogPrintf("SMS Wii U: [hotcaller5] no-text-range");
+	return false;
+}
+
+inline bool hotcaller_text_addr(uint32_t a)
+{
+	return a >= s_hotTextStart && a < s_hotTextEnd && !(a & 3);
+}
+
+enum HotCallerExit {
+	kHotBadThread,
+	kHotBadStack,
+	kHotFrameNextOob,
+	kHotRetOob,
+	kHotSymbolFiltered,
+	kHotDepthExhausted,
+	kHotSuccess,
+	kHotExitCount,
+};
+
+uint32_t s_hotCallerCounts[kHotExitCount];
+WutTime s_hotCallerLastReport;
+uint32_t s_hotCallerWalks;
+void hotcaller_report(void)
+{
+	const WutTime now = wut_OSGetTime();
+	if (!s_hotCallerLastReport) {
+		s_hotCallerLastReport = now;
+		return;
+	}
+	if (now - s_hotCallerLastReport < kTimerHz) return;
+	s_hotCallerLastReport = now;
+	WHBLogPrintf("SMS Wii U: [hotlist] hotcaller5 counts bad-thread=%u bad-stack=%u frame-next-oob=%u ret-oob=%u symbol-filtered=%u depth-exhausted=%u success=%u",
+	             unsigned(s_hotCallerCounts[kHotBadThread]), unsigned(s_hotCallerCounts[kHotBadStack]),
+	             unsigned(s_hotCallerCounts[kHotFrameNextOob]), unsigned(s_hotCallerCounts[kHotRetOob]),
+	             unsigned(s_hotCallerCounts[kHotSymbolFiltered]), unsigned(s_hotCallerCounts[kHotDepthExhausted]),
+	             unsigned(s_hotCallerCounts[kHotSuccess]));
+	std::memset(s_hotCallerCounts, 0, sizeof(s_hotCallerCounts));
+}
 
 void count_inclusive(Table& t, const uint8_t* ctx)
 {
@@ -163,6 +255,176 @@ void* s_workerThread;
 volatile uint32_t s_wactive;
 bool s_wrunning;
 
+bool s_slowOn;
+volatile uint32_t s_slowActive;
+SlowTable s_slowFrame[2];
+SlowBucket s_slowBucket[2]; // 0 normal, 1 slow
+uint32_t s_slowFrameNo;
+uint32_t s_slowPreHist[kSlowHistBins];
+uint32_t s_slowFrameIds[256];
+uint32_t s_slowFrameIdCount;
+uint32_t s_slowDrawDoneUs;
+uint32_t s_slowWindowSamples;
+WutTime s_slowWindowCost;
+
+inline void slow_count_pc(SlowTable& t, uint32_t pc)
+{
+	uint32_t slot = slot_of(pc, kSlowSlots);
+	for (uint32_t probe = 0; probe < 16; ++probe, slot = (slot + 1) % kSlowSlots) {
+		if (t.pc[slot] == pc) { ++t.count[slot]; return; }
+		if (!t.pc[slot]) { t.pc[slot] = pc; t.count[slot] = 1; return; }
+	}
+	++t.dropped;
+}
+
+void slow_count_inclusive(SlowTable& t, const uint8_t* ctx)
+{
+	const uint32_t top = *reinterpret_cast<const uint32_t*>(ctx + kStackStartOffset);
+	const uint32_t bottom = *reinterpret_cast<const uint32_t*>(ctx + kStackEndOffset);
+	uint32_t sp = *reinterpret_cast<const uint32_t*>(ctx + kSpOffset);
+	for (int depth = 0; depth < 32; ++depth) {
+		if (sp < bottom || sp + 8 > top || (sp & 3)) return;
+		const uint32_t next = *reinterpret_cast<const volatile uint32_t*>(sp);
+		if (next <= sp || next + 8 > top) return;
+		const uint32_t ret = *reinterpret_cast<const volatile uint32_t*>(next + 4);
+		sp = next;
+		if (!code_addr_(ret)) continue;
+		uint32_t slot = slot_of(ret, kSlowIncSlots);
+		for (uint32_t probe = 0; probe < 16; ++probe, slot = (slot + 1) % kSlowIncSlots) {
+			if (t.incPc[slot] == ret) { ++t.incCount[slot]; break; }
+			if (!t.incPc[slot]) { t.incPc[slot] = ret; t.incCount[slot] = 1; break; }
+			if (probe == 15) ++t.incDropped;
+		}
+	}
+}
+
+void slow_sample(const uint8_t* ctx, uint32_t pc)
+{
+	SlowTable& t = s_slowFrame[s_slowActive & 1];
+	++t.samples;
+	++s_slowWindowSamples;
+	slow_count_pc(t, pc);
+	slow_count_inclusive(t, ctx);
+}
+
+void slow_merge_counts(uint32_t* dstPc, uint32_t* dstCount, uint32_t slots,
+                       const uint32_t* srcPc, const uint32_t* srcCount)
+{
+	for (uint32_t i = 0; i < slots; ++i) {
+		if (!srcPc[i]) continue;
+		uint32_t slot = slot_of(srcPc[i], slots);
+		for (uint32_t probe = 0; probe < 32; ++probe, slot = (slot + 1) % slots) {
+			if (dstPc[slot] == srcPc[i]) { dstCount[slot] += srcCount[i]; break; }
+			if (!dstPc[slot]) { dstPc[slot] = srcPc[i]; dstCount[slot] = srcCount[i]; break; }
+		}
+	}
+}
+
+void slow_merge_frame(SlowTable& frame, bool slow)
+{
+	SlowBucket& bucket = s_slowBucket[slow ? 1 : 0];
+	slow_merge_counts(bucket.pc, bucket.count, kSlowSlots, frame.pc, frame.count);
+	slow_merge_counts(bucket.incPc, bucket.incCount, kSlowIncSlots, frame.incPc, frame.incCount);
+	++bucket.frames;
+	bucket.samples += frame.samples;
+}
+
+struct SlowFunc { char name[64]; uint32_t count; };
+
+void slow_report_bucket(SlowBucket& bucket, const char* tag)
+{
+	SlowFunc funcs[256], inc[256];
+	uint32_t nf = 0, ni = 0;
+	for (uint32_t i = 0; i < kSlowSlots; ++i) {
+		if (!bucket.pc[i]) continue;
+		char name[64] = {};
+		wut_OSGetSymbolName(bucket.pc[i], name, sizeof(name));
+		uint32_t f = 0;
+		while (f < nf && std::strcmp(funcs[f].name, name) != 0) ++f;
+		if (f == nf) {
+			if (nf == 256) continue;
+			std::memcpy(funcs[f].name, name, sizeof(name)); funcs[f].count = 0; ++nf;
+		}
+		funcs[f].count += bucket.count[i];
+	}
+	for (uint32_t i = 0; i < kSlowIncSlots; ++i) {
+		if (!bucket.incPc[i]) continue;
+		char name[64] = {};
+		wut_OSGetSymbolName(bucket.incPc[i], name, sizeof(name));
+		uint32_t f = 0;
+		while (f < ni && std::strcmp(inc[f].name, name) != 0) ++f;
+		if (f == ni) {
+			if (ni == 256) continue;
+			std::memcpy(inc[f].name, name, sizeof(name)); inc[f].count = 0; ++ni;
+		}
+		inc[f].count += bucket.incCount[i];
+	}
+	const uint32_t samplesWhole = bucket.frames ? bucket.samples / bucket.frames : 0;
+	const uint32_t samplesTenth = bucket.frames ? (bucket.samples * 10 / bucket.frames) % 10 : 0;
+	port_log("[slowprof] bucket=%s frames=%u samples_per_frame=%u.%u\n", tag, unsigned(bucket.frames),
+	         unsigned(samplesWhole), unsigned(samplesTenth));
+	for (int rank = 0; rank < 20; ++rank) {
+		uint32_t best = nf;
+		for (uint32_t i = 0; i < nf; ++i)
+			if (funcs[i].count && (best == nf || funcs[i].count > funcs[best].count)) best = i;
+		if (best == nf) break;
+		const uint32_t whole = bucket.frames ? funcs[best].count / bucket.frames : 0;
+		const uint32_t tenth = bucket.frames ? (funcs[best].count * 10 / bucket.frames) % 10 : 0;
+		port_log("[slowprof] %s exc rank=%d count_per_frame=%u.%u total=%u %s\n", tag, rank, unsigned(whole), unsigned(tenth),
+		         unsigned(funcs[best].count), funcs[best].name);
+		funcs[best].count = 0;
+	}
+	for (int rank = 0; rank < 30; ++rank) {
+		uint32_t best = ni;
+		for (uint32_t i = 0; i < ni; ++i)
+			if (inc[i].count && (best == ni || inc[i].count > inc[best].count)) best = i;
+		if (best == ni) break;
+		const uint32_t whole = bucket.frames ? inc[best].count / bucket.frames : 0;
+		const uint32_t tenth = bucket.frames ? (inc[best].count * 10 / bucket.frames) % 10 : 0;
+		port_log("[slowprof] %s inc rank=%d count_per_frame=%u.%u total=%u %s\n", tag, rank, unsigned(whole), unsigned(tenth),
+		         unsigned(inc[best].count), inc[best].name);
+		inc[best].count = 0;
+	}
+	std::memset(&bucket, 0, sizeof(bucket));
+}
+
+void slow_frame_end(uint32_t preUs)
+{
+	if (!s_slowOn) return;
+	const bool slow = preUs >= 22000;
+	const uint32_t bin = (preUs / 2000 < kSlowHistBins - 1) ? preUs / 2000 : kSlowHistBins - 1;
+	++s_slowPreHist[bin];
+	++s_slowFrameNo;
+	if (slow && s_slowFrameIdCount < 256) s_slowFrameIds[s_slowFrameIdCount++] = s_slowFrameNo;
+	const uint32_t done = s_slowActive & 1;
+	s_slowActive = done ^ 1;
+	slow_merge_frame(s_slowFrame[done], slow);
+	std::memset(&s_slowFrame[done], 0, sizeof(s_slowFrame[done]));
+	port_log("[slowprof] frame=%u class=%s pre_us=%u drawdone_us=%u\n", unsigned(s_slowFrameNo), slow ? "SLOW" : "NORMAL",
+	         unsigned(preUs), unsigned(s_slowDrawDoneUs));
+	s_slowDrawDoneUs = 0;
+}
+
+void slow_report()
+{
+	uint32_t frames = s_slowBucket[0].frames + s_slowBucket[1].frames;
+	const uint32_t samplesPerSecond = uint32_t(uint64_t(s_slowWindowSamples) * kTimerHz / kReportEvery);
+	const uint32_t costUs = uint32_t(s_slowWindowCost * 1000000 / kTimerHz);
+	port_log("[slowprof] overhead samples_per_s=%u us_per_frame=%u frames=%u\n", unsigned(samplesPerSecond),
+	         frames ? unsigned(costUs / frames) : 0, unsigned(frames));
+	port_log("[slowprof] slow_frames=");
+	for (uint32_t i = 0; i < s_slowFrameIdCount; ++i) port_log("%s%u", i ? "," : "", unsigned(s_slowFrameIds[i]));
+	port_log("\n[slowprof] pre_hist_bin_us=2000");
+	for (uint32_t i = 0; i < kSlowHistBins; ++i) port_log(" %u:%u", unsigned(i * 2000), unsigned(s_slowPreHist[i]));
+	port_log("\n");
+	slow_report_bucket(s_slowBucket[1], "SLOW");
+	slow_report_bucket(s_slowBucket[0], "NORMAL");
+	std::memset(s_slowPreHist, 0, sizeof(s_slowPreHist));
+	s_slowFrameIdCount = 0;
+	s_slowWindowSamples = 0;
+	s_slowWindowCost = 0;
+}
+
 void sample(Table& t, void* mainThread, void* context)
 {
 	const uint32_t pc = *reinterpret_cast<const uint32_t*>(static_cast<const uint8_t*>(context) + kSrr0Offset);
@@ -192,6 +454,12 @@ void on_alarm(void*, void* context)
 {
 	if (s_reporting && context == s_mainThread) return;
 	sample(s_tables[s_active & 1], s_mainThread, context);
+	if (s_slowOn && context == s_mainThread) {
+		const uint32_t pc = *reinterpret_cast<const uint32_t*>(static_cast<const uint8_t*>(context) + kSrr0Offset);
+		const WutTime t0 = wut_OSGetTime();
+		slow_sample(static_cast<const uint8_t*>(context), pc);
+		s_slowWindowCost += wut_OSGetTime() - t0;
+	}
 }
 void on_walarm(void*, void* context) { sample(s_wtables[s_wactive & 1], s_workerThread, context); }
 
@@ -353,6 +621,77 @@ void report(Table& t, const char* tag, void* mainThread)
 	std::memset(&t, 0, sizeof(t));
 }
 
+/* Called by the marker-gated game-thread GXBegin/GXCallDisplayList entry
+ * points.  The resulting values are carried in the producer stream; the
+ * worker must never walk its own stack looking for the game caller. */
+extern "C" void sms_wiiu_hotcaller_capture(uint32_t out[8])
+{
+	std::memset(out, 0, 8 * sizeof(*out));
+	const uint32_t walk = s_hotCallerWalks++;
+	HotCallerExit exit = kHotDepthExhausted;
+	if (!hotcaller_resolve_text_range()) {
+		++s_hotCallerCounts[kHotBadThread];
+		hotcaller_report();
+		return;
+	}
+	const uint8_t* thread = static_cast<const uint8_t*>(wut_OSGetCurrentThread());
+	if (!thread) {
+		exit = kHotBadThread;
+		++s_hotCallerCounts[exit];
+		hotcaller_report();
+		return;
+	}
+	const uint32_t top = *reinterpret_cast<const volatile uint32_t*>(thread + kStackStartOffset);
+	const uint32_t bottom = *reinterpret_cast<const volatile uint32_t*>(thread + kStackEndOffset);
+	if (bottom >= top || top < 8 || (bottom & 7) || (top & 7)) {
+		exit = kHotBadStack;
+		if (walk < 3)
+			WHBLogPrintf("SMS Wii U: [hotcaller5] walk=%u bad-stack top=%08x bottom=%08x frame=%08x",
+			             unsigned(walk), unsigned(top), unsigned(bottom),
+			             unsigned(reinterpret_cast<uint32_t>(__builtin_frame_address(0))));
+		++s_hotCallerCounts[exit];
+		hotcaller_report();
+		return;
+	}
+	uint32_t frame = reinterpret_cast<uint32_t>(__builtin_frame_address(0));
+	uint32_t found = 0;
+	for (uint32_t depth = 0; depth < kHotCallerMaxDepth; ++depth) {
+		uint32_t next = 0, ret = 0;
+		if (!stack_word(frame, bottom, top)) {
+			exit = kHotFrameNextOob;
+			if (walk < 3)
+				WHBLogPrintf("SMS Wii U: [hotcaller5] walk=%u depth=%u top=%08x bottom=%08x frame=%08x next=%08x ret=%08x",
+				                     unsigned(walk), unsigned(depth), unsigned(top), unsigned(bottom), unsigned(frame), unsigned(next), unsigned(ret));
+			break;
+		}
+		next = *reinterpret_cast<const volatile uint32_t*>(frame);
+		if (next <= frame || !stack_word(next, bottom, top)) {
+			exit = kHotFrameNextOob;
+			if (walk < 3)
+				WHBLogPrintf("SMS Wii U: [hotcaller5] walk=%u depth=%u top=%08x bottom=%08x frame=%08x next=%08x ret=%08x",
+				                     unsigned(walk), unsigned(depth), unsigned(top), unsigned(bottom), unsigned(frame), unsigned(next), unsigned(ret));
+			break;
+		}
+		ret = *reinterpret_cast<const volatile uint32_t*>(next + 4);
+		frame = next;
+		if (!hotcaller_text_addr(ret)) {
+			exit = kHotRetOob;
+		} else {
+			exit = kHotSuccess;
+			bool duplicate = false;
+			for (uint32_t i = 0; i < found; ++i) duplicate |= out[i] == ret;
+			if (!duplicate && found < 8) out[found++] = ret;
+		}
+		if (walk < 3)
+			WHBLogPrintf("SMS Wii U: [hotcaller5] walk=%u depth=%u top=%08x bottom=%08x frame=%08x next=%08x ret=%08x",
+			                     unsigned(walk), unsigned(depth), unsigned(top), unsigned(bottom), unsigned(frame), unsigned(next), unsigned(ret));
+		if (exit == kHotRetOob) break;
+	}
+	if (found) exit = kHotSuccess;
+	++s_hotCallerCounts[exit];
+	hotcaller_report();
+}
+
 
 /* Hang watchdog: a thread on core 2 that watches the frame boundary. The
  * audio pacer's 10 s stats ran the hang check, but in the pause hang
@@ -480,8 +819,16 @@ extern "C" void sms_wiiu_profiler_tick(void)
 	if (s_enabled < 0) {
 		s_mainThread = wut_OSGetCurrentThread(); // the hang check needs it either way
 		wd_start();
-		s_enabled = sms_wiiu_sd_marker("perfdiag") || sms_wiiu_sd_marker("cpuprof");
+		s_slowOn = sms_wiiu_sd_marker("slowprof") != 0;
+		s_enabled = sms_wiiu_sd_marker("perfdiag") || sms_wiiu_sd_marker("cpuprof") || s_slowOn;
 		port_log("[prof] sampler %s (SD marker perfdiag or cpuprof)\n", s_enabled ? "on" : "off");
+		if (s_slowOn) {
+			char lrName[64] = {};
+			wut_OSGetSymbolName(kSlowDrawDoneLr, lrName, sizeof(lrName));
+			port_log("[slowprof] build=slowprof1 marker=on drawdone_lr=%08x symbol=%s\n", unsigned(kSlowDrawDoneLr), lrName);
+		} else {
+			port_log("[slowprof] build=slowprof1 marker=off\n");
+		}
 	}
 	if (!s_enabled)
 		return;
@@ -506,6 +853,14 @@ extern "C" void sms_wiiu_profiler_tick(void)
 		report(s_wtables[wdone], "[wprof]", s_workerThread);
 	}
 	s_reporting = false;
+	if (s_slowOn) slow_report();
+}
+
+/* Called by the renderer with the same pre interval used by [hitch].  The
+ * renderer owns that boundary because the profiler tick runs just before it. */
+extern "C" void sms_wiiu_slowprof_frame(uint32_t preUs)
+{
+	slow_frame_end(preUs);
 }
 
 /* From the GX2 producer worker's thread at its start: with the SD marker
@@ -559,6 +914,16 @@ extern "C" void sms_wiiu_hang_check(void)
 		port_log("[hang]   #%d %08x %s\n", depth, (unsigned)ret, sym);
 		sp = next;
 	}
+}
+
+extern "C" int sms_wiiu_slowprof_enabled(void)
+{
+	return s_slowOn ? 1 : 0;
+}
+
+extern "C" void sms_wiiu_slowprof_drawdone(uint32_t lr, uint32_t waitUs)
+{
+	if (s_slowOn && lr == kSlowDrawDoneLr) s_slowDrawDoneUs += waitUs;
 }
 
 /* Every exit path cancels the alarm, or it fires into an unmapped process. */

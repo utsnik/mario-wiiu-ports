@@ -1,0 +1,29 @@
+Reason: Wii U: refuse START (pause menu) until the console-wide pause freeze is fixed; marker pausemenu restores it
+--- a/src/System/MarDirectorDirect.cpp	2026-11-12 23:36:08.737711136 +0000
++++ b/src/System/MarDirectorDirect.cpp	2026-11-12 23:36:08.812714315 +0000
+@@ -66,6 +66,9 @@
+ // that scales its length by SMSGetVSyncTimesPerSec(); at 60 that asked for
+ // 24 frames of work, 0.8 s. Halve it to keep its 0.4 s.
+ #include "port_framerate.h"
++#ifdef TARGET_WIIU
++extern "C" int sms_wiiu_pause_menu_allowed(void);
++#endif
+ static inline f32 MarDirectorPortSoundFrames(f32 frames)
+ {
+ 	return port_frame_scale() * frames;
+@@ -1211,6 +1214,15 @@
+ 				if (getGamePad()->checkFrameMeaning(TMarioGamePad::MEANING_0x1)) {
+ 					if (gpMarioOriginal->checkActionThing3()) {
+ #endif
++#ifdef TARGET_WIIU
++						// Wii U: opening the pause menu freezes the whole console (2026-11-12, every level,
++						// with or without the HD pack or gx2prod). Until that is fixed START is refused like a
++						// blocked pause; SD marker `pausemenu` restores the menu for testing.
++						if (!sms_wiiu_pause_menu_allowed()) {
++							SMSGetMSound()->startSoundSystemSE(MSD_SE_SY_NOT_COLLECT, 0, nullptr, 0);
++							break;
++						}
++#endif
+ 						r29 = STATE_PAUSE_MENU;
+ 						break;
+ 					}

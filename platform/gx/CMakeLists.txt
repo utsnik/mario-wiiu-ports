@@ -177,6 +177,12 @@ if(SMS_GX_BUILD_TESTS)
         ${CMAKE_CURRENT_SOURCE_DIR}/../wiiu)
     target_compile_features(gx2_texture_native_test PRIVATE cxx_std_17)
     add_test(NAME gx2_texture_native_test COMMAND gx2_texture_native_test)
+    add_executable(goopwb_i8_encoder_test
+        ${CMAKE_CURRENT_SOURCE_DIR}/../wiiu/tests/goopwb_i8_encoder_test.cpp)
+    target_include_directories(goopwb_i8_encoder_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/../wiiu)
+    target_compile_features(goopwb_i8_encoder_test PRIVATE cxx_std_11)
+    add_test(NAME goopwb_i8_encoder_test COMMAND goopwb_i8_encoder_test)
 
     add_library(gx2_texture_pack_core STATIC
         src/gx_texture_pack_common.cpp

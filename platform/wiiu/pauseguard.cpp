@@ -11,8 +11,8 @@
 namespace {
 
 constexpr uint32_t kPhysMask = 0x3fffffffu;
-constexpr unsigned kRangeCount = 3; // MEM2 arena, usable MEM1, foreground heap
-constexpr unsigned kSkipLogLimit = 96;
+constexpr unsigned kRangeCount = 5; // MEM2 arena, usable MEM1, foreground heap, whole MEM1 bound, whole MEM2 bound
+constexpr unsigned kSkipLogLimit = 400;
 constexpr unsigned kTraceLogLimit = 4096;
 constexpr uint32_t kTraceFrames = 120;
 
@@ -90,6 +90,19 @@ void sms_wiiu_pauseguard_init(void)
     s_ranges[0] = {reinterpret_cast<uintptr_t>(sms_wiiu_mem2_base), sms_wiiu_mem2_size};
     s_ranges[1] = {reinterpret_cast<uintptr_t>(port_mem1_base), port_mem1_size};
     refreshForeground();
+    // pauseguard1 (2026-11-12) only knew the game arena and the port's MEM1 slice, so it skipped valid
+    // targets (WHB's TV colour buffer in MEM1, default-heap buffers in MEM2): black screen and a slowed
+    // game. Accept the whole MEM1/MEM2 bounds the OS reports; only pointers outside them are skipped.
+    {
+        uint32_t a = 0, n = 0;
+        OSGetMemBound(OS_MEM1, &a, &n);
+        s_ranges[3] = {uintptr_t(a), uint64_t(n)};
+        a = 0; n = 0;
+        OSGetMemBound(OS_MEM2, &a, &n);
+        s_ranges[4] = {uintptr_t(a), uint64_t(n)};
+        WHBLogPrintf("SMS Wii U: [pauseguard] bounds MEM1=%08x+%u MEM2=%08x+%u", unsigned(s_ranges[3].begin),
+                     unsigned(s_ranges[3].size), unsigned(s_ranges[4].begin), unsigned(s_ranges[4].size));
+    }
     WHBLogPrintf("SMS Wii U: [pauseguard] on MEM2=%p+%u MEM1=%p+%u foreground=%08x+%u",
                  sms_wiiu_mem2_base, unsigned(sms_wiiu_mem2_size), port_mem1_base,
                  unsigned(port_mem1_size), unsigned(s_ranges[2].begin), unsigned(s_ranges[2].size));
@@ -204,3 +217,17 @@ void sms_wiiu_pauseguard_present(void)
 }
 
 } // extern "C"
+
+// Pause-menu gate (decomp-patches/zzzz-wiiu-13-pause-menu-gate.patch): opening the pause menu freezes the whole
+// console (2026-11-12), so START is refused unless the SD marker `pausemenu` is present.
+extern "C" int sms_wiiu_pause_menu_allowed(void)
+{
+    static int s_allowed = -1;
+    if (s_allowed < 0) {
+        // Default-allow since 2026-11-13: the START freeze was the uninitialised save-state hint (8eac24c),
+        // confirmed in Cemu and on the console. SD marker nopausemenu restores the refusal.
+        s_allowed = sms_wiiu_sd_marker("nopausemenu") ? 0 : 1;
+        WHBLogPrintf("SMS Wii U: [pausegate] pause menu %s (marker nopausemenu)", s_allowed ? "allowed" : "refused");
+    }
+    return s_allowed;
+}

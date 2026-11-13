@@ -2,6 +2,7 @@
 #include "runtime.h"
 #include "pauseguard.h"
 #include "gx2_producer_worker.h"
+#include "hotlist.h"
 #include <cstdio>
 #ifndef SMS_GX2_ASYNC_PEEK
 #define SMS_GX2_ASYNC_PEEK 1
@@ -44,6 +45,7 @@
 #include "gx2_texture.h"
 #include "gx2_vertex_program.h"
 #include "gx2_texture_pack.h"
+#include "goopwb_encoder.h"
 #include "widescreen_math.h"
 #include "../grass_math.h"
 #include "../../src/port_include/sms_wiiu_grass.h"
@@ -96,6 +98,7 @@ static void gx2ProdBoundary(uint32_t kind);
 static void gx2ProdCallList(void* list, uint32_t bytes);
 static bool gx2DlOpenForDraw();
 static void gx2DlClose();
+static void warpPassEnd(bool reopen);
 static uint32_t textureCacheEntryCount();
 static void resetTargetScissor();
 static void applyState();
@@ -3258,6 +3261,407 @@ static void updateWideTarget() {
 // frame into a texture and draws it back (water, heat haze, shadows). The
 // copy lives in a GX2 texture keyed by its destination address; lookups of
 // that address use it instead of decoding RAM the copy never wrote.
+static constexpr uint32_t kGoopWbSlotCount = 3;
+static constexpr uint32_t kGoopWbMaxRegistrations = 64;
+
+struct GoopWbSlot {
+    GX2Surface surface;
+    uint8_t* encoded;
+    const void* dest;
+    uint32_t bytes;
+    uint32_t logicalW, logicalH;
+    uint32_t storageW, storageH;
+    uint32_t sampleX, sampleY, sampleW, sampleH;
+    uint32_t frame;
+    uint64_t stamp;
+    uint64_t destinationHash;
+    uint32_t seq;  // reservation order: two copies of one layer in a frame share frame and stamp
+    bool queued;
+};
+
+struct GoopWbRegistration {
+    const void* dest;
+    uint32_t width, height, fmt, generation;
+    GoopWbSlot slots[kGoopWbSlotCount];
+    uint32_t lastReservedSeq, lastAppliedSeq;  // goopverify: RAM reflects copy lastAppliedSeq (or an equal one)
+    bool stale;
+};
+
+static GoopWbRegistration s_goopWbRegistrations[kGoopWbMaxRegistrations];
+static uint32_t s_goopWbRegistrationCount;
+static uint32_t s_goopWbGeneration;
+static bool s_goopWbEnabled;
+static uint32_t s_goopWbQueued;
+static uint32_t s_goopWbUnchanged;
+static uint64_t s_goopWbBoundaryUs;
+static uint32_t s_goopWbBoundaryMaxUs;
+static uint32_t s_goopWbEvery = 1;
+static bool s_goopWbNoStamp;
+static uint32_t s_goopWbEventLogs;
+static constexpr uint32_t kGoopWbEventLogLimit = 24;
+static uint32_t s_goopWbCommitted;
+static uint32_t s_goopWbNotReady;
+static uint32_t s_goopWbSlotExhaustion;
+static uint32_t s_goopWbConflicts;
+static uint32_t s_goopWbUnregisteredLogs;
+// goopcap (default; SD marker goopwball turns it off), 2026-11-13: the layers are staged at the scene
+// resolution (a 256x256 layer is a 576x576 RGBA8 surface), so each encode reads ~1.3 MB back. Ricco/Bianco
+// copy several layers a frame and over42 went 0.35% -> 24%. The boundary now encodes at most one layer per
+// frame, round-robin, and only each layer's newest finished copy: an older one is superseded (a copy holds the
+// whole layer, so nothing is lost, the write-back only lags a few frames).
+static bool s_goopWbAll;
+static uint32_t s_goopWbNextReg;
+static uint32_t s_goopWbSuperseded;
+static uint32_t s_goopWbStolen;
+// goopcap2: Ricco's two 512x256 layers stage at 1152x576 and one whole encode still cost ~6 ms (over42 3.9%).
+// The chosen copy is encoded across frames, kGoopWbTexelsPerFrame logical texels per boundary, and committed
+// when its last row is done (conflict check at commit). The active slot is never superseded or reused.
+static GoopWbSlot* s_goopWbActive;
+static uint32_t s_goopWbActiveRow;
+static constexpr uint32_t kGoopWbTexelsPerFrame = 32768;
+static GoopWbRegistration* s_goopWbActiveReg;
+// Stale = a layer with nothing queued whose newest copy never reached RAM: the FLUDD bug (physics read the old map).
+static uint32_t s_goopWbStaleEvents, s_goopWbForwarded;
+extern "C" void GXPC_MemoryWritten(const void* p, uint32_t n);
+
+static GoopWbRegistration* goopWbRegistration(const void* dest) {
+    for (uint32_t i = 0; i < s_goopWbRegistrationCount; ++i)
+        if (s_goopWbRegistrations[i].dest == dest) return &s_goopWbRegistrations[i];
+    return nullptr;
+}
+
+static void goopWbFreeSlot(GoopWbSlot& slot) {
+    if (slot.surface.image) MEMFreeToDefaultHeap(slot.surface.image);
+    if (slot.encoded) MEMFreeToDefaultHeap(slot.encoded);
+    memset(&slot, 0, sizeof(slot));
+}
+
+static bool goopWbPrepareSlot(GoopWbSlot& slot, uint32_t storageW, uint32_t storageH,
+                              uint32_t bytes) {
+    if (slot.surface.image && slot.surface.width == storageW &&
+        slot.surface.height == storageH && slot.bytes == bytes)
+        return true;
+    goopWbFreeSlot(slot);
+    slot.surface.use = GX2SurfaceUse(GX2_SURFACE_USE_TEXTURE | GX2_SURFACE_USE_COLOR_BUFFER);
+    slot.surface.dim = GX2_SURFACE_DIM_TEXTURE_2D;
+    slot.surface.width = storageW;
+    slot.surface.height = storageH;
+    slot.surface.depth = 1;
+    slot.surface.mipLevels = 1;
+    slot.surface.format = GX2_SURFACE_FORMAT_UNORM_R8_G8_B8_A8;
+    slot.surface.aa = GX2_AA_MODE1X;
+    slot.surface.tileMode = GX2_TILE_MODE_LINEAR_ALIGNED;
+    GX2CalcSurfaceSizeAndAlignment(&slot.surface);
+    slot.surface.image = alignedZero(slot.surface.alignment, slot.surface.imageSize);
+    slot.encoded = static_cast<uint8_t*>(alignedZero(64, bytes));
+    if (!slot.surface.image || !slot.encoded) {
+        goopWbFreeSlot(slot);
+        return false;
+    }
+    DCFlushRange(slot.surface.image, slot.surface.imageSize);
+    slot.bytes = bytes;
+    return true;
+}
+
+static GoopWbSlot* goopWbReserve(const void* dest, uint32_t logicalW, uint32_t logicalH,
+                                 uint32_t fmt, const GX2Surface& privateSurface,
+                                 uint32_t sampleX, uint32_t sampleY,
+                                 uint32_t sampleW, uint32_t sampleH) {
+    // Copy format is the 4-bit BP field: 1 = GX_TF_I8, 8 = GX_CTF_R8. Sunshine copies the pollution layers
+    // with GX_CTF_R8 (MarDirectorInitECT "graffito"), so goopwb1 ignored every cleaning copy. Both are 8-bit
+    // single-channel texels in the same 8x4 tiling; the encoder takes the R byte, which is what R8 holds.
+    if (!s_goopWbEnabled || (fmt != 1 && fmt != 8)) return nullptr;
+    // Plaza A/B 2026-11-13: the layers are copied back on nearly every frame (the game redraws them), and goopwb
+    // cost over42 0.3% -> 1.7-3.2%. goopwbevery2/goopwbevery4 write back only every Nth frame (physics lag <= N frames).
+    if (s_goopWbEvery > 1 && (g_displayFrames % s_goopWbEvery) != 0) return nullptr;
+    GoopWbRegistration* registration = goopWbRegistration(dest);
+    if (!registration) {
+        if (s_goopWbUnregisteredLogs++ < 32)
+            WHBLogPrintf("[goopwb] I8 copy destination not registered dest=%p size=%ux%u",
+                         dest, unsigned(logicalW), unsigned(logicalH));
+        return nullptr;
+    }
+    if (registration->width != logicalW ||
+        registration->height != logicalH ||
+        privateSurface.format != GX2_SURFACE_FORMAT_UNORM_R8_G8_B8_A8) {
+        WHBLogPrintf("[goopwb] skip dest=%p registered=%ux%u fmt=%u copy=%ux%u sourceFmt=%u",
+                     dest, unsigned(registration->width), unsigned(registration->height),
+                     unsigned(registration->fmt), unsigned(logicalW), unsigned(logicalH),
+                     unsigned(privateSurface.format));
+        return nullptr;
+    }
+    GoopWbSlot* slot = nullptr;
+    for (uint32_t i = 0; i < kGoopWbSlotCount; ++i) {
+        if (!registration->slots[i].queued) {
+            slot = &registration->slots[i];
+            break;
+        }
+    }
+    if (!slot && !s_goopWbAll) {
+        // Every slot is queued: reuse the oldest one whose staging copy has finished (the boundary has not
+        // encoded it yet, and this newer copy supersedes it). Same thread as the boundary, so no race; the
+        // new staging copy is ordered after the old one on the GPU and gets its own stamp.
+        const uint64_t retired = GX2GetRetiredTimeStamp();
+        for (uint32_t i = 0; i < kGoopWbSlotCount; ++i) {
+            GoopWbSlot& candidate = registration->slots[i];
+            if (&candidate != s_goopWbActive && candidate.stamp && retired >= candidate.stamp &&
+                (!slot || candidate.seq < slot->seq))
+                slot = &candidate;
+        }
+        if (slot) {
+            slot->queued = false;
+            slot->stamp = 0;
+            ++s_goopWbStolen;
+        }
+    }
+    if (!slot) {
+        ++s_goopWbSlotExhaustion;
+        WHBLogPrintf("[goopwb] slot exhaustion dest=%p frame=%u", dest, unsigned(g_displayFrames));
+        return nullptr;
+    }
+    const uint32_t bytes = sms_wiiu::goopwb_i8_tile_bytes(logicalW, logicalH);
+    if (!bytes || !goopWbPrepareSlot(*slot, privateSurface.width, privateSurface.height, bytes))
+        return nullptr;
+    slot->dest = dest;
+    slot->logicalW = logicalW;
+    slot->logicalH = logicalH;
+    slot->storageW = privateSurface.width;
+    slot->storageH = privateSurface.height;
+    slot->sampleX = sampleX;
+    slot->sampleY = sampleY;
+    slot->sampleW = sampleW;
+    slot->sampleH = sampleH;
+    slot->frame = g_displayFrames;
+    slot->stamp = 0;
+    slot->destinationHash = xxh64(dest, bytes, 0);
+    slot->queued = true;
+    slot->seq = ++s_goopWbQueued;
+    registration->lastReservedSeq = slot->seq;
+    return slot;
+}
+
+static void goopWbStageCopy(const GX2Surface& source, GoopWbSlot& slot) {
+    GX2CopySurface(const_cast<GX2Surface*>(&source), 0, 0, &slot.surface, 0, 0);
+    GX2Invalidate(GX2_INVALIDATE_MODE_COLOR_BUFFER, slot.surface.image, slot.surface.imageSize);
+    GX2Invalidate(GX2_INVALIDATE_MODE_TEXTURE, slot.surface.image, slot.surface.imageSize);
+}
+
+static void goopWbStampPending() {
+    if (!s_goopWbEnabled) return;
+    const uint64_t stamp = GX2GetLastSubmittedTimeStamp();
+    for (uint32_t r = 0; r < s_goopWbRegistrationCount; ++r) {
+        GoopWbRegistration& registration = s_goopWbRegistrations[r];
+        for (uint32_t i = 0; i < kGoopWbSlotCount; ++i) {
+            GoopWbSlot& slot = registration.slots[i];
+            if (!slot.queued || slot.stamp) continue;
+            slot.stamp = stamp;
+            if (s_goopWbEventLogs++ < kGoopWbEventLogLimit)
+            WHBLogPrintf("[goopwb] queue frame=%u dest=%p slot=%u storage=%ux%u stamp=%llu",
+                         unsigned(slot.frame), slot.dest, unsigned(i), unsigned(slot.storageW),
+                         unsigned(slot.storageH), (unsigned long long)slot.stamp);
+        }
+    }
+}
+
+extern "C" void sms_wiiu_register_pollution_i8(const void* dest, uint32_t width,
+                                                 uint32_t height) {
+    if (!s_goopWbEnabled || !dest || !width || !height) return;
+    GoopWbRegistration* registration = goopWbRegistration(dest);
+    if (!registration) {
+        if (s_goopWbRegistrationCount >= kGoopWbMaxRegistrations) {
+            WHBLogPrintf("[goopwb] registration table full dest=%p", dest);
+            return;
+        }
+        registration = &s_goopWbRegistrations[s_goopWbRegistrationCount++];
+        memset(registration, 0, sizeof(*registration));
+        registration->dest = dest;
+    }
+    registration->width = width;
+    registration->height = height;
+    registration->fmt = 1;
+    registration->generation = ++s_goopWbGeneration;
+    WHBLogPrintf("[goopwb] register dest=%p size=%ux%u fmt=I8 bytes=%u", dest,
+                 unsigned(width), unsigned(height),
+                 unsigned(sms_wiiu::goopwb_i8_tile_bytes(width, height)));
+}
+
+// Writes an encoded layer into game RAM when it differs (goopcap path; the goopwball path keeps its own copy).
+static void goopWbCommitEncoded(GoopWbRegistration& registration, GoopWbSlot& slot, uint32_t age) {
+    if (slot.seq > registration.lastAppliedSeq) registration.lastAppliedSeq = slot.seq;
+    if (memcmp(slot.dest, slot.encoded, slot.bytes) == 0) {
+        ++s_goopWbUnchanged;
+        return;
+    }
+    memcpy(const_cast<void*>(slot.dest), slot.encoded, slot.bytes);
+    // Our own write changes dest: copies queued after this one hashed the old bytes and would all read as
+    // game-written conflicts (Plaza: half of all copies, and the last copy after cleaning could be lost).
+    // Forward the new hash to queued slots that saw the same bytes this one did.
+    const uint64_t written = xxh64(slot.dest, slot.bytes, 0);
+    for (uint32_t i = 0; i < kGoopWbSlotCount; ++i) {
+        GoopWbSlot& other = registration.slots[i];
+        if (&other != &slot && other.queued && other.destinationHash == slot.destinationHash) {
+            other.destinationHash = written;
+            ++s_goopWbForwarded;
+        }
+    }
+    if (!s_goopWbNoStamp) GXPC_MemoryWritten(slot.dest, slot.bytes);
+    ++s_goopWbCommitted;
+    if (s_goopWbEventLogs++ < kGoopWbEventLogLimit)
+        WHBLogPrintf("[goopwb] commit frame=%u queued=%u age=%u dest=%p bytes=%u", unsigned(g_displayFrames),
+                     unsigned(slot.frame), unsigned(age), slot.dest, unsigned(slot.bytes));
+}
+
+static void goopWbCheckStale() {
+    for (uint32_t r = 0; r < s_goopWbRegistrationCount; ++r) {
+        GoopWbRegistration& registration = s_goopWbRegistrations[r];
+        bool busy = false;
+        for (uint32_t i = 0; i < kGoopWbSlotCount; ++i) busy = busy || registration.slots[i].queued;
+        const bool stale = !busy && registration.lastAppliedSeq < registration.lastReservedSeq;
+        if (stale && !registration.stale) {
+            ++s_goopWbStaleEvents;
+            if (s_goopWbStaleEvents <= 16)
+                WHBLogPrintf("[goopverify] STALE dest=%p frame=%u newest copy %u never reached RAM (applied %u)",
+                             registration.dest, unsigned(g_displayFrames), unsigned(registration.lastReservedSeq),
+                             unsigned(registration.lastAppliedSeq));
+        }
+        registration.stale = stale;
+    }
+}
+
+static void goopWbBoundaryCapped(uint64_t retired) {
+    const uint32_t regCount = s_goopWbRegistrationCount;
+    // Keep only each layer's newest finished copy (a copy holds the whole layer); never touch the active slot.
+    for (uint32_t r = 0; r < regCount; ++r) {
+        GoopWbSlot* newest = nullptr;
+        for (uint32_t i = 0; i < kGoopWbSlotCount; ++i) {
+            GoopWbSlot& slot = s_goopWbRegistrations[r].slots[i];
+            if (&slot == s_goopWbActive || !slot.queued || !slot.stamp || retired < slot.stamp) continue;
+            if (newest && newest->seq >= slot.seq) {
+                slot.queued = false; slot.stamp = 0; ++s_goopWbSuperseded;
+                continue;
+            }
+            if (newest) { newest->queued = false; newest->stamp = 0; ++s_goopWbSuperseded; }
+            newest = &slot;
+        }
+    }
+    if (!s_goopWbActive) {
+        for (uint32_t rr = 0; rr < regCount && !s_goopWbActive; ++rr) {
+            const uint32_t r = (s_goopWbNextReg + rr) % regCount;
+            for (uint32_t i = 0; i < kGoopWbSlotCount; ++i) {
+                GoopWbSlot& slot = s_goopWbRegistrations[r].slots[i];
+                if (!slot.queued || !slot.stamp || retired < slot.stamp) continue;
+                s_goopWbActive = &slot;
+                s_goopWbActiveReg = &s_goopWbRegistrations[r];
+                s_goopWbActiveRow = 0;
+                s_goopWbNextReg = (r + 1) % regCount;
+                DCInvalidateRange(slot.surface.image, slot.surface.imageSize);
+                break;
+            }
+        }
+        if (!s_goopWbActive) { goopWbCheckStale(); return; }
+    }
+    GoopWbSlot& slot = *s_goopWbActive;
+    uint32_t rows = slot.logicalW ? kGoopWbTexelsPerFrame / slot.logicalW : slot.logicalH;
+    if (!rows) rows = 1;
+    const uint32_t end = s_goopWbActiveRow + rows < slot.logicalH ? s_goopWbActiveRow + rows : slot.logicalH;
+    sms_wiiu::goopwb_encode_i8_tiles_rows(
+        static_cast<const uint8_t*>(slot.surface.image), slot.surface.pitch,
+        slot.logicalW, slot.logicalH, slot.storageW, slot.storageH,
+        slot.sampleX, slot.sampleY, slot.sampleW, slot.sampleH, slot.encoded, s_goopWbActiveRow, end);
+    s_goopWbActiveRow = end;
+    if (end < slot.logicalH) { goopWbCheckStale(); return; }
+    const uint32_t age = g_displayFrames >= slot.frame ? g_displayFrames - slot.frame : 0;
+    if (xxh64(slot.dest, slot.bytes, 0) != slot.destinationHash) {
+        ++s_goopWbConflicts;
+        if (s_goopWbEventLogs++ < kGoopWbEventLogLimit)
+            WHBLogPrintf("[goopwb] destination conflict frame=%u queued=%u age=%u dest=%p",
+                         unsigned(g_displayFrames), unsigned(slot.frame), unsigned(age), slot.dest);
+    } else {
+        goopWbCommitEncoded(*s_goopWbActiveReg, slot, age);
+    }
+    slot.queued = false;
+    slot.stamp = 0;
+    s_goopWbActive = nullptr;
+    s_goopWbActiveReg = nullptr;
+    goopWbCheckStale();
+}
+
+extern "C" void sms_wiiu_gx2_renderer_goopwb_boundary(void) {
+    if (!s_goopWbEnabled) return;
+    const OSTime goopT0 = OSGetSystemTime();
+    struct GoopTimer {  // game-thread cost of the boundary (commit encode/copy), reported in the counters line
+        OSTime t0;
+        ~GoopTimer() {
+            const uint32_t us = uint32_t(OSTicksToMicroseconds(OSGetSystemTime() - t0));
+            s_goopWbBoundaryUs += us;
+            if (us > s_goopWbBoundaryMaxUs) s_goopWbBoundaryMaxUs = us;
+        }
+    } goopTimer{goopT0};
+    const uint64_t retired = GX2GetRetiredTimeStamp();
+    if (!s_goopWbAll) {
+        goopWbBoundaryCapped(retired);
+        return;
+    }
+    for (uint32_t r = 0; r < s_goopWbRegistrationCount; ++r) {
+        GoopWbRegistration& registration = s_goopWbRegistrations[r];
+        for (uint32_t i = 0; i < kGoopWbSlotCount; ++i) {
+            GoopWbSlot& slot = registration.slots[i];
+            if (!slot.queued || !slot.stamp) continue;
+            const uint32_t age = g_displayFrames >= slot.frame ? g_displayFrames - slot.frame : 0;
+            if (retired < slot.stamp) {
+                ++s_goopWbNotReady;
+                if (s_goopWbEventLogs++ < kGoopWbEventLogLimit)
+                WHBLogPrintf("[goopwb] not-ready frame=%u queued=%u age=%u stamp=%llu retired=%llu",
+                             unsigned(g_displayFrames), unsigned(slot.frame), unsigned(age),
+                             (unsigned long long)slot.stamp, (unsigned long long)retired);
+                continue;
+            }
+            // Conflict check first: an encode that would be discarded cost ~45% of the encodes (2026-11-13).
+            const bool conflict = xxh64(slot.dest, slot.bytes, 0) != slot.destinationHash;
+            if (!conflict) {
+                DCInvalidateRange(slot.surface.image, slot.surface.imageSize);
+                sms_wiiu::goopwb_encode_i8_tiles_rect(
+                    static_cast<const uint8_t*>(slot.surface.image), slot.surface.pitch,
+                    slot.logicalW, slot.logicalH, slot.storageW, slot.storageH,
+                    slot.sampleX, slot.sampleY, slot.sampleW, slot.sampleH, slot.encoded);
+            }
+            if (conflict) {
+                ++s_goopWbConflicts;
+                if (s_goopWbEventLogs++ < kGoopWbEventLogLimit)
+                WHBLogPrintf("[goopwb] destination conflict frame=%u queued=%u age=%u dest=%p",
+                             unsigned(g_displayFrames), unsigned(slot.frame), unsigned(age), slot.dest);
+            } else {
+                // 2026-11-12: per-commit logs + a 64 KB byte-diff loop cost frames while cleaning (over42
+                // 0.2% -> 2%). Commit only when the bytes differ, and log the first few events only.
+                if (memcmp(slot.dest, slot.encoded, slot.bytes) != 0) {
+                    memcpy(const_cast<void*>(slot.dest), slot.encoded, slot.bytes);
+                    // The GPU copy entry for dest already holds this image; stamping the pages makes the texture
+                    // path treat it as CPU-written and re-decode it. goopwbnostamp skips the stamp.
+                    if (!s_goopWbNoStamp) GXPC_MemoryWritten(slot.dest, slot.bytes);
+                    ++s_goopWbCommitted;
+                    if (s_goopWbEventLogs++ < kGoopWbEventLogLimit)
+                        WHBLogPrintf("[goopwb] commit frame=%u queued=%u age=%u dest=%p bytes=%u",
+                                     unsigned(g_displayFrames), unsigned(slot.frame), unsigned(age), slot.dest,
+                                     unsigned(slot.bytes));
+                } else {
+                    ++s_goopWbUnchanged;
+                }
+            }
+            slot.queued = false;
+            slot.stamp = 0;
+        }
+    }
+}
+
+static void goopWbShutdown() {
+    s_goopWbActive = nullptr;
+    s_goopWbActiveReg = nullptr;
+    for (uint32_t r = 0; r < s_goopWbRegistrationCount; ++r)
+        for (uint32_t i = 0; i < kGoopWbSlotCount; ++i)
+            goopWbFreeSlot(s_goopWbRegistrations[r].slots[i]);
+    s_goopWbRegistrationCount = 0;
+}
+
 struct CopyEntry {
     const void* dest = nullptr;
     TextureEntry tex;
@@ -3515,9 +3919,15 @@ static void copyToTexture(const void* dest, uint32_t x, uint32_t y, uint32_t w, 
         tw = uint32_t(float(w) * s_gameScale);
         th = uint32_t(float(h) * s_gameScale);
     }
-    if (tx >= cb->surface.width || ty >= cb->surface.height) tw = th = 0;
-    if (tx + tw > cb->surface.width) tw = cb->surface.width - tx;
-    if (ty + th > cb->surface.height) th = cb->surface.height - ty;
+    if (tx >= cb->surface.width || ty >= cb->surface.height) {
+        static uint32_t s_outsideLogs;
+        if (s_outsideLogs++ < 16)
+            WHBLogPrintf("[efb] copy origin outside target tx=%u ty=%u w=%u h=%u target=%ux%u (an unsigned-underflow huge copy before 2026-11-13)",
+                         unsigned(tx), unsigned(ty), unsigned(w), unsigned(h), unsigned(cb->surface.width), unsigned(cb->surface.height));
+        tw = th = 0;
+    }
+    if (tw && tx + tw > cb->surface.width) tw = cb->surface.width - tx;  // tw==0 when tx is outside: no unsigned underflow
+    if (th && ty + th > cb->surface.height) th = cb->surface.height - ty;
     if (!tw || !th) return;
     CopyEntry* e = nullptr;
     for (CopyEntry& c : copyCache())
@@ -3646,6 +4056,9 @@ static void copyToTexture(const void* dest, uint32_t x, uint32_t y, uint32_t w, 
                   e->tex.texture.surface.imageSize);
     GX2Invalidate(GX2_INVALIDATE_MODE_TEXTURE, e->tex.texture.surface.image,
                   e->tex.texture.surface.imageSize);
+    if (GoopWbSlot* slot = goopWbReserve(dest, logicalW, logicalH, fmt, e->tex.texture.surface,
+                                         e->sampleX, e->sampleY, e->sampleW, e->sampleH))
+        goopWbStageCopy(e->tex.texture.surface, *slot);
     bathCopyConsumed();
 }
 
@@ -3659,6 +4072,7 @@ struct ProducerResolvedCopy {
     GX2Rect sourceRect;
     GX2Point destinationPoint;
     void* retiredImage;
+    GoopWbSlot* goopSlot;
     bool ready;
     bool fullSurface;
 };
@@ -3683,9 +4097,15 @@ static ProducerResolvedCopy resolveProducerCopy(const void* dest, uint32_t x, ui
         tw = uint32_t(w * s_gameScale);
         th = uint32_t(h * s_gameScale);
     }
-    if (tx >= cb->surface.width || ty >= cb->surface.height) tw = th = 0;
-    if (tx + tw > cb->surface.width) tw = cb->surface.width - tx;
-    if (ty + th > cb->surface.height) th = cb->surface.height - ty;
+    if (tx >= cb->surface.width || ty >= cb->surface.height) {
+        static uint32_t s_outsideLogs;
+        if (s_outsideLogs++ < 16)
+            WHBLogPrintf("[efb] copy origin outside target tx=%u ty=%u w=%u h=%u target=%ux%u (an unsigned-underflow huge copy before 2026-11-13)",
+                         unsigned(tx), unsigned(ty), unsigned(w), unsigned(h), unsigned(cb->surface.width), unsigned(cb->surface.height));
+        tw = th = 0;
+    }
+    if (tw && tx + tw > cb->surface.width) tw = cb->surface.width - tx;  // tw==0 when tx is outside: no unsigned underflow
+    if (th && ty + th > cb->surface.height) th = cb->surface.height - ty;
     if (!tw || !th) return result;
 
     CopyEntry* e = nullptr;
@@ -3797,6 +4217,8 @@ static ProducerResolvedCopy resolveProducerCopy(const void* dest, uint32_t x, ui
     result.fullSurface = cemu;
     result.sourceRect = {int32_t(sourceLeft), int32_t(sourceTop), int32_t(sourceRight), int32_t(sourceBottom)};
     result.destinationPoint = {0, 0};
+    result.goopSlot = goopWbReserve(dest, logicalW, logicalH, fmt, e->tex.texture.surface,
+                                    e->sampleX, e->sampleY, e->sampleW, e->sampleH);
     result.ready = true;
     bathCopyConsumed();
     return result;
@@ -4254,6 +4676,23 @@ static TextureEntry* getTexture(int map) {
         }
     } else {
         const uint8_t* tlutPtr = indexed ? g.tlutMem + (tlut << 9) : nullptr;
+        if (indexed) {
+            // C14X2 indexes up to 16383 palette entries (32 KB); from a TLUT slot near the end of the 512 KB
+            // TLUT memory the decoder read past g.tlutMem (the old GX path clamps, gx_texture.cpp:610). Decode
+            // from a zero-padded copy instead. Only the texture decode uses it, synchronously, here.
+            const uint32_t off = tlut << 9, need = fmt == 8 ? 32u : fmt == 9 ? 512u : 0x8000u;
+            if (off + need > uint32_t(sizeof g.tlutMem)) {
+                static uint8_t s_tlutPad[0x8000];
+                static uint32_t s_tlutPadLogs;
+                const uint32_t have = off < uint32_t(sizeof g.tlutMem) ? uint32_t(sizeof g.tlutMem) - off : 0u;
+                memcpy(s_tlutPad, g.tlutMem + off, have);
+                memset(s_tlutPad + have, 0, sizeof s_tlutPad - have);
+                tlutPtr = s_tlutPad;
+                if (s_tlutPadLogs++ < 8)
+                    WHBLogPrintf("[tex] TLUT %u fmt=%u needs %u bytes past TLUT memory end; padded", unsigned(tlut),
+                                 unsigned(fmt), unsigned(off + need - uint32_t(sizeof g.tlutMem)));
+            }
+        }
         const uint8_t* src = source;
         float mipDiff = 0.0f;
         uint32_t pw = w, ph = h;
@@ -4790,10 +5229,32 @@ extern "C" void sms_wiiu_dynres_shutdown(void) {
 // marker nosceneres keeps the setting's size everywhere; sceneres900 uses 900.
 static volatile uint32_t s_sceneRenderH;
 static bool s_sceneResOff, s_sceneRes900, s_sceneResRead;
+// SD marker "nocoronawarp" (build warpskip1): in the coronaBoss scene, leave out the
+// GX2 draw of the JPA indirect screen-warp particles (see warpMatch).  s_warpOn is
+// false without the marker, and nothing below runs then.  The scene flag is set on
+// the game thread when a scene archive opens; counters are written by the worker and
+// read by core 1's periodic report (a torn read only skews one log line).
+static bool s_warpMarker, s_warpOn, s_warpFirstLogged;
+static volatile bool s_warpScene;
+static uint32_t s_warpTotal, s_warpFrames;
+// SD marker "warplowres" (build warplow1): the same draws are rendered at half size
+// into a scratch target and composited back (see warpPassBegin).  s_warpLowOn is
+// false without the marker; s_warpPass is true only between a pass's Begin and End.
+static bool s_warpLowMarker, s_warpLowOn, s_warpPass;
+static uint32_t s_warpLowPasses, s_warpLowDraws, s_warpLowFrames;
+#define SMS_WARP_SIGNATURE "st=4 tm=05 z-off t0=half-viewport t2=32x32"
 extern "C" void sms_wiiu_gx2_scene_archive(const char* name) {
     if (!name || strchr(name, '/')) return;
     const size_t n = strlen(name);
     if (n < 4 || strcmp(name + n - 4, ".szs") != 0) return;
+    if (s_warpOn || s_warpLowOn) {
+        s_warpScene = strncmp(name, "coronaBoss", 10) == 0;
+        s_warpTotal = s_warpFrames = 0;
+        s_warpLowPasses = s_warpLowDraws = s_warpLowFrames = 0;
+        s_warpFirstLogged = false;
+        WHBLogPrintf("SMS Wii U: [warp] scene=%s active=%d signature=%s mode=%s", name, s_warpScene ? 1 : 0, SMS_WARP_SIGNATURE,
+                     s_warpOn ? "skip" : "lowres");
+    }
     if (!s_sceneResRead) {
         s_sceneResRead = true;
         s_sceneResOff = sdMarkerPresent("nosceneres");
@@ -5359,6 +5820,9 @@ static void applyState() {
     GX2BlendCombineMode ccomb = GX2_BLEND_COMBINE_MODE_ADD;
     if (blend && ((cm >> 11) & 1)) {
         csrc = GX2_BLEND_MODE_ONE; cdst = GX2_BLEND_MODE_ONE; ccomb = GX2_BLEND_COMBINE_MODE_REV_SUB;
+        // warplowres: the half-size target starts at 0 and accumulates the quads' colour
+        // with ADD; the composite then subtracts the sum from the full-size target.
+        if (s_warpPass) ccomb = GX2_BLEND_COMBINE_MODE_ADD;
     } else if (blend) {
         csrc = noDstAlpha(kSrc[(cm >> 8) & 7]); cdst = noDstAlpha(kDst[(cm >> 5) & 7]);
     }
@@ -5416,11 +5880,327 @@ static void applyState() {
                              (GX2ChannelMask)0, (GX2ChannelMask)0, (GX2ChannelMask)0);
 }
 
+// SD marker "hotlist" (build hotlist1).  s_hotOn is false unless the marker is
+// present AND gx2prod and the gpuframe log are on; every use below sits behind
+// it, so without the marker no extra work runs and no extra stamp is issued.
+// The worker summarises each list it records (s_hotOpen), pushes the summary
+// into a ring just before enqueue_list(), and core 1 reads the ring in the same
+// order when it replays the list (gx2ProdCallList).  Optional marker
+// hotskip=<ordinal> leaves out the GX2 draw call(s) of that list ordinal in
+// each frame; the state they would use is still recorded, so the redundancy
+// caches stay valid.
+extern "C" int sms_wiiu_gpuframe_hot_enable(void);
+extern "C" void sms_wiiu_gpuframe_stamp_tag(int kind, const void* tag);
+extern "C" int sms_wiiu_hotcaller_enabled(void);
+static constexpr uint32_t kHotRing = 4096;  // = the service ring: lists in flight never wrap it
+static bool s_hotMarker, s_hotOn;
+static bool s_hotSplit;
+static int s_hotSkipOrd = -1;
+static HotListInfo* s_hotRing;
+static HotListInfo s_hotOpen;
+static uint32_t s_hotWrite, s_hotRead, s_hotListNo, s_hotMismatch;
+static uint8_t s_hotPass;
+
+extern "C" int sms_wiiu_hotlist_split_enabled(void) {
+    return s_hotOn && s_hotSplit ? 1 : 0;
+}
+
+/* Called by the worker while it parses the ordered host-state token.  The
+ * token is a producer-stream boundary: finish the preceding merged list,
+ * then label the next list until the matching exit token. */
+extern "C" void sms_wiiu_hotlist_boundary(uint32_t phase) {
+    if (!s_hotOn || !s_hotSplit) return;
+    flushBatch();
+    gx2DlClose();
+    s_hotPass = phase == 1 ? 1 : phase == 3 ? 2 : 0;
+}
+
+static void hotTex(HotTex& o, const TextureEntry& t, uint32_t map) {
+    o.src = uint32_t(reinterpret_cast<uintptr_t>(t.source));
+    o.img = uint32_t(reinterpret_cast<uintptr_t>(t.texture.surface.image));
+    o.w = uint16_t(t.width);
+    o.h = uint16_t(t.height);
+    o.fmt = uint8_t(t.fmt);
+    o.map = uint8_t(map);
+}
+
+static void hotSig(HotDraw& d, uint32_t nidx, const TevKey& key, TextureEntry* const* tex) {
+    d = HotDraw{};
+    d.nidx = nidx;
+    d.cm0 = g.bp[BP_CMODE0];
+    d.stages = uint16_t(key.stages);
+    d.texMask = uint8_t(tevTextureMask(key));
+    d.zmode = uint8_t(g.bp[BP_ZMODE] & 0xff);
+    d.vpw = uint16_t(g.viewport[2]);
+    d.vph = uint16_t(g.viewport[3]);
+    uint32_t n = 0;
+    for (uint32_t map = 0; map < 8 && n < 2; ++map)
+        if (tex[map]) hotTex(d.tex[n++], *tex[map], map);
+    for (uint32_t i = 0; i < 8; ++i) d.caller[i] = g_hotCaller[i];
+    d.identity = g_hotIdentity;
+}
+
+// Called once per draw that goes into the open list.  Returns true when the
+// hotskip marker asks for this draw's GX2 draw call to be left out.
+static bool hotNoteDraw(uint32_t nidx, const TevKey& key, TextureEntry* const* tex) {
+    HotListInfo& h = s_hotOpen;
+    const bool skip = s_hotSkipOrd >= 0 && s_hotListNo == uint32_t(s_hotSkipOrd);
+    if (!h.draws) hotSig(h.first, nidx, key, tex);
+    if (!h.draws || nidx > h.maxIdx) hotSig(h.big, nidx, key, tex);
+    ++h.draws;
+    h.totalIdx += nidx;
+    if (nidx > h.maxIdx) h.maxIdx = nidx;
+    if (skip) ++h.skipped;
+    return skip;
+}
+
+// The JPA indirect emitters (TEmitterIndirectViewObj: heat-shimmer particles) draw
+// quads with 4 TEV stages, an indirect stage, map 0 = the half-size screen copy
+// (gpScreenTexture, 320x224 for a 640x448 GX viewport), map 2 = the 32x32 distortion
+// texture, no z test.  hotlist1 on the console showed that as the first draw of the
+// expensive Corona batches.  The indirect flag is logged but not required (it is the
+// one part of the key not seen in the hotlist output).
+static bool warpSigMatch(const TevKey& key, TextureEntry* const* tex) {
+    if (key.stages != 4 || tevTextureMask(key) != 0x05 || (g.bp[BP_ZMODE] & 1)) return false;
+    const TextureEntry* t0 = tex[0];
+    const TextureEntry* t2 = tex[2];
+    if (!t0 || !t2 || t2->width != 32 || t2->height != 32) return false;
+    return float(t0->width) * 2.0f == g.viewport[2] && float(t0->height) * 2.0f == g.viewport[3];
+}
+
+static bool warpMatch(uint32_t nidx, const TevKey& key, TextureEntry* const* tex) {
+    if (!warpSigMatch(key, tex)) return false;
+    const TextureEntry* t0 = tex[0];
+    const TextureEntry* t2 = tex[2];
+    ++s_warpTotal;
+    if (!s_warpFirstLogged) {
+        s_warpFirstLogged = true;
+        bool ind = key.iref != 0;
+        for (uint32_t i = 0; i < 16; ++i) ind = ind || key.ind[i] != 0;
+        WHBLogPrintf("SMS Wii U: [warp] first match this scene: idx=%u ind=%d cm0=%08x t0=%ux%u f%u src=%08x img=%08x t2=%ux%u f%u vp=%dx%d signature=%s",
+                     unsigned(nidx), ind ? 1 : 0, unsigned(g.bp[BP_CMODE0]), unsigned(t0->width), unsigned(t0->height),
+                     unsigned(t0->fmt), unsigned(uintptr_t(t0->source)), unsigned(uintptr_t(t0->texture.surface.image)),
+                     unsigned(t2->width), unsigned(t2->height), unsigned(t2->fmt), int(g.viewport[2]), int(g.viewport[3]),
+                     SMS_WARP_SIGNATURE);
+    }
+    return true;
+}
+
+/* ---- warplowres ----------------------------------------------------------
+ * The shimmer quads blend with GX_BM_SUBTRACT, which the port draws as
+ * REV_SUB(ONE, ONE): dst' = max(0, dst - src).  That is linear in src, so a run of
+ * such draws equals ONE subtraction of their summed colour (every src >= 0, the
+ * UNORM clamp at 0 and 1 commutes with the sum: max(0, max(0, d - a) - b) =
+ * max(0, d - a - b), and d - min(1, a + b) clamps to the same 0).  So the pass
+ * clears a half-size RGBA target to 0, draws the quads into it with ADD(ONE, ONE)
+ * (applyState, s_warpPass) at half the mapping scale, and the End service
+ * subtracts it from the full-size target with one bilinear fullscreen quad
+ * (REV_SUB, ONE, ONE, RGB only, as the quads' own colour mask).  Only draws that
+ * match the warp signature AND subtract-blend with no z test/write, no alpha
+ * update and no dst-alpha constant are taken; anything else ends the pass first.
+ *
+ * Ordering follows executeCopy, not the bath hooks: everything happens on the
+ * worker at the draw's position in the stream (close the list, queue the core-1
+ * service, flip the mapping, invalidate the caches, reopen a list), so there is no
+ * game-thread flush and no fence, and the services run in list order on core 1.
+ * Any other split (copy, clear, token, context), any worker boundary and any
+ * non-matching draw ends the pass, so a pass never spans a frame or a wait. */
+struct WarpLowTarget {
+    GX2ColorBuffer colour;
+    GX2DepthBuffer depth;
+    GX2Texture colourTex;
+    uint32_t mainW, mainH;
+    bool valid;
+};
+static WarpLowTarget s_warpLow;
+static BathLowResMapping s_warpFullMapping;
+static bool s_warpLowFailed;
+static BathDepthVertex* s_warpQuadRing;
+static uint32_t s_warpQuadNext;
+static GX2Sampler s_warpSampler;
+static constexpr uint32_t kWarpQuadSlots = 64;
+
+static bool warpLowMatch(const TevKey& key, TextureEntry* const* tex) {
+    if (!warpSigMatch(key, tex)) return false;
+    const uint32_t cm = g.bp[BP_CMODE0];
+    return (cm & 1) && ((cm >> 11) & 1) && !((cm >> 4) & 1) && !(g.bp[BP_ZMODE] & 0x11) &&
+           !((g.bp[BP_CMODE1] >> 8) & 1);
+}
+
+static bool warpLowEnsureTarget() {
+    GX2ColorBuffer* mc = renderColour();
+    if (!mc || !mc->surface.width || !mc->surface.height) return false;
+    if (s_warpLow.valid && s_warpLow.mainW == mc->surface.width && s_warpLow.mainH == mc->surface.height)
+        return true;
+    if (s_warpLow.valid) {
+        deferFree(s_warpLow.colour.surface.image);
+        deferFree(s_warpLow.depth.surface.image);
+        s_warpLow = WarpLowTarget{};
+    }
+    const uint32_t w = (mc->surface.width + 1) / 2, h = (mc->surface.height + 1) / 2;
+    WarpLowTarget t = {};
+    const bool ok = bathAllocSurface(t.colour.surface, GX2SurfaceUse(GX2_SURFACE_USE_TEXTURE | GX2_SURFACE_USE_COLOR_BUFFER),
+                                     mc->surface.format, w, h) &&
+                    bathAllocSurface(t.depth.surface, GX2_SURFACE_USE_DEPTH_BUFFER, GX2_SURFACE_FORMAT_FLOAT_R32, w, h);
+    if (!ok) {
+        if (t.colour.surface.image) MEMFreeToDefaultHeap(t.colour.surface.image);
+        if (t.depth.surface.image) MEMFreeToDefaultHeap(t.depth.surface.image);
+        return false;
+    }
+    t.colour.viewNumSlices = 1;
+    t.depth.viewNumSlices = 1;
+    GX2InitColorBufferRegs(&t.colour);
+    GX2InitDepthBufferRegs(&t.depth);
+    t.colourTex.surface = t.colour.surface;
+    t.colourTex.viewNumMips = 1;
+    t.colourTex.viewNumSlices = 1;
+    t.colourTex.compMap = GX2_COMP_MAP(GX2_SQ_SEL_R, GX2_SQ_SEL_G, GX2_SQ_SEL_B, GX2_SQ_SEL_A);
+    GX2InitTextureRegs(&t.colourTex);
+    GX2InitSampler(&s_warpSampler, GX2_TEX_CLAMP_MODE_CLAMP, GX2_TEX_XY_FILTER_MODE_LINEAR);
+    t.mainW = mc->surface.width;
+    t.mainH = mc->surface.height;
+    t.valid = true;
+    s_warpLow = t;
+    WHBLogPrintf("SMS Wii U: [warplowres] target=%ux%u for main %ux%u", unsigned(w), unsigned(h),
+                 unsigned(t.mainW), unsigned(t.mainH));
+    return true;
+}
+
+// Worker: scale the mapping the vertex uniforms and scissors are computed from.
+// Only pixel quantities scale (gameScale, gameX, lodScale); s_efbW and s_ox are in
+// game units and stay.  (bathSetMapping halves those two as well.)
+static void warpSetMapping(bool low) {
+    if (low) {
+        s_warpFullMapping = {s_tvW, s_tvH, s_gameScale, s_gameX, s_efbW, s_ox, s_lodScale, s_xmap};
+        s_tvW = float(s_warpLow.colour.surface.width);
+        s_tvH = float(s_warpLow.colour.surface.height);
+        s_gameScale = s_warpFullMapping.gameScale * 0.5f;
+        s_gameX = s_warpFullMapping.gameX * 0.5f;
+        s_lodScale = s_warpFullMapping.lodScale * 0.5f;
+    } else {
+        s_tvW = s_warpFullMapping.tvW;
+        s_tvH = s_warpFullMapping.tvH;
+        s_gameScale = s_warpFullMapping.gameScale;
+        s_gameX = s_warpFullMapping.gameX;
+        s_lodScale = s_warpFullMapping.lodScale;
+        s_xmap = s_warpFullMapping.xmap;
+    }
+}
+
+// Core 1, in list order: clear the scratch target to 0 and draw into it.
+static void warpBeginService(void*) {
+    if (!s_warpLow.valid) return;
+    GX2ClearColor(&s_warpLow.colour, 0.0f, 0.0f, 0.0f, 0.0f);
+    GX2ClearDepthStencilEx(&s_warpLow.depth, 1.0f, 0, GX2_CLEAR_FLAGS_DEPTH);
+    GX2Invalidate(GX2_INVALIDATE_MODE_DEPTH_BUFFER, s_warpLow.depth.surface.image, s_warpLow.depth.surface.imageSize);
+    // Clears leave the context undefined (GPR split included): restore, then bind.
+    GX2SetContextState(WHBGfxGetTVContextState());
+    GX2SetColorBuffer(&s_warpLow.colour, GX2_RENDER_TARGET_0);
+    GX2SetDepthBuffer(&s_warpLow.depth);
+    GX2SetViewport(0.0f, 0.0f, float(s_warpLow.colour.surface.width), float(s_warpLow.colour.surface.height), 0.0f, 1.0f);
+    GX2SetScissor(0, 0, s_warpLow.colour.surface.width, s_warpLow.colour.surface.height);
+}
+
+// Core 1: back to the main target and subtract the scratch target from it.
+static void warpEndService(void*) {
+    if (!s_warpLow.valid) return;
+    GX2Invalidate(GX2_INVALIDATE_MODE_COLOR_BUFFER, s_warpLow.colour.surface.image, s_warpLow.colour.surface.imageSize);
+    GX2Invalidate(GX2_INVALIDATE_MODE_TEXTURE, s_warpLow.colour.surface.image, s_warpLow.colour.surface.imageSize);
+    rebindTvTarget(false);
+    resetTargetScissor();
+    if (!s_warpQuadRing)
+        s_warpQuadRing = static_cast<BathDepthVertex*>(
+            alignedZero(GX2_VERTEX_BUFFER_ALIGNMENT, sizeof(BathDepthVertex) * 6 * kWarpQuadSlots));
+    if (!s_warpQuadRing) return;
+    GX2ColorBuffer* mc = renderColour();
+    static const float kCorners[6][4] = {
+        {-1.0f, -1.0f, 0.0f, 1.0f}, {1.0f, -1.0f, 1.0f, 1.0f}, {1.0f, 1.0f, 1.0f, 0.0f},
+        {-1.0f, -1.0f, 0.0f, 1.0f}, {1.0f, 1.0f, 1.0f, 0.0f}, {-1.0f, 1.0f, 0.0f, 0.0f}};
+    BathDepthVertex* v = s_warpQuadRing + (s_warpQuadNext++ % kWarpQuadSlots) * 6;
+    for (uint32_t i = 0; i < 6; ++i) {
+        v[i].position[0] = kCorners[i][0];
+        v[i].position[1] = kCorners[i][1];
+        v[i].position[2] = 0.5f;
+        v[i].position[3] = 1.0f;
+        v[i].texcoord[0] = kCorners[i][2];
+        v[i].texcoord[1] = kCorners[i][3];
+        v[i].colour[0] = v[i].colour[1] = v[i].colour[2] = v[i].colour[3] = 1.0f;
+    }
+    DCFlushRange(v, sizeof(BathDepthVertex) * 6);
+    GX2Invalidate(GX2_INVALIDATE_MODE_CPU_ATTRIBUTE_BUFFER, v, sizeof(BathDepthVertex) * 6);
+    static const float windowParams[4] = {1, 0, 0, 0};
+    GX2SetFetchShader(&s_modulate.fetch);
+    GX2SetVertexShader(&s_modulate.vertex);
+    GX2SetPixelShader(&s_modulate.pixel);
+    GX2SetPixelUniformReg(s_modulate.pixel.uniformVars[0].offset, 4, windowParams);
+    GX2SetPixelTexture(&s_warpLow.colourTex, 0);
+    GX2SetPixelSampler(&s_warpSampler, 0);
+    GX2SetViewport(0.0f, 0.0f, float(mc->surface.width), float(mc->surface.height), 0.0f, 1.0f);
+    GX2SetBlendControl(GX2_RENDER_TARGET_0, GX2_BLEND_MODE_ONE, GX2_BLEND_MODE_ONE, GX2_BLEND_COMBINE_MODE_REV_SUB,
+                       FALSE, GX2_BLEND_MODE_ONE, GX2_BLEND_MODE_ONE, GX2_BLEND_COMBINE_MODE_REV_SUB);
+    GX2SetColorControl(GX2_LOGIC_OP_COPY, 0xff, FALSE, TRUE);
+    GX2SetDepthOnlyControl(FALSE, FALSE, GX2_COMPARE_FUNC_ALWAYS);
+    GX2SetAlphaTest(FALSE, GX2_COMPARE_FUNC_ALWAYS, 0.0f);
+    GX2SetTargetChannelMasks(GX2ChannelMask(GX2_CHANNEL_MASK_RGB), (GX2ChannelMask)0, (GX2ChannelMask)0,
+                             (GX2ChannelMask)0, (GX2ChannelMask)0, (GX2ChannelMask)0, (GX2ChannelMask)0,
+                             (GX2ChannelMask)0);
+    GX2SetPolygonControl(GX2_FRONT_FACE_CW, FALSE, FALSE, FALSE, GX2_POLYGON_MODE_TRIANGLE, GX2_POLYGON_MODE_TRIANGLE,
+                         FALSE, FALSE, FALSE);
+    GX2SetAttribBuffer(0, sizeof(BathDepthVertex) * 6, sizeof(BathDepthVertex), v);
+    GX2DrawEx(GX2_PRIMITIVE_MODE_TRIANGLES, 6, 0, 1);
+}
+
+// Worker: the next draw belongs in a half-size pass.
+static void warpPassBegin() {
+    if (s_warpPass || !s_gx2ProdEnabled || s_warpLowFailed) return;
+    if (!warpLowEnsureTarget()) {
+        s_warpLowFailed = true;
+        WHBLogPrintf("SMS Wii U: [warplowres] target allocation failed; shimmer stays full size");
+        return;
+    }
+    gx2DlClose();
+    if (!gx2prod::enqueueService(warpBeginService, nullptr, gx2prod::SERVICE_COUNTER_COPY_CLEAR)) {
+        s_warpLowFailed = true;
+        WHBLogPrintf("SMS Wii U: [warplowres] begin service rejected; shimmer stays full size");
+        gx2DlOpenForDraw();
+        return;
+    }
+    warpSetMapping(true);
+    s_warpPass = true;
+    ++s_warpLowPasses;
+    invalidateVertexUniforms();
+    gx2DlOpenForDraw();
+}
+
+// Worker: the pass is over (a non-matching draw, a split, or a boundary).
+static void warpPassEnd(bool reopen) {
+    if (!s_warpPass) return;
+    s_warpPass = false;  // first: nothing below may recurse into a split
+    gx2DlClose();
+    warpSetMapping(false);
+    if (!gx2prod::enqueueService(warpEndService, nullptr, gx2prod::SERVICE_COUNTER_COPY_CLEAR))
+        WHBLogPrintf("SMS Wii U: [warplowres] end service rejected; the target stays on the scratch surface");
+    invalidateVertexUniforms();
+    if (reopen) gx2DlOpenForDraw();
+}
+
+// Worker, once per draw that goes into the open list (either marker).  True: leave
+// the GX2 draw call out.  The per-draw state is already recorded either way.
+static bool drawSkipped(uint32_t nidx, const TevKey& key, TextureEntry* const* tex) {
+    bool skip = s_hotOn && hotNoteDraw(nidx, key, tex);
+    if (s_warpOn && s_warpScene && warpMatch(nidx, key, tex)) {
+        if (s_hotOn && !skip) ++s_hotOpen.skipped;
+        skip = true;
+    }
+    return skip;
+}
+
 static void grassDrawConsumer(GrassGroupGpu& group, uint8_t mode,
                               float drawX, float drawZ, const float* swing) {
     /* Grass is a normal draw boundary: pending decoded GX geometry must be
      * submitted before its replacement state is installed. */
     flushBatch();
+    if (s_warpPass) warpPassEnd(true);
     if (group.failed || !group.uploaded || group.generation != s_grassGeneration ||
         !s_grassShaderReady || !s_frameActive) {
         grassRefuse(group, "grass group is stale or unavailable");
@@ -5469,7 +6249,8 @@ static void grassDrawConsumer(GrassGroupGpu& group, uint8_t mode,
     ++s_grassDynamicUploads;
     GrassFetchRecord* buffer = mode == 0 ? group.nearBuffer : group.farBuffer;
     GX2SetAttribBuffer(0, group.bytes, sizeof(GrassFetchRecord), buffer);
-    GX2DrawEx(GX2_PRIMITIVE_MODE_TRIANGLES, group.count * 3, 0, 1);
+    const bool hotSkip = s_hotOn && s_gx2DlEnabled && hotNoteDraw(group.count * 3, tevKey, tevTextures);
+    if (!hotSkip) GX2DrawEx(GX2_PRIMITIVE_MODE_TRIANGLES, group.count * 3, 0, 1);
     if (s_gx2DlEnabled) ++s_gx2DlOpenDraws;
     if (g.bp[BP_ZMODE] & 0x10) s_depthWritten = true;
     ++s_drawsThisFrame;
@@ -6036,6 +6817,12 @@ void rendererInit(float) {
     // sd:/wiiu/apps/sms/cpuxf forces the CPU transform for A/B runs.
     s_gpuXfEnabled = envFlag("SMS_GX2_GPU_XF", true) && !sdMarkerPresent("cpuxf");
     s_retileTextures = !sdMarkerPresent("noretile");
+    s_goopWbEnabled = !sdMarkerPresent("nogoopwb");  // default-on 2026-11-12 (user: "Flydd bug fixed"); nogoopwb opts out
+    s_goopWbNoStamp = sdMarkerPresent("goopwbnostamp");
+    s_goopWbEvery = sdMarkerPresent("goopwbevery4") ? 4u : sdMarkerPresent("goopwbevery2") ? 2u : 1u;
+    s_goopWbAll = sdMarkerPresent("goopwball");
+    if (s_goopWbEnabled)
+        WHBLogPrintf("[goopwb] enabled: registered pollution I8 destinations only every=%u nostamp=%d cap=%s", unsigned(s_goopWbEvery), s_goopWbNoStamp ? 1 : 0, s_goopWbAll ? "off(goopwball)" : "32k texels/frame");
     if (const char* hud = std::getenv("SMS_WIDESCREEN_HUD"))
         s_hudEdges = s_wide > 1.0f && std::strcmp(hud, "edges") == 0;
     updateWideTarget();
@@ -6069,6 +6856,16 @@ void rendererInit(float) {
                  s_bathLowResMarker ? "on" : "off", s_bathNoDepth ? "on" : "off",
                  s_bathFence ? "on" : "off", s_bathNoSwitch ? "on" : "off",
                  s_bathFull ? "on" : "off");
+    s_hotMarker = sdMarkerPresent("hotlist");
+    s_hotSplit = s_hotMarker && sdMarkerPresent("hotsplit");
+    WHBLogPrintf("SMS Wii U: [hotlist] build=hotname7 marker=%s", s_hotMarker ? "on" : "off");
+    s_warpMarker = sdMarkerPresent("nocoronawarp");
+    s_warpOn = s_warpMarker && s_gx2DlEnabled;
+    WHBLogPrintf("SMS Wii U: [warp] build=warpskip1 marker=%s", s_warpMarker ? "on" : "off");
+    if (s_warpMarker && !s_warpOn)
+        WHBLogPrintf("SMS Wii U: [warp] REFUSED: needs the gx2dl display-list path");
+    s_warpLowMarker = sdMarkerPresent("warplowres");
+    WHBLogPrintf("SMS Wii U: [warplowres] build=warplow1 marker=%s", s_warpLowMarker ? "on" : "off");
     // Pianta 50.0 -> 33.3 ms with the mixer off core 0 (2026-10-27).
     s_compactVx = !sdMarkerPresent("nocompactvx");
     if (!s_compactVx) WHBLogPrintf("SMS Wii U: [compactvx] packed vertex batches off (SD marker nocompactvx)");
@@ -6145,6 +6942,34 @@ void rendererInit(float) {
             WHBLogPrintf("SMS Wii U: [gx2prod] worker start failed; marker path disabled");
         }
     }
+    if (s_warpLowMarker) {
+        s_warpLowOn = s_gx2ProdEnabled && s_gx2DlEnabled;
+        WHBLogPrintf("SMS Wii U: [warplowres] %s (needs gx2dl and gx2prod; coronaBoss only; %s)",
+                     s_warpLowOn ? "active" : "REFUSED", s_warpOn ? "nocoronawarp also on: skip wins" : "lowres");
+    }
+    if (s_hotMarker) {
+        if (s_gx2ProdEnabled && s_gx2DlEnabled && sms_wiiu_gpuframe_hot_enable()) {
+            s_hotRing = static_cast<HotListInfo*>(
+                MEMAllocFromDefaultHeapEx(uint32_t(kHotRing * sizeof(HotListInfo)), 64));
+            if (s_hotRing) {
+                std::memset(s_hotRing, 0, kHotRing * sizeof(HotListInfo));
+                for (int ord = 0; ord < 256 && s_hotSkipOrd < 0; ++ord) {
+                    char name[24];
+                    std::snprintf(name, sizeof(name), "hotskip=%d", ord);
+                    if (sdMarkerPresent(name)) s_hotSkipOrd = ord;
+                }
+                s_hotOn = true;
+            }
+        }
+        if (s_hotOn)
+            WHBLogPrintf("SMS Wii U: [hotlist] hotsplit=%s (SD marker hotsplit)", s_hotSplit ? "on" : "off");
+        WHBLogPrintf("SMS Wii U: [hotlist] %s (needs gx2dl, gx2prod and the gpuframe marker) skip-ordinal=%d",
+                     s_hotOn ? "active" : "REFUSED", s_hotSkipOrd);
+    }
+}
+
+extern "C" int sms_wiiu_hotcaller_enabled(void) {
+    return s_hotOn ? 1 : 0;
 }
 
 static void hudReanchor() {
@@ -6749,12 +7574,31 @@ static uint32_t s_perfDlSplitsCopy, s_perfDlSplitsClear, s_perfDlSplitsContext, 
 static uint32_t s_perfDlCoreRecord, s_perfDlCoreCall;
 static bool s_gx2DlRecording;
 
+// Core 1: pair the replayed list with the worker's summary and stamp it.
+static void hotStampList(void* list) {
+    const uint32_t addr = uint32_t(reinterpret_cast<uintptr_t>(list));
+    uint32_t at = s_hotRead;
+    // The ring and the service queue carry the same lists in the same order;
+    // if a summary is missing, look a few ahead rather than mis-tag every list after.
+    for (uint32_t ahead = 0; ahead < 16 && at + ahead != s_hotWrite; ++ahead) {
+        if (s_hotRing[(at + ahead) % kHotRing].list == addr) {
+            s_hotRead = at + ahead + 1;
+            sms_wiiu_gpuframe_stamp_tag(1, &s_hotRing[(at + ahead) % kHotRing]);
+            return;
+        }
+    }
+    ++s_hotMismatch;
+    HotListInfo none = {};
+    sms_wiiu_gpuframe_stamp_tag(1, &none);
+}
+
 static void gx2ProdCallList(void* list, uint32_t bytes) {
     if (OSGetCoreId() != 1)
         WHBLogPrintf("SMS Wii U: [gx2prod] list service on unexpected core=%u", (unsigned)OSGetCoreId());
     sms_wiiu_gpuframe_stamp(0);
     GX2DirectCallDisplayList(list, bytes);
-    sms_wiiu_gpuframe_stamp(1);
+    if (s_hotOn) hotStampList(list);
+    else sms_wiiu_gpuframe_stamp(1);
     ++s_perfDlCalled;
     s_perfDlCoreCall = OSGetCoreId();
 }
@@ -6775,6 +7619,7 @@ static void gx2ProdConsume(const uint8_t* bytes, uint32_t size) {
 static void gx2ProdBoundary(uint32_t kind) {
     SMS_PORT_HEAP_SCOPE();
     producerBoundary(kind);
+    if (s_warpPass) warpPassEnd(false);
     // flushBatch() leaves a merged display list open.  Closing it before this
     // hook returns ensures enqueue_list() precedes the worker's barrier.
     gx2DlClose();
@@ -6834,11 +7679,22 @@ static bool gx2DlEndCall(void* list) {
     s_perfDlBytes += bytes;
     s_perfDlMaxBytes = std::max(s_perfDlMaxBytes, bytes);
     if (s_gx2ProdEnabled) {
+        if (s_hotOn) {
+            // Summary first, then the list: core 1 sees the list only after enqueue.
+            s_hotOpen.valid = 1;
+            s_hotOpen.ord = s_hotListNo;
+            s_hotOpen.list = uint32_t(reinterpret_cast<uintptr_t>(list));
+            s_hotRing[s_hotWrite % kHotRing] = s_hotOpen;
+            __asm__ volatile("sync" ::: "memory");
+            ++s_hotWrite;
+        }
         if (!gx2prod::enqueue_list(list, bytes)) {
+            if (s_hotOn) --s_hotWrite;
             ++s_perfDlOverflows;
             WHBLogPrintf("SMS Wii U: [gx2prod] list queue overflow; sequence stopped");
             return false;
         }
+        if (s_hotOn) ++s_hotListNo;
     } else {
         gx2ProdCallList(list, bytes);
     }
@@ -6867,6 +7723,7 @@ static void gx2DlClose() {
 
 static void gx2DlSplit(int reason) {
     if (gx2DlRejectCore1ProducerClose("gx2DlSplit")) return;
+    if (s_warpPass) warpPassEnd(false);
     if (!s_gx2DlOpen) return;
     switch (reason) {
     case kDlSplitCopy: ++s_perfDlSplitsCopy; break;
@@ -6885,6 +7742,10 @@ static bool gx2DlOpenForDraw() {
         if (!gx2DlBegin(&list)) return false;
         s_gx2DlOpen = list;
         s_gx2DlOpenDraws = 0;
+        if (s_hotOn) {
+            s_hotOpen = HotListInfo{};
+            s_hotOpen.pass = s_hotPass;
+        }
     }
     return true;
 }
@@ -6920,11 +7781,16 @@ static DrawDoneSite s_ddSites[8];
 static uint32_t s_ddOther;
 static uintptr_t s_ddFrameMaxLr;
 static OSTime s_ddFrameMax;
+extern "C" void sms_wiiu_slowprof_drawdone(uint32_t lr, uint32_t waitUs);
+extern "C" int sms_wiiu_slowprof_enabled(void);
+extern "C" void sms_wiiu_slowprof_frame(uint32_t preUs);
 void producerDrawDoneWait(void* caller) {
     const OSTime t0 = OSGetTime();
     gx2prod::wait(gx2prod::kWaitDrawDone);
     const OSTime dt = OSGetTime() - t0;
     const uintptr_t lr = reinterpret_cast<uintptr_t>(caller);
+    if (sms_wiiu_slowprof_enabled())
+        sms_wiiu_slowprof_drawdone(uint32_t(lr), uint32_t(OSTicksToMicroseconds(dt)));
     if (dt > s_ddFrameMax) { s_ddFrameMax = dt; s_ddFrameMaxLr = lr; }
     for (DrawDoneSite& site : s_ddSites) {
         if (site.lr && site.lr != lr) continue;
@@ -7055,6 +7921,16 @@ void flushBatch() {
         // CPU TEV evaluator when they are priming a generated fixed program.
         if (allTextures && (mask || SMS_GX2_TEV_UNTEXTURED)) tevShader = tevShaderForKey(tevKey);
     }
+    if (s_warpLowOn) {
+        // warplowres: enter or leave the half-size pass at this draw (nocoronawarp wins).
+        const bool want = s_warpScene && !s_warpOn && warpLowMatch(tevKey, tevTextures);
+        if (want) ++s_warpLowDraws;
+        if (want != s_warpPass) {
+            if (want) warpPassBegin();
+            else warpPassEnd(true);
+            s_xmap = drawXMap();
+        }
+    }
     const bool tevPath = tevShader != nullptr;
     if (SMS_GX2_DEBUG_DUMP && !tevPath) {
         const uint32_t mask = tevTextureMask(tevKey);
@@ -7143,8 +8019,9 @@ void flushBatch() {
             if (listReady) {
                 GX2SetAttribBuffer(0, (pend.n + 1) * kRawVertexStride, kRawVertexStride,
                                    s_dlArena + pend.ref->baseVertex);
-                GX2DrawIndexedEx(GX2_PRIMITIVE_MODE_TRIANGLES, pend.nidx, GX2_INDEX_TYPE_U32,
-                                 const_cast<uint32_t*>(storedIdx), 0, 1);
+                if (!((s_hotOn || s_warpOn) && drawSkipped(pend.nidx, tevKey, tevTextures)))
+                    GX2DrawIndexedEx(GX2_PRIMITIVE_MODE_TRIANGLES, pend.nidx, GX2_INDEX_TYPE_U32,
+                                     const_cast<uint32_t*>(storedIdx), 0, 1);
                 ++s_gx2DlOpenDraws;
             } else {
                 GX2SetAttribBuffer(0, (pend.n + 1) * kRawVertexStride, kRawVertexStride,
@@ -7349,7 +8226,8 @@ void flushBatch() {
                      (unsigned)k.numTexGens, (unsigned)k.dualTex, (unsigned)k.postTex[0], (unsigned)k.projectionOrtho);
     }
     if (listReady) {
-        GX2DrawIndexedEx(mode, indexCount, GX2_INDEX_TYPE_U32, ibo, 0, 1);
+        if (!((s_hotOn || s_warpOn) && drawSkipped(indexCount, tevKey, tevTextures)))
+            GX2DrawIndexedEx(mode, indexCount, GX2_INDEX_TYPE_U32, ibo, 0, 1);
         ++s_gx2DlOpenDraws;
     } else {
         GX2DrawIndexedEx(mode, indexCount, GX2_INDEX_TYPE_U32, ibo, 0, 1);
@@ -7549,7 +8427,18 @@ static void producerCopyService(void* opaque) {
                       r.copy.destination.imageSize);
         GX2Invalidate(GX2_INVALIDATE_MODE_TEXTURE, r.copy.destination.image,
                       r.copy.destination.imageSize);
-        sms_wiiu_gpuframe_stamp(7);
+        if (r.copy.goopSlot)
+            goopWbStageCopy(r.copy.destination, *r.copy.goopSlot);
+        if (s_hotOn) {
+            HotListInfo tag = {};
+            tag.valid = 2;
+            tag.aux[0] = uint32_t(reinterpret_cast<uintptr_t>(r.copy.destination.image));
+            tag.aux[1] = r.copy.destination.width;
+            tag.aux[2] = r.copy.destination.height;
+            sms_wiiu_gpuframe_stamp_tag(7, &tag);
+        } else {
+            sms_wiiu_gpuframe_stamp(7);
+        }
     }
     rebindTvTarget(false);
     if (!r.clear) return;
@@ -7621,8 +8510,8 @@ void executeCopy(uint32_t ctrl) {
                 th = uint32_t(float(h) * s_gameScale);
             }
             if (tx >= cb->surface.width || ty >= cb->surface.height) tw = th = 0;
-            if (tx + tw > cb->surface.width) tw = cb->surface.width - tx;
-            if (ty + th > cb->surface.height) th = cb->surface.height - ty;
+            if (tw && tx + tw > cb->surface.width) tw = cb->surface.width - tx;  // tw==0 when tx is outside: no unsigned underflow
+            if (th && ty + th > cb->surface.height) th = cb->surface.height - ty;
             r.clearRect = {int32_t(tx), int32_t(ty), int32_t(tx + tw), int32_t(ty + th)};
         }
         debugCopy(r.display, x, y, w, h, g.copyDest, ctrl);
@@ -8390,6 +9279,7 @@ extern "C" void sms_wiiu_gx2_renderer_shutdown(void) {
         sms_wiiu_gx2_renderer_prepare_exit();
         WHBLogPrintf("SMS Wii U: [gx2prod] worker stopped");
     }
+    goopWbShutdown();
     texturePackShutdown();
     // No GX2 work here: sms_wiiu_exit runs after ProcUI released the
     // foreground, and handing WHBGfx back its TV-sized layout (a precaution
@@ -8438,6 +9328,16 @@ extern "C" void sms_wiiu_gx2_renderer_begin(void) {
     }
     sms_wiiu_gpuframe_stamp(10);
     s_debugDrawNo = 0;
+    if (s_hotOn) s_hotListNo = 0;
+    if (s_warpLowOn && s_warpScene && ++s_warpLowFrames % 300 == 0)
+        WHBLogPrintf("SMS Wii U: [warplowres] passes=%u.%u/frame draws=%u.%u/frame total=%u/%u frames=%u",
+                     unsigned(s_warpLowPasses * 10 / s_warpLowFrames / 10), unsigned(s_warpLowPasses * 10 / s_warpLowFrames % 10),
+                     unsigned(s_warpLowDraws * 10 / s_warpLowFrames / 10), unsigned(s_warpLowDraws * 10 / s_warpLowFrames % 10),
+                     unsigned(s_warpLowPasses), unsigned(s_warpLowDraws), unsigned(s_warpLowFrames));
+    if (s_warpOn && s_warpScene && ++s_warpFrames % 300 == 0)
+        WHBLogPrintf("SMS Wii U: [warp] skipped=%u.%u/frame total=%u frames=%u signature=%s",
+                     unsigned(s_warpTotal * 10 / s_warpFrames / 10), unsigned(s_warpTotal * 10 / s_warpFrames % 10),
+                     unsigned(s_warpTotal), unsigned(s_warpFrames), SMS_WARP_SIGNATURE);
     GX2SetViewport(0.0f, 0.0f, s_tvW, s_tvH, 0.0f, 1.0f);
     GX2SetScissor(0, 0, uint32_t(s_tvW), uint32_t(s_tvH));
     s_frameActive = true;
@@ -8522,6 +9422,7 @@ extern "C" void sms_wiiu_gx2_renderer_end(void) {
 #endif
     flushBatch();
     GX2Flush();
+    goopWbStampPending();
     /* By this frame boundary the worker has consumed every queued command
      * and core 1 has called and flushed every list: start or advance the
      * countdown of scene-retired grass buffers. */
@@ -8536,17 +9437,18 @@ extern "C" void sms_wiiu_gx2_renderer_end(void) {
     const WorkerLargestTextureSnapshot workerMax = workerLargestTextureSnapshot();
     if (s_gx2ProdEnabled && s_prodFrontendStart)
         gx2prod::record_core1_frontend(prodMicros(s_prodFrontendStart));
-    if (s_perfLastEnd) {
-        s_perfWall += perfNow - s_perfLastEnd;
-        const uint32_t us = uint32_t(OSTicksToMicroseconds(perfNow - s_perfLastEnd));
-        if (us > 34000) ++s_frameOver34;
+	if (s_perfLastEnd) {
+		s_perfWall += perfNow - s_perfLastEnd;
+		const uint32_t us = uint32_t(OSTicksToMicroseconds(perfNow - s_perfLastEnd));
+		const uint32_t pre = s_frameBeginTime > s_perfLastEnd ? uint32_t(OSTicksToMicroseconds(s_frameBeginTime - s_perfLastEnd)) : 0;
+		if (sms_wiiu_slowprof_enabled()) sms_wiiu_slowprof_frame(pre);
+		if (us > 34000) ++s_frameOver34;
         if (us > 41700) { ++s_frameOver42; if (s_perfFrames < 32) s_frameMissMask |= 1u << s_perfFrames; }
         if (us > s_frameMaxUs) s_frameMaxUs = us;
         if (us > 45000 && s_hitchLines < 200) {
             ++s_hitchLines;
             const auto usOf = [](OSTime t) { return uint32_t(OSTicksToMicroseconds(t)); };
-            const uint32_t pre = s_frameBeginTime > s_perfLastEnd ? usOf(s_frameBeginTime - s_perfLastEnd) : 0;
-            const uint32_t draw = s_frameBeginTime > s_perfLastEnd ? usOf(perfNow - s_frameBeginTime) : 0;
+			const uint32_t draw = s_frameBeginTime > s_perfLastEnd ? usOf(perfNow - s_frameBeginTime) : 0;
             gx2prod::Counters p = {};
             if (s_gx2ProdEnabled) gx2prod::snapshot(&p);
             const gx2prod::Counters& q = s_hitchLast.prod;
@@ -8627,6 +9529,14 @@ extern "C" void sms_wiiu_gx2_renderer_end(void) {
         WHBLogPrintf("SMS Wii U: [frames] frame=%u over34=%u over42=%u maxUs=%u missMask=%08x logUs=%u", (unsigned)g_displayFrames,
                      (unsigned)s_frameOver34, (unsigned)s_frameOver42, (unsigned)s_frameMaxUs,
                      (unsigned)s_frameMissMask, (unsigned)s_reportUs);
+        if (s_goopWbEnabled)
+            WHBLogPrintf("[goopwb] boundary us total=%llu max=%u (game thread, since start)",
+                         (unsigned long long)s_goopWbBoundaryUs, unsigned(s_goopWbBoundaryMaxUs));
+            WHBLogPrintf("[goopwb] counters queued=%u committed=%u unchanged=%u not-ready=%u slot-exhaustion=%u conflicts=%u superseded=%u stolen=%u forwarded=%u stale=%u",
+                         unsigned(s_goopWbQueued), unsigned(s_goopWbCommitted), unsigned(s_goopWbUnchanged),
+                         unsigned(s_goopWbNotReady), unsigned(s_goopWbSlotExhaustion),
+                         unsigned(s_goopWbConflicts), unsigned(s_goopWbSuperseded), unsigned(s_goopWbStolen),
+                         unsigned(s_goopWbForwarded), unsigned(s_goopWbStaleEvents));
         s_frameOver34 = s_frameOver42 = s_frameMaxUs = s_frameMissMask = 0;
         if (g_perfStages) {
             const OSTime staged = s_stKey + s_stVkey + s_stState + s_stShader + s_stXfu;

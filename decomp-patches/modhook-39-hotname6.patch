@@ -1,0 +1,56 @@
+Reason: wiiu hotname6: associate each loaded J3D model-data object with a copied archive file name and carry that pointer value into the hotlist draw summary.
+--- a/libs/JSystem/include/JSystem/JKernel/JKRFileLoader.hpp
++++ b/libs/JSystem/include/JSystem/JKernel/JKRFileLoader.hpp
+@@ -71,4 +71,8 @@
+ 	/* 0x34 */ u32 mMountCount;
+ };
+ 
++#ifdef __WIIU__
++extern "C" void sms_wiiu_hotname_resource(const void*, const char*);
++#endif
++
+ inline void* JKRGetNameResource(const char* name, JKRFileLoader* loader)
+@@ -79,9 +83,13 @@
+ inline void* JKRGetNameResource(const char* name, JKRFileLoader* loader)
+ {
+-	return JKRFileLoader::getGlbResource(name, loader);
++	void* resource = JKRFileLoader::getGlbResource(name, loader);
++	sms_wiiu_hotname_resource(resource, name);
++	return resource;
+ }
+ 
+ inline void* JKRGetResource(const char* name)
+ {
+-	return JKRFileLoader::getGlbResource(name);
++	void* resource = JKRFileLoader::getGlbResource(name);
++	sms_wiiu_hotname_resource(resource, name);
++	return resource;
+ }
+--- a/libs/JSystem/src/J3D/J3DGraphLoader/J3DModelLoader.cpp
++++ b/libs/JSystem/src/J3D/J3DGraphLoader/J3DModelLoader.cpp
+@@ -10,5 +10,9 @@
+ #include <JSystem/J3D/J3DGraphLoader/J3DMaterialFactory_v21.hpp>
+ #include <JSystem/JUtility/JUTNameTab.hpp>
+ #include <JSystem/JKernel/JKRHeap.hpp>
++
++#ifdef __WIIU__
++extern "C" void sms_wiiu_hotname_model(const void*, const void*);
++#endif
+ 
+ J3DModelData* J3DModelLoaderDataBase::load(const void* i_data, u32 i_flags)
+@@ -105,6 +105,9 @@
+ 	}
+ 	const J3DModelHierarchy* hierarchy = mpModelData->unk8;
+ 	mpModelData->makeHierarchy(nullptr, &hierarchy);
+ 	setupBBoardInfo();
++#ifdef __WIIU__
++	sms_wiiu_hotname_model(mpModelData, i_data);
++#endif
+ 	return mpModelData;
+ }
+--- a/libs/JSystem/src/J3D/J3DGraphBase/J3DPacket.cpp
++++ b/libs/JSystem/src/J3D/J3DGraphBase/J3DPacket.cpp
+@@ -145,2 +145,2 @@
+ 	if (mpOwnerModel)
+-		sms_wiiu_hotname_capture(mpOwnerModel, nullptr, mpOwnerModel->getModelData()->getTextureName());
++		sms_wiiu_hotname_capture(mpOwnerModel, mpOwnerModel->getModelData(), mpOwnerModel->getModelData()->getTextureName());

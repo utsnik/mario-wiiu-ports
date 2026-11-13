@@ -7,6 +7,7 @@
 #include "pauseguard.h"
 #include "gx2_texture_pack.h"
 #include "gx2_producer_worker.h"
+#include "hotlist.h"
 
 #include <dolphin/gx/GXCpu2Efb.h>
 #include <dolphin/gx/GXFrameBuffer.h>
@@ -22,10 +23,12 @@
 #include <whb/gfx.h>
 #include <coreinit/memdefaultheap.h>
 #include <coreinit/time.h>
+#include <JSystem/JUtility/JUTNameTab.hpp>
 #include <gx2/clear.h>
 #include <gx2/display.h>
 #include <gx2/event.h>
 #include <gx2/state.h>
+extern "C" int sms_wiiu_hotname_lookup(uint32_t, char*, size_t);
 extern "C" void sms_wiiu_gx2_target_begin(void);
 extern "C" void sms_wiiu_gx2_target_present(void);
 extern "C" int sms_wiiu_dynres_enabled(void);
@@ -623,6 +626,11 @@ uint32_t s_gfCount[kGfFrames], s_gfFrame;
 uint64_t s_gfPrevEnd;
 uint64_t s_gfSpan, s_gfSpanMax, s_gfIdle, s_gfStartGap;
 uint32_t s_gfStamps, s_gfFrames, s_gfNotReady, s_gfOverflow;
+/* SD marker "hotlist" (build hotlist1): a summary per stamp position.  s_gfTag
+ * is null, and every use below is skipped, unless the renderer enabled it. */
+HotListInfo* s_gfTag;         /* [kGfFrames][kGfSegs], written at stamp time */
+HotListInfo* s_gfSegTag;      /* [kGfSegs] the newest tag of a costed position */
+uint32_t* s_gfSegChg;         /* [kGfSegs] frames of the window whose tag differed */
 
 void gf_init()
 {
@@ -640,7 +648,7 @@ void gf_init()
 	port_log("SMS Wii U: GPU frame stamps %s (log %s, SD marker gpuframe)\n", s_gf ? "on" : "off", s_gfLog ? "on" : "off");
 }
 
-void gf_stamp(uint32_t kind, bool end = false)
+void gf_stamp(uint32_t kind, bool end = false, const HotListInfo* tag = nullptr)
 {
 	const uint32_t f = s_gfFrame % kGfFrames;
 	uint32_t& n = s_gfCount[f];
@@ -650,6 +658,11 @@ void gf_stamp(uint32_t kind, bool end = false)
 	}
 	uint64_t* slot = s_gfStamp + f * kGfStamps + n;
 	s_gfKind[f][n++] = uint8_t(kind);
+	if (s_gfTag && n - 1 < kGfSegs) {
+		HotListInfo& t = s_gfTag[f * kGfSegs + (n - 1)];
+		if (tag) t = *tag;
+		else memset(&t, 0, sizeof(t));
+	}
 	if (kind) GX2SampleBottomGPUCycle(slot);
 	else GX2SampleTopGPUCycle(slot);
 }
@@ -676,7 +689,17 @@ void gf_collect(uint32_t f)
 				if (st[i] > busyUntil) {
 					if (count && busyUntil) {
 						s_gfKindCost[kind < kGfKinds ? kind : 0] += st[i] - busyUntil;
-						if (i < kGfSegs) { s_gfSegCost[i] += st[i] - busyUntil; s_gfSegKind[i] = uint8_t(kind); }
+						if (i < kGfSegs) {
+							s_gfSegCost[i] += st[i] - busyUntil; s_gfSegKind[i] = uint8_t(kind);
+							if (s_gfTag) {
+								const HotListInfo& nt = s_gfTag[f * kGfSegs + i];
+								HotListInfo& ot = s_gfSegTag[i];
+								if (ot.valid && (ot.ord != nt.ord || ot.draws != nt.draws || ot.totalIdx != nt.totalIdx ||
+								                 ot.first.tex[0].img != nt.first.tex[0].img))
+									++s_gfSegChg[i];
+								ot = nt;
+							}
+						}
 					}
 					busyUntil = st[i];
 				}
@@ -704,6 +727,69 @@ void gf_collect(uint32_t f)
 	DCFlushRange(st, n * 8);
 }
 
+static void hot_identity(char* out, size_t cap, const HotDraw& d)
+{
+    char file[128];
+    if (!sms_wiiu_hotname_lookup(d.identity.modelData, file, sizeof(file)))
+        std::memcpy(file, "?", 2);
+    std::snprintf(out, cap, "model=%08x:file=%s:tex=%s,%s", unsigned(d.identity.model), file,
+                  d.identity.texName[0], d.identity.texName[1]);
+}
+
+void hot_draw_text(char* out, size_t cap, const char* name, const HotDraw& d)
+{
+	const uint32_t cm = d.cm0;
+	int n = std::snprintf(out, cap, " %s{idx=%u st=%u tm=%02x cm0=%08x be=%u sub=%u sf=%u df=%u z=%02x(en%u fn%u wr%u) vp=%ux%u",
+	                      name, unsigned(d.nidx), unsigned(d.stages), unsigned(d.texMask), unsigned(cm),
+	                      unsigned(cm & 1), unsigned((cm >> 11) & 1), unsigned((cm >> 8) & 7), unsigned((cm >> 5) & 7),
+	                      unsigned(d.zmode), unsigned(d.zmode & 1), unsigned((d.zmode >> 1) & 7), unsigned((d.zmode >> 4) & 1),
+	                      unsigned(d.vpw), unsigned(d.vph));
+	for (int t = 0; t < 2 && n > 0 && size_t(n) < cap; ++t) {
+		const HotTex& x = d.tex[t];
+		if (!x.w && !x.h && !x.src && !x.img) continue;
+		n += std::snprintf(out + n, cap - size_t(n), " t%u=m%u:%ux%u:f%u:src=%08x:img=%08x", unsigned(t), unsigned(x.map),
+		                   unsigned(x.w), unsigned(x.h), unsigned(x.fmt), unsigned(x.src), unsigned(x.img));
+	}
+	if (n > 0 && size_t(n) < cap) std::snprintf(out + n, cap - size_t(n), "}");
+	for (uint32_t i = 0; i < 8 && n > 0 && size_t(n) < cap; ++i)
+		n += std::snprintf(out + n, cap - size_t(n), " c%u=%08x", unsigned(i), unsigned(d.caller[i]));
+}
+
+/* One line for a top position: a list's summary, a copy's destination, or the
+ * kind of service stamp it was.  cost is x0.01 ms per frame, like the line above. */
+void hot_report(uint32_t pos, uint32_t cost)
+{
+	static const char* const kKindName[kGfKinds] = {"top", "list", "copyClear", "retile", "callback", "preDraws", "present",
+	                                                "copy", "copyColourClear", "copyDepthClear", "frameClears"};
+	const uint32_t kind = s_gfSegKind[pos];
+	const HotListInfo& t = s_gfSegTag[pos];
+	if (kind == 1 && t.valid == 1) {
+		char first[640], big[640];
+		hot_draw_text(first, sizeof(first), "first", t.first);
+		hot_draw_text(big, sizeof(big), "big", t.big);
+		char name0[512], name1[512];
+		hot_identity(name0, sizeof(name0), t.first);
+		hot_identity(name1, sizeof(name1), t.big);
+		const char* pass = t.pass == 1 ? "bindshadow" : t.pass == 2 ? "lightdb" : nullptr;
+		if (pass)
+			port_log("SMS Wii U: [hotlist] pos=#%u k1 pass=%s cost=%u ord=%u draws=%u skip=%u idx=%u maxidx=%u chg=%u list=%08x name0=%s name1=%s%s%s\n",
+			         unsigned(pos), pass, unsigned(cost), unsigned(t.ord), unsigned(t.draws), unsigned(t.skipped),
+			         unsigned(t.totalIdx), unsigned(t.maxIdx), unsigned(s_gfSegChg[pos]), unsigned(t.list), name0, name1, first, big);
+		else
+			port_log("SMS Wii U: [hotlist] pos=#%u k1 cost=%u ord=%u draws=%u skip=%u idx=%u maxidx=%u chg=%u list=%08x%s%s\n",
+			         unsigned(pos), unsigned(cost), unsigned(t.ord), unsigned(t.draws), unsigned(t.skipped), unsigned(t.totalIdx),
+			         unsigned(t.maxIdx), unsigned(s_gfSegChg[pos]), unsigned(t.list), first, big);
+	} else if (t.valid == 2) {
+		port_log("SMS Wii U: [hotlist] pos=#%u k%u %s cost=%u dst=%08x %ux%u chg=%u\n", unsigned(pos), unsigned(kind),
+		         kKindName[kind < kGfKinds ? kind : 0], unsigned(cost), unsigned(t.aux[0]), unsigned(t.aux[1]),
+		         unsigned(t.aux[2]), unsigned(s_gfSegChg[pos]));
+	} else {
+		port_log("SMS Wii U: [hotlist] pos=#%u k%u %s cost=%u%s chg=%u\n", unsigned(pos), unsigned(kind),
+		         kKindName[kind < kGfKinds ? kind : 0], unsigned(cost), kind == 1 ? " list=? (no summary: ring mismatch)" : "",
+		         unsigned(s_gfSegChg[pos]));
+	}
+}
+
 /* GPU timer: 27 MHz, so 2700 cycles per 0.1 ms. */
 void gf_end_frame()
 {
@@ -729,6 +815,7 @@ void gf_end_frame()
 		 * position names the same list or copy from frame to frame. */
 		char buf[256];
 		int len = 0;
+		uint32_t topPos[8], topCost[8], topCount = 0;
 		for (int r = 0; r < 8; ++r) {
 			uint32_t best = 0;
 			for (uint32_t i = 1; i < kGfSegs; ++i)
@@ -736,12 +823,21 @@ void gf_end_frame()
 			if (!s_gfSegCost[best]) break;
 			len += std::snprintf(buf + len, sizeof(buf) - len, " #%u(k%u)=%u", unsigned(best),
 			                     unsigned(s_gfSegKind[best]), unsigned(s_gfSegCost[best] / d));
+			topPos[topCount] = best;
+			topCost[topCount++] = uint32_t(s_gfSegCost[best] / d);
 			s_gfSegCost[best] = 0;
 		}
 		port_log("SMS Wii U: [gpuframe] top positions x0.01ms:%s\n", buf);
+		if (s_gfTag)
+			for (uint32_t r = 0; r < topCount; ++r)
+				hot_report(topPos[r], topCost[r]);
 		}
 		memset(s_gfKindCost, 0, sizeof(s_gfKindCost));
 		memset(s_gfSegCost, 0, sizeof(s_gfSegCost));
+		if (s_gfTag) {
+			memset(s_gfSegTag, 0, kGfSegs * sizeof(HotListInfo));
+			memset(s_gfSegChg, 0, kGfSegs * sizeof(uint32_t));
+		}
 		s_gfSpan = s_gfSpanMax = s_gfIdle = s_gfStartGap = 0;
 		s_gfStamps = s_gfFrames = s_gfNotReady = s_gfOverflow = 0;
 	}
@@ -751,6 +847,31 @@ void gf_end_frame()
 extern "C" void sms_wiiu_gpuframe_stamp(int kind)
 {
 	if (s_gf && OSGetCoreId() == 1) gf_stamp(uint32_t(kind));
+}
+
+/* SD marker "hotlist": called once by the renderer after gx2prod started.
+ * Needs the gpuframe log (the report prints beside it); returns 0 otherwise. */
+extern "C" int sms_wiiu_gpuframe_hot_enable(void)
+{
+	if (!s_gf || !s_gfLog || !s_gfStamp) return 0;
+	if (s_gfTag) return 1;
+	const size_t tagBytes = size_t(kGfFrames) * kGfSegs * sizeof(HotListInfo);
+	const size_t segBytes = size_t(kGfSegs) * sizeof(HotListInfo);
+	const size_t chgBytes = size_t(kGfSegs) * sizeof(uint32_t);
+	uint8_t* mem = static_cast<uint8_t*>(MEMAllocFromDefaultHeapEx(uint32_t(tagBytes + segBytes + chgBytes), 64));
+	if (!mem) return 0;
+	memset(mem, 0, tagBytes + segBytes + chgBytes);
+	s_gfSegTag = reinterpret_cast<HotListInfo*>(mem + tagBytes);
+	s_gfSegChg = reinterpret_cast<uint32_t*>(mem + tagBytes + segBytes);
+	s_gfTag = reinterpret_cast<HotListInfo*>(mem);
+	return 1;
+}
+
+/* A bottom stamp carrying a list summary (kind 1), or a copy's destination
+ * (kind 7, aux = image, width, height). */
+extern "C" void sms_wiiu_gpuframe_stamp_tag(int kind, const void* tag)
+{
+	if (s_gf && OSGetCoreId() == 1) gf_stamp(uint32_t(kind), false, static_cast<const HotListInfo*>(tag));
 }
 
 /* Pipelined present: WHBGfxFinishRender ends in GX2DrawDone and

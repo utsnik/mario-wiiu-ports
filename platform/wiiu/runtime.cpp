@@ -152,7 +152,11 @@ int port_savestate_save(const void*) { return 0; }
 int port_savestate_can_load_exact(const char*) { return 0; }
 int port_savestate_load_exact(const char*, void*, int*) { return 0; }
 void port_savestate_notify(const char*) {}
-void port_savestate_hint(void*) {}
+/* PortSaveStateHint (src/port_include/port_savestate.h): int count; int hasImage[2]; char label[2][16]; = 44 bytes.
+ * 2026-11-13: this stub used to leave the caller's stack struct untouched, so the pause menu's save-state hint
+ * (patch zzzz-savestate-02, TARGET_PC is defined on Wii U) looped over a garbage hint.count writing widths[2] and
+ * drawing garbage labels - the prime suspect for the whole-console freeze on START. Report "no hint". */
+void port_savestate_hint(void* out) { if (out) std::memset(out, 0, 44); }
 
 void port_warp_list_begin(void) {}
 int port_warp_list_wanted(void) { return 0; }

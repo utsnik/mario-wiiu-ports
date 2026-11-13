@@ -1,0 +1,27 @@
+Reason: Register Sunshine's CPU-readable pollution I8 image with the opt-in Wii U
+renderer. The platform hook is compiled only for Wii U, so desktop behaviour and
+the unpatched decomp remain unchanged.
+--- a/src/Map/PollutionLayer.cpp
++++ b/src/Map/PollutionLayer.cpp
+@@ -15,6 +15,10 @@
+ #include <dolphin/os/OSCache.h>
+ #include <dolphin/gx.h>
+ #include <stdio.h>
++#ifdef __WIIU__
++extern "C" void sms_wiiu_register_pollution_i8(const void*, u32, u32);
++#endif
++
+ 
+ // rogue includes needed for matching sinit & bss
+ #include <MSound/MSSetSound.hpp>
+@@ -413,6 +417,10 @@
+ 	mPollutionImage->alphaEnabled = 2;
+ 
+ 	mPollutionMap = (u8*)mPollutionImage + mPollutionImage->imageDataOffset;
++#ifdef __WIIU__
++	sms_wiiu_register_pollution_i8(mPollutionMap, mPos.getWidth(), mPos.getHeight());
++#endif
++
+ }
+ 
+ void TPollutionLayer::initLayerInfo(const TPollutionLayerInfo* param_1)

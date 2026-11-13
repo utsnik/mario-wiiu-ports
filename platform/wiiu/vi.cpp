@@ -128,6 +128,7 @@ void sms_wiiu_frame_boundary(void)
 	/* The retrace count follows the TV: a retrace waits for a real vsync,
 	 * and one that ends late counts every field that passed. */
 	const u32 fields = sms_wiiu_vsync_fields();
+	sms_wiiu_gx2_renderer_goopwb_boundary();
 	if (s_pre_callback)
 		s_pre_callback(s_retrace_count + fields);
 	sms_wiiu_gfx_frame();

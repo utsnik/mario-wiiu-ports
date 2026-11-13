@@ -28,6 +28,7 @@ uint32_t sms_wiiu_heap_free(void);
 u32 sms_wiiu_frame_count(void);
 const char* sms_wiiu_stage_path(void);
 void sms_wiiu_frame_boundary(void);
+void sms_wiiu_gx2_renderer_goopwb_boundary(void);
 void sms_wiiu_input_poll(void);
 void sms_wiiu_dvd_pump(void);
 int port_dvd_busy(void);

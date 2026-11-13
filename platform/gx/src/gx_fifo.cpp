@@ -1966,6 +1966,8 @@ void pipeWrite(const uint8_t* bytes, uint32_t n) { SMS_PORT_HEAP_SCOPE(); pipePu
 
 #ifdef __WIIU__
 uint32_t g_producerDraws = 0;
+uint32_t g_hotCaller[8] = {};
+HotIdentity g_hotIdentity = {};
 
 void producerHostState(uint8_t kind, uint8_t slot, uint32_t value) {
     const uint8_t cmd[8] = {0xF0, kind, slot, 0, uint8_t(value >> 24), uint8_t(value >> 16),
@@ -1974,6 +1976,7 @@ void producerHostState(uint8_t kind, uint8_t slot, uint32_t value) {
 }
 
 extern "C" void sms_wiiu_gx2_apply_host_state(uint8_t kind, uint8_t slot, uint32_t value);
+extern "C" void sms_wiiu_hotlist_boundary(uint32_t phase);
 
 // The worker side of producerHostState: what the same-thread API would have
 // written into g directly, applied at the same point in the command order.
@@ -2023,6 +2026,35 @@ static void applyHostState(uint8_t kind, uint8_t slot, uint32_t value) {
         }
         s_dlPtr = nullptr;
         break;
+    case kHostHotCaller0: g_hotCaller[0] = value; break;
+    case kHostHotCaller1: g_hotCaller[1] = value; break;
+    case kHostHotCaller2: g_hotCaller[2] = value; break;
+    case kHostHotCaller3: g_hotCaller[3] = value; break;
+    case kHostHotCaller4: g_hotCaller[4] = value; break;
+    case kHostHotCaller5: g_hotCaller[5] = value; break;
+    case kHostHotCaller6: g_hotCaller[6] = value; break;
+    case kHostHotCaller7: g_hotCaller[7] = value; break;
+    case kHostHotPass: sms_wiiu_hotlist_boundary(value); break;
+    case kHostHotIdentityModel:
+        g_hotIdentity = HotIdentity{};
+        g_hotIdentity.model = value;
+        break;
+    case kHostHotIdentityData:
+        g_hotIdentity.modelData = value;
+        break;
+    case kHostHotIdentityName0:
+    case kHostHotIdentityName1:
+    case kHostHotIdentityName2:
+    case kHostHotIdentityName3:
+    case kHostHotIdentityName4:
+    case kHostHotIdentityName5:
+    case kHostHotIdentityName6:
+    case kHostHotIdentityName7: {
+        const uint32_t word = value;
+        const uint32_t offset = uint32_t(kind - kHostHotIdentityName0) * 4;
+        memcpy(reinterpret_cast<char*>(g_hotIdentity.texName) + offset, &word, sizeof(word));
+        break;
+    }
     case kHostTlutPtr: s_tlutPtr = ptr; break;
     case kHostTlutOffset: s_tlutOffset = value; break;
     case kHostTlutLoad:

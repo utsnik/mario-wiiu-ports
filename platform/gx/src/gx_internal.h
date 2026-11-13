@@ -13,6 +13,9 @@
 #include <string>
 #include <stddef.h>
 #include <vector>
+#ifdef __WIIU__
+#include "../../wiiu/hotlist.h"
+#endif
 
 namespace gx {
 
@@ -168,6 +171,11 @@ enum ProducerHostKind : uint8_t {
     kHostTcManual, kHostCopyDest, kHostTexImage, kHostCallDlPtr, kHostCallDlSize,
     kHostTlutPtr, kHostTlutOffset, kHostTlutLoad,
     kHostWidescreen, kHostStretch2D, kHostWide2D, kHostHud,
+    kHostHotCaller0, kHostHotCaller1, kHostHotCaller2, kHostHotCaller3,
+    kHostHotCaller4, kHostHotCaller5, kHostHotCaller6, kHostHotCaller7, kHostHotPass,
+    kHostHotIdentityModel, kHostHotIdentityData, kHostHotIdentityName0, kHostHotIdentityName1,
+    kHostHotIdentityName2, kHostHotIdentityName3, kHostHotIdentityName4,
+    kHostHotIdentityName5, kHostHotIdentityName6, kHostHotIdentityName7,
     kHostHudPaneX1, kHostHudPaneX2, kHostHudPaneEnd,
 };
 void producerHostState(uint8_t kind, uint8_t slot, uint32_t value);
@@ -175,6 +183,8 @@ void producerHostState(uint8_t kind, uint8_t slot, uint32_t value);
 // mode: the renderer's own count lags on the worker, and the present logic
 // must not show the empty second retrace of a 30 fps frame.
 extern uint32_t g_producerDraws;
+extern uint32_t g_hotCaller[8];
+extern HotIdentity g_hotIdentity;
 #endif
 
 // ---------------------------------------------------------------- vertices

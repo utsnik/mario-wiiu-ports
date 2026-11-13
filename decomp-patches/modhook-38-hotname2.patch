@@ -1,0 +1,60 @@
+Reason: wiiu hotname3: latch the owning J3D model and model-data texture names at queued packet draw time for per-draw hotlist lightdb identities.
+--- a/libs/JSystem/include/JSystem/J3D/J3DGraphBase/J3DPacket.hpp
++++ b/libs/JSystem/include/JSystem/J3D/J3DGraphBase/J3DPacket.hpp
+@@ -14,6 +14,7 @@
+ class J3DMaterial;
+ class J3DMaterialAnm;
+ class J3DShapePacket;
++class J3DModel;
+ class J3DTexture;
+ 
+ class J3DDisplayListObj {
+@@ -154,5 +154,6 @@
+ 	virtual ~J3DMatPacket();
+ 
+ 	void addShapePacket(J3DShapePacket* packet);
++	void setOwnerModel(J3DModel* model) { mpOwnerModel = model; }
+ 
+ 	// from TP
+@@ -191,5 +191,6 @@
+ 	/* 0x40 */ J3DTexture* mTexture;
+ 	/* 0x44 */ uintptr_t unk44;
++	J3DModel* mpOwnerModel;
+ };
+ 
+ class J3DShapePacket : public J3DCallBackPacket {
+--- a/libs/JSystem/src/J3D/J3DGraphBase/J3DPacket.cpp
++++ b/libs/JSystem/src/J3D/J3DGraphBase/J3DPacket.cpp
+@@ -3,4 +3,9 @@
+ #include <JSystem/J3D/J3DGraphBase/J3DSys.hpp>
+ #include <JSystem/J3D/J3DGraphBase/J3DMaterial.hpp>
+ #include <JSystem/J3D/J3DGraphBase/J3DShape.hpp>
++#ifdef __WIIU__
++#include <JSystem/J3D/J3DGraphAnimator/J3DModel.hpp>
++// hotname3: capture copied identity before the producer stream leaves the game thread.
++extern "C" void sms_wiiu_hotname_capture(const void*, const void*, const void*);
++#endif
+ #include <dolphin/os.h>
+@@ -103,2 +103,3 @@
+ 	unk44      = 0;
++	mpOwnerModel = nullptr;
+ }
+@@ -138,6 +138,10 @@
+ void J3DMatPacket::draw()
+ {
+ 	if (isHideAllShapePacket_())
+ 		return;
++#ifdef __WIIU__
++	if (mpOwnerModel)
++		sms_wiiu_hotname_capture(mpOwnerModel, nullptr, mpOwnerModel->getModelData()->getTextureName());
++#endif
+ 
+ 	j3dSys.setTexture(mTexture);
+--- a/libs/JSystem/src/J3D/J3DGraphAnimator/J3DModel.cpp
++++ b/libs/JSystem/src/J3D/J3DGraphAnimator/J3DModel.cpp
+@@ -597,4 +597,5 @@
+ 		mMatPackets = new J3DMatPacket[pModelData->getMaterialNum()];
+ 
+ 		for (int i = 0; i < pModelData->getMaterialNum(); ++i) {
++			mMatPackets[i].setOwnerModel(this);
+ 			mMatPackets[i].setMaterial(pModelData->getMaterialNodePointer(i));

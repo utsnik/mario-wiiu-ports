@@ -77,7 +77,7 @@ struct ScriptPress {
 	s8 sx, sy, cx, cy;
 	uint32_t at, until;
 };
-ScriptPress s_script[48];
+ScriptPress s_script[96];  // 48 was full with the Plaza route alone (2026-11-13)
 int s_script_count;
 volatile uint32_t s_field;
 
@@ -472,7 +472,7 @@ void sms_wiiu_input_poll(void)
 				field = 2 * sms_wiiu_presents();
 			/* A press starts at the first poll on or after its field (polls
 			 * stall during loads) and lasts its hold, but at least 3 polls. */
-			static uint32_t s_began[48], s_polls[48];
+			static uint32_t s_began[96], s_polls[96];
 			for (int i = 0; i < s_script_count; i++) {
 				const ScriptPress& p = s_script[i];
 				if (field < p.at)
@@ -485,6 +485,9 @@ void sms_wiiu_input_poll(void)
 					continue;
 				s_polls[i]++;
 				s_status[0].button |= p.button;
+				/* FLUDD sprays by the analog trigger: a scripted r/l is a full press (2026-11-13). */
+				if (p.button & PAD_TRIGGER_R) s_status[0].triggerRight = 0xff;
+				if (p.button & PAD_TRIGGER_L) s_status[0].triggerLeft = 0xff;
 				if (p.sx) s_status[0].stickX = p.sx;
 				if (p.sy) s_status[0].stickY = p.sy;
 				if (p.cx) s_status[0].substickX = p.cx;

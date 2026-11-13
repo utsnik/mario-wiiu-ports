@@ -1,0 +1,72 @@
+Reason: wiiu hotsplit2: call the hotlist pass marker around the game-side shadow and light passes. Keep this in the port patch pipeline so configure copies compile it into the Wii U game objects.
+--- a/src/MarioUtil/LightUtil.cpp
++++ b/src/MarioUtil/LightUtil.cpp
+@@ -16,7 +16,11 @@
+ #ifdef TARGET_PC
+ #include <sms_modhook.h>
+ #endif
+ 
++#ifdef __WIIU__
++extern "C" void sms_wiiu_hotlist_pass(unsigned phase);
++#endif
++
+ JDrama::TAmbAry* TLightCommon::mAmbAry;
+ JDrama::TLightAry* TLightCommon::mLightAry;
+ Vec* TLightCommon::mLightPos;
+@@ -245,20 +245,26 @@
+ void TLightWithDBSet::perform(u32 cue, JDrama::TGraphics* graphics)
+ {
++#ifdef __WIIU__
++	sms_wiiu_hotlist_pass(3);
++#endif
+ 	if (cue & CUE_LIGHT) {
+ 		for (int i = 0; i < unk1C; ++i) {
+ 			unk10[i]->perform(CUE_LIGHT, graphics);
+ 			if (cue & CUE_UNK10000)
+ 				unk10[i]->getOpaDbo()->perform(CUE_DRAW, graphics);
+ 			if (cue & CUE_UNK20000)
+ 				unk10[i]->getXluDbo()->perform(CUE_DRAW, graphics);
+ 		}
+ 	}
+ 	if (cue & CUE_SET_DRAW_BUFFER) {
+ 		for (int i = 0; i < unk1C; ++i) {
+ 			unk10[i]->getOpaDbo()->perform(CUE_SET_DRAW_BUFFER | CUE_DRAW_INIT,
+ 			                               graphics);
+ 			unk10[i]->getXluDbo()->perform(CUE_SET_DRAW_BUFFER | CUE_DRAW_INIT,
+ 			                               graphics);
+ 		}
+ 	}
++#ifdef __WIIU__
++	sms_wiiu_hotlist_pass(4);
++#endif
+ }
+ 
+ void TLightWithDBSet::addChildGroupObj(
+--- a/src/MarioUtil/ShadowUtil.cpp
++++ b/src/MarioUtil/ShadowUtil.cpp
+@@ -25,2 +25,5 @@
+ #include <math.h>
+ 
++#ifdef __WIIU__
++extern "C" void sms_wiiu_hotlist_pass(unsigned phase);
++#endif
+@@ -448,6 +452,9 @@
+ 
+ void TMBindShadowManager::perform(u32 cue, JDrama::TGraphics* graphics)
+ {
++#ifdef __WIIU__
++	sms_wiiu_hotlist_pass(1);
++#endif
+ 	if (cue & CUE_CALC_VIEW) {
+ 		unk49 = 0;
+ 		VECNormalize(gpLightManager->getLightPos(), &mLightDir);
+@@ -463,6 +470,9 @@
+ 		if (cue & 0x20000000)
+ 			reset();
+ 	}
++#ifdef __WIIU__
++	sms_wiiu_hotlist_pass(2);
++#endif
+ }
+ 
+ static bool conectCubeDiffer(TAlphaShadowBlendQuad* param_1,

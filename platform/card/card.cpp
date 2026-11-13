@@ -64,12 +64,22 @@ std::string g_dir;
 bool g_mounted;
 CardFile g_files[kMaxFiles];
 bool g_loaded;
+bool g_dir_ok = true;
 
-void mkdirs(const std::string& p)
+bool mkdirs(const std::string& p)
 {
+	// Intermediate components such as "fs:" or "fs:/vol" can refuse mkdir on the
+	// Wii U devoptab with errors other than EEXIST, so only the final directory
+	// decides success.
 	for (size_t i = 1; i <= p.size(); i++)
 		if (i == p.size() || p[i] == '/')
 			card_mkdir(p.substr(0, i).c_str(), 0755);
+	struct stat st;
+	if (stat(p.c_str(), &st) != 0 || !S_ISDIR(st.st_mode)) {
+		port_log("[card] could not create %s: errno=%d\n", p.c_str(), errno);
+		return false;
+	}
+	return true;
 }
 
 std::string card_dir()
@@ -90,9 +100,15 @@ std::string card_dir()
 	else
 		g_dir = std::string(getenv("HOME") ? getenv("HOME") : ".") + "/.local/share/sms-port/card-a";
 #endif
-	mkdirs(g_dir);
+	g_dir_ok = mkdirs(g_dir);
 	port_log("[card] slot A: %s\n", g_dir.c_str());
 	return g_dir;
+}
+
+bool card_dir_ok()
+{
+	card_dir();
+	return g_dir_ok;
 }
 
 std::string safe(const std::string& n)
@@ -156,17 +172,57 @@ bool write_file(const std::string& path, const void* data, size_t size)
 	const bool ok = fwrite(data, 1, size, fp) == size && fflush(fp) == 0;
 	if (fclose(fp) != 0 || !ok) {
 		remove(tmp.c_str());
-		port_log("[card] could not write %s\n", path.c_str());
+		port_log("[card] could not write %s: errno=%d\n", path.c_str(), errno);
 		return false;
 	}
-#ifdef _WIN32
-	remove(path.c_str());
-#endif
 	if (rename(tmp.c_str(), path.c_str()) != 0) {
-		port_log("[card] could not replace %s\n", path.c_str());
+		const int first_errno = errno;
+		port_log("[card] rename %s -> %s failed: errno=%d; removing target and retrying\n",
+		         tmp.c_str(), path.c_str(), first_errno);
+		if (remove(path.c_str()) != 0 && errno != ENOENT) {
+			port_log("[card] could not remove %s: errno=%d\n", path.c_str(), errno);
+			return false;
+		}
+		if (rename(tmp.c_str(), path.c_str()) != 0) {
+			port_log("[card] could not replace %s: errno=%d\n", path.c_str(), errno);
+			return false;
+		}
+	}
+	return true;
+}
+
+bool promote_tmp(const std::string& path)
+{
+	const std::string tmp = path + ".tmp";
+	if (rename(tmp.c_str(), path.c_str()) == 0)
+		return true;
+	const int first_errno = errno;
+	port_log("[card] rename %s -> %s failed: errno=%d; removing target and retrying\n",
+	         tmp.c_str(), path.c_str(), first_errno);
+	if (remove(path.c_str()) != 0 && errno != ENOENT) {
+		port_log("[card] could not remove %s: errno=%d\n", path.c_str(), errno);
+		return false;
+	}
+	if (rename(tmp.c_str(), path.c_str()) != 0) {
+		port_log("[card] could not replace %s: errno=%d\n", path.c_str(), errno);
 		return false;
 	}
 	return true;
+}
+
+bool recover_tmp_pair(const std::string& base)
+{
+	std::vector<u8> st, data;
+	if (!read_all(base + ".stat.tmp", st) || st.size() != sizeof(CARDStat) ||
+	    !read_all(base + ".dat.tmp", data))
+		return false;
+	CARDStat stat;
+	memcpy(&stat, st.data(), sizeof stat);
+	if (data.size() != stat.length)
+		return false;
+	if (!promote_tmp(base + ".dat"))
+		return false;
+	return promote_tmp(base + ".stat");
 }
 
 // a file whose write was cut between its two steps on Windows: the new one is complete
@@ -177,29 +233,41 @@ void finish_write(const std::string& path)
 		fclose(fp);
 		return;
 	}
-	rename((path + ".tmp").c_str(), path.c_str());
+	fp = fopen((path + ".tmp").c_str(), "rb");
+	if (!fp)
+		return;
+	fclose(fp);
+	promote_tmp(path);
 }
 
-void save(int no)
+bool save(int no)
 {
 	CardFile& f   = g_files[no];
 	std::string b = card_dir() + "/" + disk_name(f);
-	write_file(b + ".dat", f.data.data(), f.data.size());
-	write_file(b + ".stat", &f.stat, sizeof f.stat);
+	if (!card_dir_ok() || !write_file(b + ".dat", f.data.data(), f.data.size()) ||
+	    !write_file(b + ".stat", &f.stat, sizeof f.stat)) {
+		port_log("[card] save failed for %s\n", f.name.c_str());
+		return false;
+	}
+	return true;
 }
 
 void migrate_eclipse_settings();
 
-void load()
+bool load()
 {
 	if (g_loaded)
-		return;
+		return card_dir_ok();
 	g_loaded = true;
 	std::string dir = card_dir();
+	if (!g_dir_ok) {
+		port_log("[card] load failed: card directory is unavailable\n");
+		return false;
+	}
 	finish_write(dir + "/index.txt");
 	std::vector<u8> idx;
 	if (!read_all(dir + "/index.txt", idx))
-		return;
+		return true;
 	std::string text(idx.begin(), idx.end());
 	size_t pos = 0;
 	int no     = 0;
@@ -214,6 +282,7 @@ void load()
 		CardFile& f = g_files[no++];
 		std::vector<u8> st;
 		const std::string base = dir + "/" + safe(name);
+		recover_tmp_pair(base);
 		finish_write(base + ".dat");
 		finish_write(base + ".stat");
 		if (!read_all(base + ".dat", f.data) || !read_all(base + ".stat", st) || st.size() != sizeof(CARDStat))
@@ -235,16 +304,21 @@ void load()
 		}
 	}
 	migrate_eclipse_settings();
+	return true;
 }
 
-void save_index()
+bool save_index()
 {
 	std::string t;
 	for (int i = 0; i < kMaxFiles; i++)
 		t += (g_files[i].used ? disk_name(g_files[i]) : std::string()) + "\n";
 	while (t.size() > 1 && t[t.size() - 1] == '\n' && t[t.size() - 2] == '\n')
 		t.erase(t.size() - 1);
-	write_file(card_dir() + "/index.txt", t.data(), t.size());
+	if (!card_dir_ok() || !write_file(card_dir() + "/index.txt", t.data(), t.size())) {
+		port_log("[card] save_index failed\n");
+		return false;
+	}
+	return true;
 }
 
 // Super Mario Eclipse's settings, which BetterSunshineEngine names after the
@@ -325,7 +399,8 @@ extern "C" s32 CARDMount(s32 chan, void*, CARDCallback)
 	SMS_PORT_HEAP_SCOPE();
 	if (chan != 0)
 		return CARD_RESULT_NOCARD;
-	load();
+	if (!load())
+		return CARD_RESULT_IOERROR;
 	g_mounted = true;
 	return CARD_RESULT_READY;
 }
@@ -357,15 +432,15 @@ extern "C" long CARDFormat(long chan)
 		}
 		g_files[i] = CardFile();
 	}
-	save_index();
-	return CARD_RESULT_READY;
+	return save_index() ? CARD_RESULT_READY : CARD_RESULT_IOERROR;
 }
 extern "C" s32 CARDFreeBlocks(s32 chan, s32* bytesFree, s32* filesFree)
 {
 	SMS_PORT_HEAP_SCOPE();
 	if (chan != 0)
 		return CARD_RESULT_NOCARD;
-	load();
+	if (!load())
+		return CARD_RESULT_IOERROR;
 	int nf = 0;
 	for (int i = 0; i < kMaxFiles; i++)
 		nf += !g_files[i].used;
@@ -386,7 +461,8 @@ extern "C" s32 CARDOpen(s32 chan, char* fileName, CARDFileInfo* fi)
 	SMS_PORT_HEAP_SCOPE();
 	if (chan != 0)
 		return CARD_RESULT_NOCARD;
-	load();
+	if (!load())
+		return CARD_RESULT_IOERROR;
 	int no = find(fileName);
 	if (no < 0)
 		return CARD_RESULT_NOFILE;
@@ -423,7 +499,8 @@ extern "C" long CARDCreate(long chan, char* fileName, unsigned long size, CARDFi
 	SMS_PORT_HEAP_SCOPE();
 	if (chan != 0)
 		return CARD_RESULT_NOCARD;
-	load();
+	if (!load())
+		return CARD_RESULT_IOERROR;
 	if (strlen(fileName) > CARD_FILENAME_MAX)
 		return CARD_RESULT_NAMETOOLONG;
 	if (find(fileName) >= 0)
@@ -445,8 +522,8 @@ extern "C" long CARDCreate(long chan, char* fileName, unsigned long size, CARDFi
 		current_game(f.stat.gameName, f.stat.company);
 		f.stat.iconAddr    = 0xFFFFFFFF;
 		f.stat.commentAddr = 0xFFFFFFFF;
-		save(i);
-		save_index();
+		if (!save(i) || !save_index())
+			return CARD_RESULT_IOERROR;
 		fi->chan   = chan;
 		fi->fileNo = i;
 		fi->offset = 0;
@@ -476,8 +553,7 @@ extern "C" long CARDWrite(CARDFileInfo* fi, void* buf, long length, long offset)
 		return CARD_RESULT_LIMIT;
 	memcpy(d.data() + offset, buf, length);
 	g_files[fi->fileNo].stat.time = (u32)(OSGetTime() / (OSTime)(__OSBusClock / 4));
-	save(fi->fileNo);
-	return CARD_RESULT_READY;
+	return save(fi->fileNo) ? CARD_RESULT_READY : CARD_RESULT_IOERROR;
 }
 extern "C" s32 CARDGetStatus(s32 chan, s32 fileNo, CARDStat* stat)
 {
@@ -507,8 +583,7 @@ extern "C" long CARDSetStatus(long chan, long fileNo, CARDStat* stat)
 	f.stat.iconFormat   = stat->iconFormat;
 	f.stat.iconSpeed    = stat->iconSpeed;
 	f.stat.commentAddr  = stat->commentAddr;
-	save((int)fileNo);
-	return CARD_RESULT_READY;
+	return save((int)fileNo) ? CARD_RESULT_READY : CARD_RESULT_IOERROR;
 }
 extern "C" long CARDFastDelete(long chan, long fileNo)
 {
@@ -523,13 +598,13 @@ extern "C" long CARDFastDelete(long chan, long fileNo)
 	remove((b + ".dat").c_str());
 	remove((b + ".stat").c_str());
 	g_files[fileNo] = CardFile();
-	save_index();
-	return CARD_RESULT_READY;
+	return save_index() ? CARD_RESULT_READY : CARD_RESULT_IOERROR;
 }
 extern "C" s32 CARDDelete(s32 chan, char* fileName)
 {
 	SMS_PORT_HEAP_SCOPE();
-	load();
+	if (!load())
+		return CARD_RESULT_IOERROR;
 	int no = find(fileName);
 	return no < 0 ? CARD_RESULT_NOFILE : (s32)CARDFastDelete(chan, no);
 }

@@ -16,6 +16,10 @@
 
 #include "port_fpu.h"  // port_cvt_fp2unsigned: MWCC's __cvt_fp2unsigned, as the SDK converts
 #include "gx_sdk_math.h"  // the SDK's float arithmetic, as the DOL computes it
+#ifdef __WIIU__
+#include "../../wiiu/hotlist.h"
+#include <JSystem/JUtility/JUTNameTab.hpp>
+#endif
 
 using namespace gx;
 
@@ -36,6 +40,112 @@ static uint32_t s_dlSize = 0;
 static inline bool hostState() { return producerMode() && !s_recording; }
 static inline uint32_t hostPtr(const void* p) { return uint32_t(reinterpret_cast<uintptr_t>(p)); }
 static inline uint32_t hostFloat(float f) { uint32_t v; memcpy(&v, &f, sizeof v); return v; }
+extern "C" int sms_wiiu_hotcaller_enabled(void);
+extern "C" void sms_wiiu_hotcaller_capture(uint32_t out[8]);
+extern "C" int sms_wiiu_hotlist_split_enabled(void);
+extern "C" void sms_wiiu_hotlist_pass(uint32_t phase);
+extern "C" void sms_wiiu_hotname_capture(const void* model, const void* modelData, const void* texNames);
+extern "C" void sms_wiiu_hotname_resource(const void* resource, const char* name);
+extern "C" void sms_wiiu_hotname_model(const void* modelData, const void* resource);
+extern "C" int sms_wiiu_hotname_lookup(uint32_t modelData, char* out, size_t cap);
+extern "C" void sms_wiiu_hotlist_pass(uint32_t phase) {
+    if (sms_wiiu_hotlist_split_enabled() && producerMode())
+        producerHostState(kHostHotPass, 0, phase);
+}
+static void recordHotCaller() {
+    if (!sms_wiiu_hotcaller_enabled()) return;
+    uint32_t caller[8];
+    sms_wiiu_hotcaller_capture(caller);
+    for (uint8_t i = 0; i < 8; ++i)
+        producerHostState(uint8_t(kHostHotCaller0 + i), 0, caller[i]);
+}
+namespace {
+constexpr uint32_t kHotNameRing = 64;
+constexpr size_t kHotNameLength = 128;
+struct HotNameEntry { uint32_t modelData; char name[kHotNameLength]; };
+HotNameEntry s_hotNames[kHotNameRing];
+uint32_t s_hotNameNext;
+struct HotResourceEntry { uint32_t resource; char name[kHotNameLength]; };
+HotResourceEntry s_hotResources[kHotNameRing];
+uint32_t s_hotResourceNext;
+
+static void copyHotName(char* dst, size_t cap, const char* src) {
+    size_t n = 0;
+    if (src) {
+        while (n + 1 < cap && src[n]) ++n;
+        if (n) memcpy(dst, src, n);
+    }
+    if (cap) dst[n] = 0;
+}
+}
+
+extern "C" void sms_wiiu_hotname_resource(const void* resource, const char* name) {
+    if (!resource || !name) return;
+    HotResourceEntry& entry = s_hotResources[s_hotResourceNext++ % kHotNameRing];
+    entry.resource = hostPtr(resource);
+    copyHotName(entry.name, sizeof(entry.name), name);
+}
+
+extern "C" void sms_wiiu_hotname_model(const void* modelData, const void* resource) {
+    if (!modelData || !resource) return;
+    const uint32_t resourceValue = hostPtr(resource);
+    const char* name = nullptr;
+    for (uint32_t i = 0; i < kHotNameRing; ++i) {
+        const HotResourceEntry& entry = s_hotResources[(s_hotResourceNext + kHotNameRing - 1 - i) % kHotNameRing];
+        if (entry.resource == resourceValue) { name = entry.name; break; }
+    }
+    if (!name) return;
+    const uint32_t modelValue = hostPtr(modelData);
+    for (uint32_t i = 0; i < kHotNameRing; ++i) {
+        HotNameEntry& entry = s_hotNames[i];
+        if (entry.modelData == modelValue) {
+            copyHotName(entry.name, sizeof(entry.name), name);
+            return;
+        }
+    }
+    HotNameEntry& entry = s_hotNames[s_hotNameNext++ % kHotNameRing];
+    entry.modelData = modelValue;
+    copyHotName(entry.name, sizeof(entry.name), name);
+}
+
+extern "C" int sms_wiiu_hotname_lookup(uint32_t modelData, char* out, size_t cap) {
+    if (!out || !cap) return 0;
+    for (uint32_t i = 0; i < kHotNameRing; ++i) {
+        const HotNameEntry& entry = s_hotNames[(s_hotNameNext + kHotNameRing - 1 - i) % kHotNameRing];
+        if (entry.modelData == modelData) {
+            copyHotName(out, cap, entry.name);
+            return 1;
+        }
+    }
+    out[0] = 0;
+    return 0;
+}
+
+extern "C" void sms_wiiu_hotname_capture(const void* model, const void* modelData, const void* texNames) {
+    if (!sms_wiiu_hotlist_split_enabled() || !producerMode()) return;
+    static const void* previousModel;
+    if (!model || model == previousModel) return;
+    previousModel = model;
+    HotIdentity identity = {};
+    identity.model = hostPtr(model);
+    identity.modelData = hostPtr(modelData);
+    const JUTNameTab* names = static_cast<const JUTNameTab*>(texNames);
+    if (names) {
+        const u16 count = names->getNameNum() < 2 ? names->getNameNum() : 2;
+        for (u16 i = 0; i < count; ++i) {
+            const char* name = names->getName(i);
+            if (!name) continue;
+            copyHotName(identity.texName[i], sizeof(identity.texName[i]), name);
+        }
+    }
+    producerHostState(kHostHotIdentityModel, 0, identity.model);
+    producerHostState(kHostHotIdentityData, 0, identity.modelData);
+    for (uint8_t i = 0; i < 8; ++i) {
+        uint32_t word;
+        memcpy(&word, reinterpret_cast<const char*>(identity.texName) + i * 4, sizeof(word));
+        producerHostState(uint8_t(kHostHotIdentityName0 + i), 0, word);
+    }
+}
 #endif
 static inline bool forceVtxState() {
 #ifdef __WIIU__
@@ -458,6 +568,7 @@ void GXCallDisplayList(void* list, u32 nbytes) {
     if (producerMode()) {
         // A full host pointer: ptrToPhys/physToPtr do not round-trip on Wii U.
         ++g_producerDraws;
+        recordHotCaller();
         producerHostState(kHostCallDlPtr, 0, hostPtr(list));
         producerHostState(kHostCallDlSize, 0, uint32_t(nbytes));
         return;
@@ -689,7 +800,10 @@ void GXBegin(GXPrimitive type, GXVtxFmt fmt, u16 nverts) {
     if (g_perfStages) vsrcBeginNote(__builtin_return_address(0), nverts);
     traceNoteBegin();
 #ifdef __WIIU__
-    if (hostState()) ++g_producerDraws;
+    if (hostState()) {
+        ++g_producerDraws;
+        recordHotCaller();
+    }
 #endif
     GXPC_Write8(uint8_t(type | fmt));
     GXPC_Write16(nverts);

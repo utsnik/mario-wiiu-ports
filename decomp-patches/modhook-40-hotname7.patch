@@ -1,0 +1,29 @@
+Reason: wiiu hotname7: record model resource names returned through archive member getResource paths, including typed archive lookups used by stage/map model loaders.
+--- a/libs/JSystem/src/JKernel/JKRArchivePub.cpp
++++ b/libs/JSystem/src/JKernel/JKRArchivePub.cpp
+@@ -1,1 +1,5 @@
+ #include <JSystem/JKernel/JKRArchive.hpp>
++#ifdef __WIIU__
++extern "C" void sms_wiiu_hotname_resource(const void*, const char*);
++#endif
++
+@@ -145,4 +149,8 @@
+ 	if (fileEntry) {
+-		return fetchResource(fileEntry, nullptr);
++		void* resource = fetchResource(fileEntry, nullptr);
++#ifdef __WIIU__
++		sms_wiiu_hotname_resource(resource, path);
++#endif
++		return resource;
+ 	}
+ 
+@@ -162,4 +170,8 @@
+ 	if (fileEntry) {
+-		return fetchResource(fileEntry, nullptr);
++		void* resource = fetchResource(fileEntry, nullptr);
++#ifdef __WIIU__
++		sms_wiiu_hotname_resource(resource, path);
++#endif
++		return resource;
+ 	}
+ 
