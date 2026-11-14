@@ -1,0 +1,83 @@
+name: Bug report
+description: Something is wrong in the Wii U port of Super Mario Sunshine or Super Mario Galaxy, or in the Pack Helper.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for testing. One problem per report, please. Never attach game files, disc images or keys.
+  - type: dropdown
+    id: game
+    attributes:
+      label: Game
+      options:
+        - Super Mario Sunshine
+        - Super Mario Galaxy
+        - Wii U Pack Helper (installer)
+    validations:
+      required: true
+  - type: input
+    id: release
+    attributes:
+      label: Release you downloaded
+      description: The release name and the date you downloaded it, e.g. "sms-wiiu-alpha1, downloaded 2026-11-14".
+      placeholder: smg-wiiu-alpha1, downloaded 2026-11-14
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you saw, and what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: How to make it happen
+      description: Where in the game (level, galaxy, star) and what you did just before. Does it happen every time?
+      placeholder: |
+        1. Load the save in Delfino Plaza
+        2. ...
+    validations:
+      required: true
+  - type: dropdown
+    id: output
+    attributes:
+      label: TV resolution setting on the Wii U
+      options:
+        - 720p
+        - 1080p
+        - 480p / other
+        - GamePad only / not sure
+    validations:
+      required: true
+  - type: dropdown
+    id: overclock
+    attributes:
+      label: Is your Wii U overclocked?
+      options:
+        - "No (stock)"
+        - "Yes"
+        - "Not sure"
+    validations:
+      required: true
+  - type: dropdown
+    id: region
+    attributes:
+      label: Disc region
+      options:
+        - "Sunshine: North America (GMSE01)"
+        - "Galaxy: Europe (RMGP01)"
+        - "Galaxy: North America (RMGE01)"
+        - Other / not sure
+  - type: textarea
+    id: extra
+    attributes:
+      label: Screenshots, photos or error codes
+      description: A photo of the screen, any error code (e.g. 155-0206), or a crash screen helps a lot. For Pack Helper problems, paste the text it showed.
+  - type: textarea
+    id: setup
+    attributes:
+      label: Anything else about your setup
+      description: Texture pack, custom Menu artwork, other homebrew, SD card size, Aroma version.
