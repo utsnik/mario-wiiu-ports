@@ -48,7 +48,11 @@ public:
         mYounger = pYounger;
     }
     void setCurrentMtxCalc(J3DMtxCalc* pMtxCalc) {
+#if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
+        J3DMT::currentMtxCalc() = pMtxCalc;
+#else
         mCurrentMtxCalc = pMtxCalc;
+#endif
     }
     J3DTransformInfo& getTransformInfo() {
         return mTransformInfo;
@@ -75,7 +79,11 @@ public:
         return mMtxCalc;
     }
     J3DMtxCalc* getCurrentMtxCalc() {
+#if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
+        return J3DMT::currentMtxCalc();
+#else
         return mCurrentMtxCalc;
+#endif
     };
     J3DJoint* getChild() {
         return mChild;
@@ -140,8 +148,13 @@ public:
 
 struct J3DMtxCalcJ3DSysInitSoftimage {
     static void init(const Vec& param_0, const Mtx& param_1) {
+#if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
+        J3DMT::currentS() = param_0;
+        PSMTXCopy(param_1, J3DMT::currentMtx());
+#else
         J3DSys::mCurrentS = param_0;
         PSMTXCopy(param_1, J3DSys::mCurrentMtx);
+#endif
     }
 };
 

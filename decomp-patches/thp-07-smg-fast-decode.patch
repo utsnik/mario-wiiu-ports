@@ -1,0 +1,178 @@
+--- a/libs/dolphin/src/thp/THPDec.c
++++ b/libs/dolphin/src/thp/THPDec.c
+@@ -475,6 +475,10 @@
+ #endif // clang-format on
+ }
+ 
++#if defined(TARGET_PC) && defined(PORT_GAME_SMG)
++static void port_thp_build_luts(void);
++#endif
++
+ void __THPPrepBitStream(void)
+ {
+ 	u32* ptr;
+@@ -523,6 +527,10 @@
+ 		}
+ 	}
+ 
++#if defined(TARGET_PC) && defined(PORT_GAME_SMG)
++	port_thp_build_luts();
++#endif
++
+ 	{
+ 		s32 YdcTab, UdcTab, VdcTab, YacTab, UacTab, VacTab;
+ 
+@@ -978,10 +986,27 @@
+ 		o[4] = t3 + t4;
+ 		o[3] = t3 - t4;
+ 		out = Gbase + (yTile + i / 4) * (Gwid * 4) + xPos * 4 + (i % 4) * 8;
++#if defined(PORT_GAME_SMG)
++		{
++			// lrintf without the library call (a software routine on Wii U
++			// newlib, ~350k calls per movie frame): adding 1.5 * 2^23 rounds
++			// to the nearest integer, ties to even like lrintf, for |x| < 2^22.
++			// All 8 stores go out before the loads, so the store-to-load
++			// round trips overlap.
++			union { f32 f; s32 i; } r[8];
++			for (k = 0; k < 8; k++)
++				r[k].f = (o[k] * 0.125f + 128.0f) + 12582912.0f;
++			for (k = 0; k < 8; k++) {
++				const s32 v = r[k].i - 0x4B400000;
++				out[k] = (THPSample)(v < 0 ? 0 : v > 255 ? 255 : v);
++			}
++		}
++#else
+ 		for (k = 0; k < 8; k++) {
+ 			long v = lrintf(o[k] * 0.125f + 128.0f);
+ 			out[k] = (THPSample)(v < 0 ? 0 : v > 255 ? 255 : v);
+ 		}
++#endif
+ 	}
+ }
+ 
+@@ -1647,6 +1672,117 @@
+ 	return v < (1 << (s - 1)) ? v + (-1 << s) + 1 : v;
+ }
+ 
++#if defined(PORT_GAME_SMG)
++// Galaxy: the prologue is a 640x368 movie at 59.94 fps, one decode per game
++// frame, and the per-bit reader above made it run at ~23 fps on the Wii U.
++// Same results, same (c, currByte, cnt) state: a 9-bit lookup per Huffman
++// table plus a multi-bit reader. The slow loop handles codes over 9 bits.
++#define PORT_THP_LUT_BITS 9
++static u16 port_thp_lut[4][1 << PORT_THP_LUT_BITS]; // (length << 8) | value; 0 = longer code
++
++static void port_thp_build_luts(void)
++{
++	u32 i, p;
++	for (i = 0; i < 4; i++) {
++		THPHuffmanTab* h = &__THPInfo->huffmanTabs[i];
++		if (!(__THPInfo->validHuffmanTabs & (1 << i)))
++			continue;
++		for (p = 0; p < (1u << PORT_THP_LUT_BITS); p++) {
++			s32 l;
++			port_thp_lut[i][p] = 0;
++			for (l = 1; l <= PORT_THP_LUT_BITS; l++) {
++				s32 code = (s32)(p >> (PORT_THP_LUT_BITS - l));
++				if (code <= h->maxCode[l]) {
++					port_thp_lut[i][p] = (u16)((l << 8) | h->Vij[code + h->valPtr[l]]);
++					break;
++				}
++			}
++		}
++	}
++}
++
++typedef struct {
++	u8* c;
++	u32 cb;
++	u32 cnt; // 1-based position of the next bit in cb, 33 = word used up
++} PortThpBits;
++
++// The next 32 stream bits, most significant first.
++static inline u32 port_thp_peek(const PortThpBits* b)
++{
++	const unsigned long long w = ((unsigned long long)b->cb << 32) | port_be32(b->c + 4);
++	return (u32)((w << (b->cnt - 1)) >> 32);
++}
++
++static inline void port_thp_skip(PortThpBits* b, u32 n)
++{
++	b->cnt += n;
++	if (b->cnt > 33) {
++		b->c += 4;
++		b->cb = port_be32(b->c);
++		b->cnt -= 32;
++	}
++}
++
++static inline s32 port_thp_huff(PortThpBits* b, const THPHuffmanTab* h, const u16* lut)
++{
++	const u32 bits = port_thp_peek(b);
++	const u32 e    = lut[bits >> (32 - PORT_THP_LUT_BITS)];
++	s32 code = 0, l;
++	if (e) {
++		port_thp_skip(b, e >> 8);
++		return (s32)(e & 0xFF);
++	}
++	for (l = 1; l <= 16; l++) {
++		code = (code << 1) | (s32)((bits >> (32 - l)) & 1);
++		if (code <= h->maxCode[l]) {
++			port_thp_skip(b, (u32)l);
++			return h->Vij[code + h->valPtr[l]];
++		}
++	}
++	port_thp_skip(b, 16);
++	return 0;
++}
++
++static inline s32 port_thp_receive(PortThpBits* b, s32 n)
++{
++	const s32 v = (s32)(port_thp_peek(b) >> (32 - n));
++	port_thp_skip(b, (u32)n);
++	return v;
++}
++
++static void port_thp_block(THPFileInfo* info, THPCoeff* block, THPHuffmanTab* dc,
++                           THPHuffmanTab* ac, THPComponent* comp)
++{
++	const u16* dlut = port_thp_lut[dc - info->huffmanTabs];
++	const u16* alut = port_thp_lut[ac - info->huffmanTabs];
++	PortThpBits b;
++	s32 t, k;
++	b.c   = info->c;
++	b.cb  = info->currByte;
++	b.cnt = info->cnt;
++	memset(block, 0, 64 * sizeof(THPCoeff));
++	t = port_thp_huff(&b, dc, dlut);
++	if (t)
++		comp->predDC = (s16)(comp->predDC + port_thp_extend(port_thp_receive(&b, t), t));
++	block[0] = comp->predDC;
++	for (k = 1; k < 64; k++) {
++		s32 rs = port_thp_huff(&b, ac, alut);
++		s32 r = rs >> 4, sz = rs & 15;
++		if (sz) {
++			k += r;
++			block[__THPJpegNaturalOrder[k]] = (THPCoeff)port_thp_extend(port_thp_receive(&b, sz), sz);
++		} else {
++			if (r != 15)
++				break;
++			k += 15;
++		}
++	}
++	info->c        = b.c;
++	info->currByte = b.cb;
++	info->cnt      = b.cnt;
++}
++#else
+ static void port_thp_block(THPFileInfo* info, THPCoeff* block, THPHuffmanTab* dc,
+                            THPHuffmanTab* ac, THPComponent* comp)
+ {
+@@ -1670,6 +1806,7 @@
+ 	}
+ }
+ #endif
++#endif
+ 
+ void __THPDecompressiMCURow640x480(void)
+ {

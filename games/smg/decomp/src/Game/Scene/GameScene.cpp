@@ -1,4 +1,7 @@
 #include "Game/Scene/GameScene.hpp"
+#if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
+extern "C" void smg_wiiu_gpucat_mark(int begin, int category);
+#endif
 #include "Game/Player/MarioAccess.hpp"
 #include "Game/LiveActor/HitSensor.hpp"
 #include "Game/Player/MarioActor.hpp"
@@ -360,8 +363,11 @@ void GameScene::update() {
         // such as the castle garden or the observatory.
         static int sMovieFrames = 0;
         static bool sMovieStarted = false;
+        // PETARI_MOVIE_ANY=1 also starts it during a demo (timing tests).
         const char* movie = getenv("PETARI_MOVIE");
-        if (!sMovieStarted && movie && *movie && isNerve(GET_NERVE(GameScene, GameSceneAction)) && !MR::isDemoActive() &&
+        static const bool sMovieAny = getenv("PETARI_MOVIE_ANY") != nullptr;
+        if (!sMovieStarted && movie && *movie && isNerve(GET_NERVE(GameScene, GameSceneAction)) &&
+            (sMovieAny || !MR::isDemoActive()) && !MR::isEqualStageName("FileSelect") &&
             MR::isExistSceneObj(SceneObj_MoviePlayingSequenceHolder)) {
             if (++sMovieFrames >= 120) {
                 sMovieStarted = true;
@@ -814,7 +820,13 @@ void GameScene::draw3D() const {
     // for SpaceWarp (the frame ends with a Z clear).
     port_gx_marker(PORT_GX_MARK_SCENE_DEPTH);
 #endif
+#if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
+    smg_wiiu_gpucat_mark(1, 200);  // gpucat id 200 = image effects (bloom, blur, DOF)
+#endif
     SceneFunction::executeDrawImageEffect();
+#if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
+    smg_wiiu_gpucat_mark(0, 200);
+#endif
     GXSetDither(GX_TRUE);
     MR::loadViewMtx();
     MR::loadProjectionMtx();
@@ -830,6 +842,7 @@ void GameScene::draw3D() const {
 void GameScene::draw2D() const {
 #if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
     SmsWiiUDrawownScope drawownScope("GameScene::draw2D");
+    struct GpucatScope { GpucatScope() { smg_wiiu_gpucat_mark(1, 201); } ~GpucatScope() { smg_wiiu_gpucat_mark(0, 201); } } gpucat2d;  // id 201 = draw2D
 #endif
     if (isPlayMovie()) {
         SceneFunction::executeDrawList2DMovie();

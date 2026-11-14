@@ -6,8 +6,14 @@
 #define SMS_PORT_HEAP_SCOPE() ((void)0)
 #endif
 #include "gx_internal.h"
+#include "j3d_state_delta.h"
 #ifdef __WIIU__
 #include "../../wiiu/gx2_producer_worker.h"
+#endif
+#if defined(__WIIU__) && defined(PORT_GAME_SMG)
+#include "../../../games/smg/include/wiiu/gphase.h"
+#include "../../wiiu/jpa_counters.h"
+#include "../../wiiu/jpa_final_vertex.h"
 #endif
 #include <time.h>
 #ifdef __APPLE__
@@ -407,6 +413,158 @@ void resetState() {
 // their own; the draw-sync callback is game code and must stay unscoped.
 uint32_t g_xfDirtyLo = ~0u, g_xfDirtyHi = 0;
 
+struct J3DStateDelta {
+    uint32_t materialLists, stateOps, cpSame, cpDiff, bpSame, bpDiff;
+    uint32_t xfSame, xfDiff, stateFlush, draws;
+    uint32_t skippedOps, dirtyDomains, checkRuns, checkMismatches;
+    uint32_t ownerOps[1025];
+};
+static bool s_j3dStateDeltaEnabled;
+static bool s_j3dStateDeltaCheck;
+static bool s_j3dStateDeltaReplay;
+static J3DStateDelta s_j3dStateDelta;
+
+static bool j3dStateDeltaSameCP(uint8_t reg, uint32_t value) {
+    if ((reg & 0xF0) == CP_ARRAY_BASE || (reg & 0xF0) == CP_ARRAY_STRIDE) return false;
+    switch (reg & 0xF0) {
+    case CP_MATIDX_A: return g.cpMatA == value;
+    case CP_MATIDX_B: return g.cpMatB == value;
+    case CP_VCD_LO: return g.cpVcdLo == value;
+    case CP_VCD_HI: return g.cpVcdHi == value;
+    case CP_VAT_A: return g.cpVatA[reg & 7] == value;
+    case CP_VAT_B: return g.cpVatB[reg & 7] == value;
+    case CP_VAT_C: return g.cpVatC[reg & 7] == value;
+    default: return false;  // unknown CP register: never treat as redundant
+    }
+}
+
+static bool j3dStateDeltaSameBP(uint32_t value) {
+    const uint8_t reg = uint8_t(value >> 24);
+    if (g.bpMask != 0xFFFFFF || !j3dStateDeltaCanSkip(0x61, reg, value)) return false;
+    return g.bp[reg] == (value & 0xFFFFFF);
+}
+
+static bool j3dStateDeltaSameXF(uint16_t addr, uint32_t count, const uint32_t* words) {
+    for (uint32_t i = 0; i < count; ++i) {
+        uint32_t old = 0;
+        if (addr + i < XF_MEM_WORDS) old = g.xfMem[addr + i];
+        else if (addr + i >= XF_REG_BASE && addr + i < XF_REG_BASE + XF_REG_COUNT)
+            old = g.xfReg[addr + i - XF_REG_BASE];
+        else return false;
+        if (old != words[i]) return false;
+    }
+    return true;
+}
+
+static void j3dStateDeltaNoteReplayOp(const J3DStateDeltaOp& op, bool skipped, bool differs) {
+    if (!s_j3dStateDeltaReplay) return;
+    if (skipped) {
+        ++s_j3dStateDelta.stateOps;
+        ++s_j3dStateDelta.skippedOps;
+        if (op.domain == J3D_STATE_DELTA_CP) ++s_j3dStateDelta.cpSame;
+        else if (op.domain == J3D_STATE_DELTA_BP) ++s_j3dStateDelta.bpSame;
+        else if (op.domain == J3D_STATE_DELTA_XF) ++s_j3dStateDelta.xfSame;
+    }
+    if (differs) {
+        if (op.domain == J3D_STATE_DELTA_CP) s_j3dStateDelta.dirtyDomains |= j3dStateDeltaDirtyForCP(op.reg);
+        else if (op.domain == J3D_STATE_DELTA_BP) s_j3dStateDelta.dirtyDomains |= j3dStateDeltaDirtyForBP(op.reg);
+        else if (op.domain == J3D_STATE_DELTA_XF) s_j3dStateDelta.dirtyDomains |= j3dStateDeltaDirtyForXF(op.address, op.count);
+    }
+}
+
+void j3dStateDeltaSetEnabled(bool enabled) {
+    s_j3dStateDeltaEnabled = enabled;
+    s_j3dStateDeltaReplay = false;
+    s_j3dStateDelta = {};
+    if (!enabled) s_j3dStateDeltaCheck = false;
+}
+
+bool j3dStateDeltaEnabled() { return s_j3dStateDeltaEnabled; }
+void j3dStateDeltaSetCheckEnabled(bool enabled) { s_j3dStateDeltaCheck = enabled && s_j3dStateDeltaEnabled; }
+bool j3dStateDeltaCheckEnabled() { return s_j3dStateDeltaCheck; }
+uint32_t j3dStateDeltaPendingDirtyDomains() { return s_j3dStateDelta.dirtyDomains; }
+void j3dStateDeltaInvalidateAllDomains() { if (s_j3dStateDeltaEnabled) s_j3dStateDelta.dirtyDomains = ~0u; }
+void j3dStateDeltaConsumeDirtyDomains() { s_j3dStateDelta.dirtyDomains = 0; }
+
+static void j3dStateDeltaNoteOwner() {
+#ifdef __WIIU__
+    uint32_t owner = ::gx2prod::drawown_worker_current();
+    if (owner > 1024) owner = 1024;
+    ++s_j3dStateDelta.ownerOps[owner];
+#endif
+}
+
+void j3dStateDeltaBeginReplay() {
+    if (s_j3dStateDeltaEnabled) {
+        ++s_j3dStateDelta.materialLists;
+        if (s_j3dStateDeltaCheck) ++s_j3dStateDelta.checkRuns;
+        s_j3dStateDeltaReplay = true;
+    }
+}
+
+void j3dStateDeltaEndReplay() { s_j3dStateDeltaReplay = false; }
+
+void j3dStateDeltaNoteCP(uint8_t reg, uint32_t value) {
+    if (!s_j3dStateDeltaReplay) return;
+    ++s_j3dStateDelta.stateOps;
+    j3dStateDeltaNoteOwner();
+    bool same = false;
+    same = j3dStateDeltaSameCP(reg, value);
+    ++(same ? s_j3dStateDelta.cpSame : s_j3dStateDelta.cpDiff);
+    if (!same) j3dStateDeltaNoteReplayOp({J3D_STATE_DELTA_CP, 0x08, 0, reg, 0, 1, value}, false, true);
+}
+
+void j3dStateDeltaNoteBP(uint32_t value) {
+    if (!s_j3dStateDeltaReplay) return;
+    ++s_j3dStateDelta.stateOps;
+    j3dStateDeltaNoteOwner();
+    const uint32_t reg = value >> 24;
+    const uint32_t data = value & 0xffffff;
+    bool same = j3dStateDeltaSameBP(value);
+    ++(same ? s_j3dStateDelta.bpSame : s_j3dStateDelta.bpDiff);
+    if (!same) j3dStateDeltaNoteReplayOp({J3D_STATE_DELTA_BP, 0x61, 0, uint8_t(reg), 0, 1, value}, false, true);
+}
+
+void j3dStateDeltaNoteXF(uint16_t addr, uint32_t count, const uint32_t* words) {
+    if (!s_j3dStateDeltaReplay) return;
+    ++s_j3dStateDelta.stateOps;
+    j3dStateDeltaNoteOwner();
+    bool same = true;
+    for (uint32_t i = 0; i < count; ++i) {
+        uint32_t old = 0;
+        if (addr + i < XF_MEM_WORDS) old = g.xfMem[addr + i];
+        else if (addr + i >= XF_REG_BASE && addr + i < XF_REG_BASE + XF_REG_COUNT)
+            old = g.xfReg[addr + i - XF_REG_BASE];
+        if (old != words[i]) same = false;
+    }
+    ++(same ? s_j3dStateDelta.xfSame : s_j3dStateDelta.xfDiff);
+    if (!same) j3dStateDeltaNoteReplayOp({J3D_STATE_DELTA_XF, 0x10, 0, 0, addr, uint16_t(count), 0}, false, true);
+}
+
+void j3dStateDeltaNoteDraw() {
+    if (s_j3dStateDeltaEnabled) ++s_j3dStateDelta.draws;
+}
+
+void j3dStateDeltaNoteStateChange() {
+    if (s_j3dStateDeltaReplay) ++s_j3dStateDelta.stateFlush;
+}
+
+extern "C" void sms_wiiu_j3d_state_delta_take(uint32_t* values, uint32_t valueCount) {
+    const uint32_t head[J3D_STATE_DELTA_REPORT_COUNT] = {s_j3dStateDelta.materialLists, s_j3dStateDelta.stateOps, s_j3dStateDelta.cpSame,
+                               s_j3dStateDelta.cpDiff, s_j3dStateDelta.bpSame, s_j3dStateDelta.bpDiff,
+                               s_j3dStateDelta.xfSame, s_j3dStateDelta.xfDiff, s_j3dStateDelta.stateFlush,
+                               s_j3dStateDelta.draws, s_j3dStateDelta.skippedOps,
+                               s_j3dStateDelta.dirtyDomains, s_j3dStateDelta.checkRuns,
+                               s_j3dStateDelta.checkMismatches};
+    if (values && valueCount) {
+        uint32_t n = valueCount < J3D_STATE_DELTA_REPORT_COUNT ? valueCount : J3D_STATE_DELTA_REPORT_COUNT;
+        memcpy(values, head, size_t(n) * sizeof(uint32_t));
+    }
+    memset(&s_j3dStateDelta, 0, sizeof s_j3dStateDelta);
+}
+
+extern "C" bool sms_wiiu_j3d_state_delta_enabled() { return s_j3dStateDeltaEnabled; }
+
 // Producer-side register shadows.  These mirror only the state mutation of
 // the consumer writers; renderer hooks, copies, texture invalidation, and
 // draw-sync delivery remain exclusively in writeBP/writeXF/writeCP after the
@@ -462,6 +620,7 @@ void shadowXF(uint16_t addr, uint32_t count, const uint32_t* words) {
 }
 
 void writeBP(uint32_t value) {
+    j3dStateDeltaNoteBP(value);
     uint32_t reg = value >> 24;
     uint32_t data = value & 0xFFFFFF;
     if (reg == BP_MASK) {
@@ -475,7 +634,8 @@ void writeBP(uint32_t value) {
     if (reg >= BP_TEV_REG && reg < BP_TEV_REG + 8 && (data & 0x800000)) {
         if (g.kreg[reg & 7] != data) {
 #ifdef __WIIU__
-            onStateChange(rendererFastStateUsesTevRegs());
+            jpaMergeNoteBpReg(reg);
+            onStateChange(rendererFastStateUsesTevRegs(), 1); // BP
 #else
             onStateChange(false);
 #endif
@@ -542,7 +702,8 @@ void writeBP(uint32_t value) {
         if (reg >= BP_TEV_REG && reg < BP_TEV_REG + 8)
             fastStateRelevant = fastStateRelevant || rendererFastStateUsesTevRegs();
 #endif
-        onStateChange(fastStateRelevant);
+        jpaMergeNoteBpReg(reg);
+        onStateChange(fastStateRelevant, 1); // BP
         g.bp[reg] = data;
     }
     if (reg == BP_COPY_DST) g.copyDest = physToPtr(data << 5);
@@ -553,6 +714,10 @@ void writeBP(uint32_t value) {
 }
 
 void writeCP(uint8_t reg, uint32_t value) {
+    j3dStateDeltaNoteCP(reg, value);
+#if defined(__WIIU__) && defined(PORT_GAME_SMG)
+    if (g_smg_wprof_on) rendererStateWriterDomain(4); // CP
+#endif
     switch (reg & 0xF0) {
     case CP_MATIDX_A: g.cpMatA = value; break;
     case CP_MATIDX_B: g.cpMatB = value; break;
@@ -606,7 +771,11 @@ void writeXF(uint16_t addr, uint32_t count, const uint32_t* words) {
         } else if (addr >= XF_REG_BASE && addr < XF_REG_BASE + XF_REG_COUNT) {
             uint32_t r = addr - XF_REG_BASE;
             if (g.xfReg[r] != v) {
+#ifdef __WIIU__
+                onStateChange(fastStateXfWriteAffectsKeys(addr), 2); // XF
+#else
                 onStateChange(fastStateXfWriteAffectsKeys(addr));
+#endif
                 g.xfReg[r] = v;
             }
         }
@@ -1142,6 +1311,9 @@ static struct DlEntry* s_dlRec = nullptr;  // the display list being recorded in
 
 static const uint8_t* decodeVertices(uint8_t opcode, const uint8_t* p, uint32_t count, const VtxLayout& L, int vat) {
     s_vertsLoaded += count;
+#if defined(__WIIU__) && defined(PORT_GAME_SMG)
+    SmgWProfScope wprofFetch(SmgWBucket_Fetch);
+#endif
     static DecSetup s_setup[8];
     DecSetup& S = s_setup[vat];
     if (S.layoutGen != L.gen || S.arrayGen != g_arrayGen || S.matA != g.xfReg[XFR_MATIDX_A] ||
@@ -1152,6 +1324,19 @@ static const uint8_t* decodeVertices(uint8_t opcode, const uint8_t* p, uint32_t 
         s_mtxPresent = S.mtxPresent;
     }
 
+#if defined(__WIIU__) && defined(PORT_GAME_SMG)
+    // Marker fetchpf: start the next command's lines (core 1 just wrote them
+    // into the ring, so the worker's first touch misses) while this one
+    // decodes.  Three lines only: Espresso's miss queue is tiny (dcbt flood).
+    static int s_fetchPf = -1;
+    if (s_fetchPf < 0) s_fetchPf = sms_wiiu_sd_marker("fetchpf") ? 1 : 0;
+    if (s_fetchPf) {
+        const uint8_t* e = p + size_t(count) * L.size;
+        __builtin_prefetch(e);
+        __builtin_prefetch(e + 32);
+        __builtin_prefetch(e + 64);
+    }
+#endif
     const uint32_t stride = S.stride;
     const int nops = S.nops;
     const DecOp* ops = S.ops;
@@ -1177,6 +1362,7 @@ static void loadIndexedXF(uint8_t op, uint32_t idx, uint32_t v) {
         words[k] = be ? be32(src + k * 4)
                       : (uint32_t(src[k * 4]) | uint32_t(src[k * 4 + 1]) << 8 | uint32_t(src[k * 4 + 2]) << 16 |
                          uint32_t(src[k * 4 + 3]) << 24);
+    j3dStateDeltaNoteXF(uint16_t(addr), cnt, words);
     writeXF(uint16_t(addr), cnt, words);
 }
 
@@ -1328,6 +1514,31 @@ struct StateOp {
     uint32_t v;    // CP/BP value; XF: first word in `words` (count in n); indexed load: its second half; call: size
     uint32_t n;    // XF: words; call: the list's physical address
 };
+static J3DStateDeltaOp j3dStateDeltaDescribeOp(const StateOp& op) {
+    J3DStateDeltaOp out = {J3D_STATE_DELTA_NONE, op.type, 0, op.reg, op.a, 0, op.v};
+    if (op.type == 0x08) {
+        out.domain = J3D_STATE_DELTA_CP;
+        out.count = 1;
+        out.flags = j3dStateDeltaCanSkip(op.type, op.reg, op.v) ? J3D_STATE_DELTA_FLAG_SAFE_SKIP : J3D_STATE_DELTA_FLAG_SIDE_EFFECT;
+    } else if (op.type == 0x61) {
+        out.domain = J3D_STATE_DELTA_BP;
+        out.reg = uint8_t(op.v >> 24);
+        out.count = 1;
+        out.flags = j3dStateDeltaCanSkip(op.type, out.reg, op.v) ? J3D_STATE_DELTA_FLAG_SAFE_SKIP : J3D_STATE_DELTA_FLAG_SIDE_EFFECT;
+    } else if (op.type == 0x10) {
+        out.domain = J3D_STATE_DELTA_XF;
+        out.count = uint16_t(op.n > 0xffff ? 0xffff : op.n);
+        out.flags = J3D_STATE_DELTA_FLAG_SAFE_SKIP;
+    } else if (op.type == 0x20 || op.type == 0x28 || op.type == 0x30 || op.type == 0x38) {
+        out.domain = J3D_STATE_DELTA_XF;
+        out.address = uint16_t(op.v & 0xfff);
+        out.count = uint16_t(((op.v >> 12) & 0xffff) + 1);
+        out.flags = J3D_STATE_DELTA_FLAG_SIDE_EFFECT;
+    } else if (op.type == 0x40) {
+        out.flags = J3D_STATE_DELTA_FLAG_SIDE_EFFECT;
+    }
+    return out;
+}
 struct DlArray {  // the part of an attribute array the list reads
     const uint8_t* base;
     uint32_t stride, lo, hi;  // bytes [lo, hi) from base
@@ -1349,6 +1560,7 @@ struct DlEntry {
     std::vector<DlArray> arrays;
     std::vector<DlRun> runs;
     std::vector<StateOp> ops;    // a state-only list's commands, decoded
+    std::vector<J3DStateDeltaOp> stateDeltaOps; // immutable descriptions parallel to ops
     std::vector<uint32_t> words; // their XF data
     uint32_t misses = 0;  // consecutive calls that could not reuse it
     uint32_t skip = 0;    // calls left to run without the cache
@@ -1582,17 +1794,32 @@ static bool dlCompileState(DlEntry& e, const uint8_t* p, uint32_t size) {
             return false;  // draws, or an unknown opcode
         }
         e.ops.push_back(s);
+        if (s_j3dStateDeltaEnabled) e.stateDeltaOps.push_back(j3dStateDeltaDescribeOp(s));
         p += len;
     }
     return true;
 }
 
 static void dlReplayState(const DlEntry& e) {
-    for (const StateOp& s : e.ops) {
+    j3dStateDeltaBeginReplay();
+    for (size_t opIndex = 0; opIndex < e.ops.size(); ++opIndex) {
+        const StateOp& s = e.ops[opIndex];
+        const J3DStateDeltaOp* d = opIndex < e.stateDeltaOps.size() ? &e.stateDeltaOps[opIndex] : nullptr;
+        if (d && (d->flags & J3D_STATE_DELTA_FLAG_SAFE_SKIP)) {
+            bool same = false;
+            if (s.type == 0x08) same = j3dStateDeltaSameCP(s.reg, s.v);
+            else if (s.type == 0x61) same = j3dStateDeltaSameBP(s.v);
+            else if (s.type == 0x10) same = j3dStateDeltaSameXF(s.a, s.n, &e.words[s.v]);
+            if (same) {
+                j3dStateDeltaNoteReplayOp(*d, true, false);
+                continue;
+            }
+        }
         switch (s.type) {
         case 0x08: writeCP(s.reg, s.v); break;
         case 0x61: writeBP(s.v); break;
         case 0x10:
+            j3dStateDeltaNoteXF(s.a, s.n, &e.words[s.v]);
             for (uint32_t i = 0; i < s.n;) {  // as parse: at most 64 words per writeXF
                 uint32_t m = s.n - i > 64 ? 64 : s.n - i;
                 writeXF(uint16_t(s.a + i), m, &e.words[s.v + i]);
@@ -1611,6 +1838,7 @@ static void dlReplayState(const DlEntry& e) {
         default: loadIndexedXF(s.type, s.a, s.v); break;
         }
     }
+    j3dStateDeltaEndReplay();
 }
 
 static void callDisplayListImpl(const uint8_t* data, uint32_t size);
@@ -1618,6 +1846,10 @@ static void callDisplayListImpl(const uint8_t* data, uint32_t size);
 extern "C" int64_t sms_gx_wut_time(void) __asm__("OSGetTime");
 #endif
 void callDisplayList(const uint8_t* data, uint32_t size) {
+#if defined(__WIIU__) && defined(PORT_GAME_SMG)
+    SmgWProfScope wprofDlCall(SmgWBucket_DlCall);
+    smg_wprof_note_dlcall();
+#endif
 #ifdef __WIIU__
     rendererGameDlCall();
     if (g_perfStages) {
@@ -2181,11 +2413,22 @@ void producerFrameBoundary() {
 }
 
 static void producerFlushPending() {
+#if defined(__WIIU__) && defined(PORT_GAME_SMG)
+    const uint64_t gphase_start = smg_gphase_begin_timer(SmgGPhaseTimer_ProducerFlushHook);
+#endif
     if (s_zeroCopyActive) {
         producerCommitZeroCopy();
+#if defined(__WIIU__) && defined(PORT_GAME_SMG)
+        smg_gphase_end_timer(SmgGPhaseTimer_ProducerFlushHook, gphase_start);
+#endif
         return;
     }
-    if (!s_pipeLen) return;
+    if (!s_pipeLen) {
+#if defined(__WIIU__) && defined(PORT_GAME_SMG)
+        smg_gphase_end_timer(SmgGPhaseTimer_ProducerFlushHook, gphase_start);
+#endif
+        return;
+    }
     SMS_PORT_HEAP_SCOPE();
     std::vector<uint8_t> chunk;
     chunk.swap(s_producerFlush);
@@ -2196,6 +2439,9 @@ static void producerFlushPending() {
     ::gx2prod::append(chunk.data(), bytes);
     s_producerFlush.swap(chunk);
     s_zeroCopyShortTail = false;
+#if defined(__WIIU__) && defined(PORT_GAME_SMG)
+    smg_gphase_end_timer(SmgGPhaseTimer_ProducerFlushHook, gphase_start);
+#endif
 }
 
 void setProducerMode(bool enabled, bool zeroCopy) {
@@ -2241,6 +2487,30 @@ void setProducerMode(bool enabled, bool zeroCopy) {
 // sees a producer buffer that can be overwritten on core 1.
 void producerConsume(const uint8_t* bytes, uint32_t n) {
     if (!bytes || !n) return;
+#if defined(__WIIU__) && defined(PORT_GAME_SMG)
+    SmgWProfScope wprofParse(SmgWBucket_Parse);
+    // Marker zcparse: with no carried tail, parse the producer's bytes in
+    // place (they are stable for this call; parse keeps no pointer into its
+    // buffer past its return, the tail copy below already moves it) and copy
+    // only an incomplete last command.  Was 14% of worker time in FileSelect.
+    static int s_zcParse = -1;
+    // b250: default on for Galaxy (nozcparse opts out); with arenadcbz Beach at60 82->87 / 77->84, overall 85->89 / 81->87
+    if (s_zcParse < 0) s_zcParse = sms_wiiu_sd_marker("nozcparse") ? 0 : 1;
+    if (s_zcParse && !s_workerPipeLen) {
+        s_hostOps = true;
+        while (n) {
+            uint32_t need = 1;
+            const uint32_t used = parse(bytes, n, &need);
+            if (!used) { s_workerPipeNeed = need; break; }
+            bytes += used;
+            n -= used;
+        }
+        s_hostOps = false;
+        if (!n) { s_workerPipeNeed = 1; return; }
+        // fall through: the incomplete tail goes to s_workerPipe (parse is
+        // tried again there and stops at once, waiting for more bytes)
+    }
+#endif
     if (s_workerPipe.size() < size_t(s_workerPipeLen) + n)
         s_workerPipe.resize(size_t(s_workerPipeLen) + n);
     memcpy(s_workerPipe.data() + s_workerPipeLen, bytes, n);
@@ -2269,6 +2539,9 @@ void producerBoundary(uint32_t kind) {
     // Boundaries are published only after all earlier byte chunks have been
     // consumed by the worker.  A flush boundary closes the current GX2 list;
     // the core-1 service pump then replays queued list calls in order.
+#if defined(__WIIU__) && defined(PORT_GAME_SMG)
+    SmgWProfScope wprofParse(SmgWBucket_Parse);
+#endif
     if (s_workerPipeLen) producerConsume(nullptr, 0);
     (void)kind;
     flushBatch();
@@ -2405,7 +2678,11 @@ void producerHostState(uint8_t kind, uint8_t slot, uint32_t value) {
     // simultaneously redirecting GX writes into a display-list buffer.  Do
     // not let this private record become part of a list that may be replayed
     // by GX2 or Cemu.
+#if defined(PORT_GAME_SMG)
+    if (s_redirect && (kind == kHostDrawownPush || kind == kHostDrawownPop || kind == kHostGpuCat)) {
+#else
     if (s_redirect && (kind == kHostDrawownPush || kind == kHostDrawownPop)) {
+#endif
         if (s_zeroCopyAppend) {
             pipePut(cmd, sizeof cmd, true);
             return;
@@ -2419,12 +2696,29 @@ void producerHostState(uint8_t kind, uint8_t slot, uint32_t value) {
     pipePut(cmd, sizeof cmd);
 }
 
+bool producerHostStateTry(uint8_t kind, uint8_t slot, uint32_t value) {
+    if (!s_producerMode) return false;
+    if (s_zeroCopyAppend) {
+        if (!s_zeroCopyActive && !producerOpenZeroCopy()) return false;
+        if (s_zeroCopyCapacity - s_pipeLen < 8) {
+            producerCommitZeroCopy();
+            if (!producerOpenZeroCopy() || s_zeroCopyCapacity - s_pipeLen < 8) return false;
+        }
+    }
+    producerHostState(kind, slot, value);
+    return true;
+}
+
 // The worker side of producerHostState: what the same-thread API would have
 // written into g directly, applied at the same point in the command order.
 static void applyHostState(uint8_t kind, uint8_t slot, uint32_t value) {
     static const uint8_t* s_dlPtr;
     static const uint8_t* s_tlutPtr;
     static uint32_t s_tlutOffset;
+#if defined(PORT_GAME_SMG)
+    static const uint8_t* s_texStreamPtr;
+    static uint32_t s_texStreamBytes;
+#endif
     const uint8_t* ptr = reinterpret_cast<const uint8_t*>(uintptr_t(value));
     switch (kind) {
     case kHostArrayBase:
@@ -2479,6 +2773,37 @@ static void applyHostState(uint8_t kind, uint8_t slot, uint32_t value) {
     case kHostTlutPtr: s_tlutPtr = ptr; break;
     case kHostTlutOffset: s_tlutOffset = value; break;
     case kHostTexInvalidate: textureInvalidateAll(); break;
+#if defined(PORT_GAME_SMG)
+    case kHostTexStreamPtr: s_texStreamPtr = ptr; break;
+    case kHostTexStreamBytes:
+        textureStreamWritten(s_texStreamPtr, value);
+        s_texStreamPtr = nullptr;
+        break;
+    case kHostTexStreamLinearBytes:
+        s_texStreamBytes = value;
+        break;
+    case kHostGpuCat:
+        rendererGpuCatMark(slot, value);
+        break;
+    case kHostJpaFinalVx: {
+        const SmsWiiuJpaFinalVxDesc* desc =
+            reinterpret_cast<const SmsWiiuJpaFinalVxDesc*>(uintptr_t(value));
+        if (slot == SMS_WIIU_JPA_FINALVX_BEGIN_CHECK)
+            jpaFinalVxBeginCheck(desc);
+        else if (slot == SMS_WIIU_JPA_FINALVX_SUBMIT)
+            jpaFinalVxSubmit(desc);
+        else {
+            sms_wiiu_jpa_finalvx_fallback(SMS_WIIU_JPA_FINALVX_FALLBACK_UNSUPPORTED);
+            logmsg("gx2prod: unknown jpafinalvx record phase %u", unsigned(slot));
+        }
+        break;
+    }
+    case kHostTexStreamPitch:
+        textureStreamWrittenLinear(s_texStreamPtr, s_texStreamBytes, value);
+        s_texStreamPtr = nullptr;
+        s_texStreamBytes = 0;
+        break;
+#endif
     case kHostTlutLoad:
         onStateChange();
         if (s_tlutPtr && s_tlutOffset + value <= sizeof g.tlutMem) memcpy(g.tlutMem + s_tlutOffset, s_tlutPtr, value);

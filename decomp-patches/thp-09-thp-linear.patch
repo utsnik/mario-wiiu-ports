@@ -1,0 +1,328 @@
+Reason: Galaxy: decode THP planes directly into GX2 linear-aligned surfaces
+--- a/libs/dolphin/src/thp/THPDec.c
++++ b/libs/dolphin/src/thp/THPDec.c
+@@ -34,6 +34,19 @@
+ static f32* Gq __attribute__((aligned(32)));
+ static u8* __THPLCWork512[3];
+ static u8* __THPLCWork640[3];
++#if defined(PORT_GAME_SMG)
++static BOOL port_thp_linear;
++static u32 port_thp_pitch;
++static u32 port_thp_pitch_y;
++static u32 port_thp_pitch_uv;
++#define PORT_THP_BASE(linear, tiled) (port_thp_linear ? (linear) : (tiled))
++#define PORT_THP_PITCH(pitch) (port_thp_linear ? (pitch) : 0)
++#define PORT_THP_SET_PITCH(pitch) (port_thp_pitch = (pitch))
++#else
++#define PORT_THP_BASE(linear, tiled) (tiled)
++#define PORT_THP_PITCH(pitch) 0
++#define PORT_THP_SET_PITCH(pitch) ((void)0)
++#endif
+ static u32 __THPOldGQR5;
+ static u32 __THPOldGQR6;
+ static u8* __THPWorkArea;
+@@ -208,6 +221,19 @@
+ 	return errorCode;
+ }
+ 
++#if defined(PORT_GAME_SMG)
++s32 THPVideoDecodeLinear(void* file, void* y, void* u, void* v, void* work, u32 yPitch, u32 uvPitch)
++{
++    s32 result;
++    port_thp_linear = TRUE;
++    port_thp_pitch_y = yPitch;
++    port_thp_pitch_uv = uvPitch;
++    result = THPVideoDecode(file, y, u, v, work);
++    port_thp_linear = FALSE;
++    return result;
++}
++#endif
++
+ static void __THPSetupBuffers(void)
+ {
+ 	u8 i;
+@@ -909,11 +935,11 @@
+ // out = x / 8 + 128 saturated to u8, stored into GX I8 tiles (8x4 pixels,
+ // 32 bytes) of a strip Gwid pixels wide; yTile selects the tile row.
+ #if defined(PORT_GAME_SMG)
+-static void port_thp_idct_p(const THPCoeff* in, u32 xPos, u32 yTile, THPSample* Gbase, u32 Gwid, const f32* q);
+-static void port_thp_idct(THPCoeff* in, u32 xPos, u32 yTile) { port_thp_idct_p(in, xPos, yTile, Gbase, Gwid, Gq); }
++static void port_thp_idct_p(const THPCoeff* in, u32 xPos, u32 yTile, THPSample* Gbase, u32 Gwid, const f32* q, u32 pitch);
++static void port_thp_idct(THPCoeff* in, u32 xPos, u32 yTile) { port_thp_idct_p(in, xPos, yTile, Gbase, Gwid, Gq, port_thp_pitch); }
+ // Same transform, with the strip base, width and quantiser as parameters so
+ // the movie helper threads (thp-08) can run it on their own rows.
+-static void port_thp_idct_p(const THPCoeff* in, u32 xPos, u32 yTile, THPSample* Gbase, u32 Gwid, const f32* q)
++static void port_thp_idct_p(const THPCoeff* in, u32 xPos, u32 yTile, THPSample* Gbase, u32 Gwid, const f32* q, u32 pitch)
+ {
+ 	f32 ws[64];
+ 	int i;
+@@ -1007,7 +1033,12 @@
+ 		o[5] = t2 - t5;
+ 		o[4] = t3 + t4;
+ 		o[3] = t3 - t4;
+-		out = Gbase + (yTile + i / 4) * (Gwid * 4) + xPos * 4 + (i % 4) * 8;
++#if defined(PORT_GAME_SMG)
++		if (pitch)
++			out = Gbase + (yTile * 4 + i) * pitch + xPos;
++		else
++#endif
++			out = Gbase + (yTile + i / 4) * (Gwid * 4) + xPos * 4 + (i % 4) * 8;
+ #if defined(PORT_GAME_SMG)
+ 		{
+ 			// lrintf without the library call (a software routine on Wii U
+@@ -1367,8 +1398,9 @@
+ 		__THPHuffDecodeDCTCompV(__THPInfo, __THPMCUBuffer[5]);
+ 
+ 		comp  = &__THPInfo->components[0];
+-		Gbase = __THPLCWork512[0];
++		Gbase = PORT_THP_BASE(__THPInfo->dLC[0], __THPLCWork512[0]);
+ 		Gwid  = 512;
++		PORT_THP_SET_PITCH(port_thp_pitch_y);
+ 		Gq    = __THPInfo->quantTabs[comp->quantizationTableSelector];
+ 		x_pos = (u32)(cl_num * 16);
+ 		__THPInverseDCTNoYPos(__THPMCUBuffer[0], x_pos);
+@@ -1377,14 +1409,16 @@
+ 		__THPInverseDCTY8(__THPMCUBuffer[3], x_pos + 8);
+ 
+ 		comp  = &__THPInfo->components[1];
+-		Gbase = __THPLCWork512[1];
++		Gbase = PORT_THP_BASE(__THPInfo->dLC[1], __THPLCWork512[1]);
+ 		Gwid  = 256;
++		PORT_THP_SET_PITCH(port_thp_pitch_uv);
+ 		Gq    = __THPInfo->quantTabs[comp->quantizationTableSelector];
+ 		x_pos /= 2;
+ 		__THPInverseDCTNoYPos(__THPMCUBuffer[4], x_pos);
+ 		comp  = &__THPInfo->components[2];
+-		Gbase = __THPLCWork512[2];
++		Gbase = PORT_THP_BASE(__THPInfo->dLC[2], __THPLCWork512[2]);
+ 		Gq    = __THPInfo->quantTabs[comp->quantizationTableSelector];
++		PORT_THP_SET_PITCH(port_thp_pitch_uv);
+ 		__THPInverseDCTNoYPos(__THPMCUBuffer[5], x_pos);
+ 
+ 		if (__THPInfo->RST != 0) {
+@@ -1403,13 +1437,28 @@
+ 		}
+ 	}
+ 
++#if defined(PORT_GAME_SMG)
++	if (port_thp_linear) {
++		__THPInfo->dLC[0] += port_thp_pitch_y * 16;
++		__THPInfo->dLC[1] += port_thp_pitch_uv * 8;
++		__THPInfo->dLC[2] += port_thp_pitch_uv * 8;
++	} else {
++		LCStoreData(__THPInfo->dLC[0], __THPLCWork512[0], 0x2000);
++		LCStoreData(__THPInfo->dLC[1], __THPLCWork512[1], 0x800);
++		LCStoreData(__THPInfo->dLC[2], __THPLCWork512[2], 0x800);
++
++		__THPInfo->dLC[0] += 0x2000;
++		__THPInfo->dLC[1] += 0x800;
++		__THPInfo->dLC[2] += 0x800;
++	}
++#else
+ 	LCStoreData(__THPInfo->dLC[0], __THPLCWork512[0], 0x2000);
+ 	LCStoreData(__THPInfo->dLC[1], __THPLCWork512[1], 0x800);
+ 	LCStoreData(__THPInfo->dLC[2], __THPLCWork512[2], 0x800);
+-
+ 	__THPInfo->dLC[0] += 0x2000;
+ 	__THPInfo->dLC[1] += 0x800;
+ 	__THPInfo->dLC[2] += 0x800;
++#endif
+ }
+ 
+ #ifndef TARGET_PC
+@@ -1849,8 +1898,9 @@
+ 			__THPHuffDecodeDCTCompV(__THPInfo, __THPMCUBuffer[5]);
+ 
+ 			comp  = &__THPInfo->components[0];
+-			Gbase = __THPLCWork640[0];
++			Gbase = PORT_THP_BASE(__THPInfo->dLC[0], __THPLCWork640[0]);
+ 			Gwid  = 640;
++			PORT_THP_SET_PITCH(port_thp_pitch_y);
+ 			Gq    = __THPInfo->quantTabs[comp->quantizationTableSelector];
+ 			x_pos = (u32)(cl_num * 16);
+ 			__THPInverseDCTNoYPos(__THPMCUBuffer[0], x_pos);
+@@ -1859,15 +1909,17 @@
+ 			__THPInverseDCTY8(__THPMCUBuffer[3], x_pos + 8);
+ 
+ 			comp  = &__THPInfo->components[1];
+-			Gbase = __THPLCWork640[1];
++			Gbase = PORT_THP_BASE(__THPInfo->dLC[1], __THPLCWork640[1]);
+ 			Gwid  = 320;
++			PORT_THP_SET_PITCH(port_thp_pitch_uv);
+ 			Gq    = __THPInfo->quantTabs[comp->quantizationTableSelector];
+ 			x_pos /= 2;
+ 			__THPInverseDCTNoYPos(__THPMCUBuffer[4], x_pos);
+ 
+ 			comp  = &__THPInfo->components[2];
+-			Gbase = __THPLCWork640[2];
++			Gbase = PORT_THP_BASE(__THPInfo->dLC[2], __THPLCWork640[2]);
+ 			Gq    = __THPInfo->quantTabs[comp->quantizationTableSelector];
++			PORT_THP_SET_PITCH(port_thp_pitch_uv);
+ 			__THPInverseDCTNoYPos(__THPMCUBuffer[5], x_pos);
+ 
+ 			if (__THPInfo->RST != 0) {
+@@ -1889,13 +1941,23 @@
+ 		}
+ 	}
+ 
+-	LCStoreData(__THPInfo->dLC[0], __THPLCWork640[0], 0x2800);
+-	LCStoreData(__THPInfo->dLC[1], __THPLCWork640[1], 0xA00);
+-	LCStoreData(__THPInfo->dLC[2], __THPLCWork640[2], 0xA00);
+-
+-	__THPInfo->dLC[0] += 0x2800;
+-	__THPInfo->dLC[1] += 0xA00;
+-	__THPInfo->dLC[2] += 0xA00;
++#if defined(PORT_GAME_SMG)
++	if (port_thp_linear) {
++		__THPInfo->dLC[0] += port_thp_pitch_y * 16;
++		__THPInfo->dLC[1] += port_thp_pitch_uv * 8;
++		__THPInfo->dLC[2] += port_thp_pitch_uv * 8;
++	} else {
++#endif
++		LCStoreData(__THPInfo->dLC[0], __THPLCWork640[0], 0x2800);
++		LCStoreData(__THPInfo->dLC[1], __THPLCWork640[1], 0xA00);
++		LCStoreData(__THPInfo->dLC[2], __THPLCWork640[2], 0xA00);
++
++		__THPInfo->dLC[0] += 0x2800;
++		__THPInfo->dLC[1] += 0xA00;
++		__THPInfo->dLC[2] += 0xA00;
++#if defined(PORT_GAME_SMG)
++	}
++#endif
+ }
+ 
+ void __THPDecompressiMCURowNxN(void)
+@@ -1917,8 +1979,9 @@
+ 		__THPHuffDecodeDCTCompV(__THPInfo, __THPMCUBuffer[5]);
+ 
+ 		comp  = &__THPInfo->components[0];
+-		Gbase = __THPLCWork640[0];
++		Gbase = PORT_THP_BASE(__THPInfo->dLC[0], __THPLCWork640[0]);
+ 		Gwid  = x;
++		PORT_THP_SET_PITCH(port_thp_pitch_y);
+ 		Gq    = __THPInfo->quantTabs[comp->quantizationTableSelector];
+ 		x_pos = (u32)(cl_num * 16);
+ 		__THPInverseDCTNoYPos(__THPMCUBuffer[0], x_pos);
+@@ -1927,15 +1990,17 @@
+ 		__THPInverseDCTY8(__THPMCUBuffer[3], x_pos + 8);
+ 
+ 		comp  = &__THPInfo->components[1];
+-		Gbase = __THPLCWork640[1];
++		Gbase = PORT_THP_BASE(__THPInfo->dLC[1], __THPLCWork640[1]);
+ 		Gwid  = x / 2;
++		PORT_THP_SET_PITCH(port_thp_pitch_uv);
+ 		Gq    = __THPInfo->quantTabs[comp->quantizationTableSelector];
+ 		x_pos /= 2;
+ 		__THPInverseDCTNoYPos(__THPMCUBuffer[4], x_pos);
+ 
+ 		comp  = &__THPInfo->components[2];
+-		Gbase = __THPLCWork640[2];
++		Gbase = PORT_THP_BASE(__THPInfo->dLC[2], __THPLCWork640[2]);
+ 		Gq    = __THPInfo->quantTabs[comp->quantizationTableSelector];
++		PORT_THP_SET_PITCH(port_thp_pitch_uv);
+ 		__THPInverseDCTNoYPos(__THPMCUBuffer[5], x_pos);
+ 
+ 		if (__THPInfo->RST != 0) {
+@@ -1955,15 +2020,25 @@
+ 		}
+ 	}
+ 
+-	LCStoreData(__THPInfo->dLC[0], __THPLCWork640[0],
+-	            ((4 * sizeof(u8) * 64) * (x / 16)));
+-	LCStoreData(__THPInfo->dLC[1], __THPLCWork640[1],
+-	            ((sizeof(u8) * 64) * (x / 16)));
+-	LCStoreData(__THPInfo->dLC[2], __THPLCWork640[2],
+-	            ((sizeof(u8) * 64) * (x / 16)));
+-	__THPInfo->dLC[0] += ((4 * sizeof(u8) * 64) * (x / 16));
+-	__THPInfo->dLC[1] += ((sizeof(u8) * 64) * (x / 16));
+-	__THPInfo->dLC[2] += ((sizeof(u8) * 64) * (x / 16));
++#if defined(PORT_GAME_SMG)
++	if (port_thp_linear) {
++		__THPInfo->dLC[0] += port_thp_pitch_y * 16;
++		__THPInfo->dLC[1] += port_thp_pitch_uv * 8;
++		__THPInfo->dLC[2] += port_thp_pitch_uv * 8;
++	} else {
++#endif
++		LCStoreData(__THPInfo->dLC[0], __THPLCWork640[0],
++		            ((4 * sizeof(u8) * 64) * (x / 16)));
++		LCStoreData(__THPInfo->dLC[1], __THPLCWork640[1],
++		            ((sizeof(u8) * 64) * (x / 16)));
++		LCStoreData(__THPInfo->dLC[2], __THPLCWork640[2],
++		            ((sizeof(u8) * 64) * (x / 16)));
++		__THPInfo->dLC[0] += ((4 * sizeof(u8) * 64) * (x / 16));
++		__THPInfo->dLC[1] += ((sizeof(u8) * 64) * (x / 16));
++		__THPInfo->dLC[2] += ((sizeof(u8) * 64) * (x / 16));
++#if defined(PORT_GAME_SMG)
++	}
++#endif
+ }
+ 
+ #ifndef TARGET_PC
+@@ -2706,6 +2781,9 @@
+ 	s32 rows;
+ 	u32 mcus;
+ 	u32 x;
++	u32 ypitch;
++	u32 uvpitch;
++	BOOL linear;
+ 	u8* y;
+ 	u8* u;
+ 	u8* v;
+@@ -2737,21 +2815,21 @@
+ 		PORT_THP_SYNC();
+ 		++done;
+ 		b = &port_thp_coef[(u32)r * j->mcus * 6];
+-		y = j->y + (u32)r * j->x * 16;
+-		u = j->u + (u32)r * j->x * 4;
+-		v = j->v + (u32)r * j->x * 4;
++		y = j->y + (u32)r * (j->linear ? j->ypitch * 16 : j->x * 16);
++		u = j->u + (u32)r * (j->linear ? j->uvpitch * 8 : j->x * 4);
++		v = j->v + (u32)r * (j->linear ? j->uvpitch * 8 : j->x * 4);
+ 		for (m = 0; m < j->mcus; m++, b += 6) {
+ 			const u32 xp = m * 16;
+-			port_thp_idct_p(b[0], xp, 0, y, j->x, j->q[0]);
+-			port_thp_idct_p(b[1], xp + 8, 0, y, j->x, j->q[0]);
+-			port_thp_idct_p(b[2], xp, 2, y, j->x, j->q[0]);
+-			port_thp_idct_p(b[3], xp + 8, 2, y, j->x, j->q[0]);
+-			port_thp_idct_p(b[4], xp / 2, 0, u, j->x / 2, j->q[1]);
+-			port_thp_idct_p(b[5], xp / 2, 0, v, j->x / 2, j->q[2]);
+-		}
+-		smg_thp_mt_flush(y, j->x * 16);
+-		smg_thp_mt_flush(u, j->x * 4);
+-		smg_thp_mt_flush(v, j->x * 4);
++			port_thp_idct_p(b[0], xp, 0, y, j->x, j->q[0], j->linear ? j->ypitch : 0);
++			port_thp_idct_p(b[1], xp + 8, 0, y, j->x, j->q[0], j->linear ? j->ypitch : 0);
++			port_thp_idct_p(b[2], xp, 2, y, j->x, j->q[0], j->linear ? j->ypitch : 0);
++			port_thp_idct_p(b[3], xp + 8, 2, y, j->x, j->q[0], j->linear ? j->ypitch : 0);
++			port_thp_idct_p(b[4], xp / 2, 0, u, j->x / 2, j->q[1], j->linear ? j->uvpitch : 0);
++			port_thp_idct_p(b[5], xp / 2, 0, v, j->x / 2, j->q[2], j->linear ? j->uvpitch : 0);
++		}
++		smg_thp_mt_flush(y, j->linear ? j->ypitch * 16 : j->x * 16);
++		smg_thp_mt_flush(u, j->linear ? j->uvpitch * 8 : j->x * 4);
++		smg_thp_mt_flush(v, j->linear ? j->uvpitch * 8 : j->x * 4);
+ 		__asm__ volatile("" ::: "memory");
+ 		smg_thp_mt_add(&j->done, 1);
+ 	}
+@@ -2791,6 +2869,9 @@
+ 	j->rows = rows;
+ 	j->mcus = mcus;
+ 	j->x    = x;
++	j->ypitch = port_thp_pitch_y;
++	j->uvpitch = port_thp_pitch_uv;
++	j->linear = port_thp_linear;
+ 	j->y    = (u8*)tileY;
+ 	j->u    = (u8*)tileU;
+ 	j->v    = (u8*)tileV;
+@@ -2838,9 +2919,9 @@
+ 	PORT_THP_SYNC();
+ 
+ 	// The state the strip decoders leave behind.
+-	info->dLC[0] = (u8*)tileY + (u32)rows * x * 16;
+-	info->dLC[1] = (u8*)tileU + (u32)rows * x * 4;
+-	info->dLC[2] = (u8*)tileV + (u32)rows * x * 4;
++	info->dLC[0] = (u8*)tileY + (u32)rows * (port_thp_linear ? port_thp_pitch_y * 16 : x * 16);
++	info->dLC[1] = (u8*)tileU + (u32)rows * (port_thp_linear ? port_thp_pitch_uv * 8 : x * 4);
++	info->dLC[2] = (u8*)tileV + (u32)rows * (port_thp_linear ? port_thp_pitch_uv * 8 : x * 4);
+ 	return 1;
+ }
+ #endif

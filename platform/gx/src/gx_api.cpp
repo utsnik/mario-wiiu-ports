@@ -8,6 +8,11 @@
 #include "../../wiiu/gx2_producer_worker.h"
 extern "C" int sms_wiiu_gx2_imgfxnative_enabled(void);
 extern "C" void sms_wiiu_gx2_wait_peek(int colour);
+#if defined(PORT_GAME_SMG)
+extern "C" int sms_wiiu_sd_marker(const char* name);
+bool smg_gphase_enabled();
+void smg_gphase_note_texinv_wait(uintptr_t caller, uint64_t us);
+#endif
 #endif
 
 #include <dolphin/gx.h>
@@ -40,6 +45,17 @@ bool rendererReady();
 static bool s_recording = false;
 static uint8_t* s_dlBegin = nullptr;
 static uint32_t s_dlSize = 0;
+#if defined(__WIIU__)
+static bool s_cpuTextureWritePending;
+#if defined(PORT_GAME_SMG)
+static int s_texInvNoWait = -1;
+static bool texInvNoWaitEnabled() {
+    if (s_texInvNoWait < 0)
+        s_texInvNoWait = sms_wiiu_sd_marker("texinvnowait") != 0 ? 1 : 0;
+    return s_texInvNoWait != 0;
+}
+#endif
+#endif
 #ifdef __WIIU__
 // Producer mode: state the same-thread path writes straight into g goes
 // through the stream instead (see ProducerHostKind).
@@ -1595,7 +1611,25 @@ void GXInitTlutRegion(GXTlutRegion* region, u32 addr, GXTlutSize size) {
 void GXInvalidateTexRegion(GXTexRegion*) { textureInvalidateAll(); }
 void GXInvalidateTexAll(void) {
 #ifdef __WIIU__
-    if (producerMode()) { ::gx2prod::wait(::gx2prod::kWaitFlush); return; }
+    if (producerMode()) {
+#if defined(PORT_GAME_SMG)
+        if (texInvNoWaitEnabled() && !s_cpuTextureWritePending) {
+            // Copyown destinations are resolved by address and invalidated by
+            // producerCopyService before the next worker-side texture load.
+            ::gx2prod::wake();
+            return;
+        }
+        if (smg_gphase_enabled()) {
+            const uint64_t start = static_cast<uint64_t>(gx::monoSeconds() * 1000000.0);
+            ::gx2prod::wait(::gx2prod::kWaitFlush);
+            const uint64_t elapsed = static_cast<uint64_t>(gx::monoSeconds() * 1000000.0) - start;
+            smg_gphase_note_texinv_wait(reinterpret_cast<uintptr_t>(__builtin_return_address(0)), elapsed);
+        } else
+#endif
+        ::gx2prod::wait(::gx2prod::kWaitFlush);
+        s_cpuTextureWritePending = false;
+        return;
+    }
 #endif
     flushBatch();
     textureInvalidateAll();
@@ -1609,6 +1643,7 @@ void GXInvalidateTexAll(void) {
 void GXPC_InvalidateTexturesAfterCpuWrite(void) {
 #ifdef __WIIU__
     if (producerMode()) {
+        s_cpuTextureWritePending = true;
         producerHostState(kHostTexInvalidate, 0, 0);
         return;
     }
@@ -1616,6 +1651,32 @@ void GXPC_InvalidateTexturesAfterCpuWrite(void) {
     flushBatch();
     textureInvalidateAll();
 }
+#if defined(PORT_GAME_SMG)
+void GXPC_TextureStreamWritten(const void* p, uint32_t bytes) {
+#ifdef __WIIU__
+    if (producerMode()) {
+        producerHostState(kHostTexStreamPtr, 0, hostPtr(p));
+        producerHostState(kHostTexStreamBytes, 0, bytes);
+        return;
+    }
+#endif
+    textureStreamWritten(p, bytes);
+}
+void GXPC_TextureStreamWrittenLinear(const void* p, uint32_t bytes, uint32_t pitch) {
+#ifdef __WIIU__
+    if (producerMode()) {
+        producerHostState(kHostTexStreamPtr, 0, hostPtr(p));
+        producerHostState(kHostTexStreamLinearBytes, 0, bytes);
+        producerHostState(kHostTexStreamPitch, 0, pitch);
+        return;
+    }
+#endif
+    textureStreamWrittenLinear(p, bytes, pitch);
+}
+void GXPC_TextureStreamStats(uint32_t* refreshes, uint32_t* hashesSkipped) {
+    textureStreamStats(refreshes, hashesSkipped);
+}
+#endif
 GXTexRegionCallback GXSetTexRegionCallback(GXTexRegionCallback f) {
     GXTexRegionCallback old = s_texRegionCb;
     s_texRegionCb = f;

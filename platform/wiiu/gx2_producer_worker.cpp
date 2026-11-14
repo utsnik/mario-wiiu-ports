@@ -9,6 +9,16 @@
 
 #include <cstring>
 
+#if defined(PORT_GAME_SMG)
+#include "../../games/smg/include/wiiu/gphase.h"
+extern void smg_gphase_note_prod_wait(uint32_t kind, uint32_t us);
+extern void smg_gphase_note_prod_service(uint32_t us);
+#endif
+
+#if defined(PORT_GAME_SMG)
+extern "C" void smg_wiiu_gpuframe_stamp(int kind);
+#endif
+
 namespace gx2prod {
 namespace {
 
@@ -79,6 +89,15 @@ static volatile uint32_t s_pendingRequest;
 static volatile uint32_t s_stopRequested;
 static bool s_started;
 static uint32_t s_wokenAt;
+#if defined(PORT_GAME_SMG)
+/* Marker wakefix: the wake decision used the queue depth seen when the
+ * zero-copy chunk was reserved, long before it was committed; a worker that
+ * drained and slept in between was not woken until 32 KiB more arrived or a
+ * synchronous wait.  With the marker, after publishing, wake whenever the
+ * worker has already consumed everything before this chunk. */
+static bool s_wakeFix;
+static uint32_t s_wakeFixWakes;
+#endif
 static Counters s_totals;
 static Counters s_lastLog;
 static uint32_t s_lastLogFrame;
@@ -206,6 +225,9 @@ static void consumeThrough(uint32_t target) {
         uint32_t bytes = target - read;
         const uint32_t contiguous = kByteRingSize - offset;
         if (bytes > contiguous) bytes = contiguous;
+#if defined(PORT_GAME_SMG)
+        smg_wprof_note_consume();
+#endif
         s_hooks.consume(s_byteRing + offset, bytes);
         read += bytes;
         releaseBarrier();
@@ -214,6 +236,10 @@ static void consumeThrough(uint32_t target) {
 }
 
 static void drainWorker() {
+#if defined(PORT_GAME_SMG)
+    smg_wprof_worker_mark();
+    smg_wprof_note_wake();
+#endif
     drawownResume();
     for (;;) {
         acquireBarrier();
@@ -223,6 +249,9 @@ static void drainWorker() {
         consumeThrough(target);
 
         if (request != s_workerHandled && reached(target, s_requestTarget)) {
+#if defined(PORT_GAME_SMG)
+            SmgWProfScope wprof_req(SmgWBucket_Req);
+#endif
             const uint32_t kind = s_requestKind;
             const ServiceFn fn = s_requestFn;
             void* const arg = s_requestArg;
@@ -246,6 +275,9 @@ static void drainWorker() {
             }
         }
         add(&s_totals.workerBusyMicros, microsSince(busyStart));
+#if defined(PORT_GAME_SMG)
+        smg_wprof_note_busy(microsSince(busyStart));
+#endif
 
         acquireBarrier();
         if (s_byteRead == s_byteWrite && request == s_requestId) {
@@ -300,6 +332,10 @@ bool start(const Hooks& hooks, bool core2) {
     }
 
     core2 = core2 || sms_wiiu_sd_marker("gx2core2");
+#if defined(PORT_GAME_SMG)
+    s_wakeFix = sms_wiiu_sd_marker("wakefix") != 0;
+    if (s_wakeFix) port_log("SMS Wii U: [prod] wakefix on\n");
+#endif
     s_hooks = hooks;
     s_byteRead = s_byteWrite = 0;
     s_serviceRead = s_serviceWrite = 0;
@@ -379,6 +415,10 @@ void drawown_worker_draw() {
         ++s_drawownOwners[s_drawownCurrent].draws;
 }
 
+uint32_t drawown_worker_current() {
+    return s_drawownEnabled ? s_drawownCurrent : kDrawownOtherOwner;
+}
+
 void drawown_report(uint32_t frame) {
     if (!s_drawownEnabled || !frame || frame % kDrawownWindowFrames) return;
     __sync_synchronize();
@@ -441,17 +481,31 @@ bool append(const uint8_t* bytes, uint32_t size) {
     }
 
     uint32_t write = 0, used;
+#if defined(PORT_GAME_SMG)
+    uint64_t append_wait_start = 0;
+    bool append_wait_timing = false;
+#endif
     for (;;) {
         write = s_byteWrite;
         acquireBarrier();
         used = write - s_byteRead;
         if (size <= kByteRingSize - used) break;
+#if defined(PORT_GAME_SMG)
+        if (!append_wait_timing) {
+            append_wait_start = smg_gphase_begin_timer(SmgGPhaseTimer_ProducerAppendWait);
+            append_wait_timing = true;
+        }
+#endif
         /* The worker can itself be waiting for room in the ordered service
          * ring, so core 1 must pump that ring while applying byte backpressure. */
         wakeWorker();
         serviceImpl(true);
         wut_OSSleepTicks(62156250 / 20000); // about 50 us
     }
+#if defined(PORT_GAME_SMG)
+    if (append_wait_timing)
+        smg_gphase_end_timer(SmgGPhaseTimer_ProducerAppendWait, append_wait_start);
+#endif
 
     const uint32_t offset = write % kByteRingSize;
     uint32_t first = kByteRingSize - offset;
@@ -469,6 +523,16 @@ bool append(const uint8_t* bytes, uint32_t size) {
         s_wokenAt = s_byteWrite;
         wakeWorker();
     }
+#if defined(PORT_GAME_SMG)
+    else if (s_wakeFix) {
+        __sync_synchronize();  // publish byteWrite before reading byteRead
+        if (s_byteRead == write) {
+            s_wokenAt = s_byteWrite;
+            ++s_wakeFixWakes;
+            wakeWorker();
+        }
+    }
+#endif
     // Keep ordered display-list services moving while the game is recording;
     // this also prevents a busy producer from filling the service ring before
     // its next synchronous boundary.
@@ -519,6 +583,16 @@ bool commit(uint32_t size) {
         s_wokenAt = s_byteWrite;
         wakeWorker();
     }
+#if defined(PORT_GAME_SMG)
+    else if (s_wakeFix) {
+        __sync_synchronize();  // publish byteWrite before reading byteRead
+        if (s_byteRead == write) {
+            s_wokenAt = s_byteWrite;
+            ++s_wakeFixWakes;
+            wakeWorker();
+        }
+    }
+#endif
     if (s_serviceRead != s_serviceWrite)
         serviceImpl(false);
     return true;
@@ -555,6 +629,10 @@ void wait(uint32_t kind) {
     }
     if (kind < WAIT_KIND_COUNT)
         add(&s_totals.waitMicros[kind], microsSince(startTime));
+#if defined(PORT_GAME_SMG)
+    if (kind < WAIT_KIND_COUNT)
+        smg_gphase_note_prod_wait(kind, microsSince(startTime));
+#endif
 }
 
 bool queueBoundary(uint32_t kind, ServiceFn fn, void* arg) {
@@ -586,6 +664,10 @@ void waitPending(uint32_t kind) {
     s_pendingRequest = 0;
     if (kind < WAIT_KIND_COUNT)
         add(&s_totals.waitMicros[kind], microsSince(startTime));
+#if defined(PORT_GAME_SMG)
+    if (kind < WAIT_KIND_COUNT)
+        smg_gphase_note_prod_wait(kind, microsSince(startTime));
+#endif
 }
 
 bool enqueue_list(void* displayList, uint32_t bytes) {
@@ -649,6 +731,9 @@ static void serviceImpl(bool allowNested) {
             }
         } else if (record.type == SERVICE_CALLBACK) {
             record.fn(record.arg);
+#if defined(PORT_GAME_SMG)
+            smg_wiiu_gpuframe_stamp(4);
+#endif
         }
         if (record.type == SERVICE_BARRIER) {
             /* Retire the queue slot before publishing completion.  A waiter
@@ -664,7 +749,13 @@ static void serviceImpl(bool allowNested) {
     if (serviced) add(&s_totals.core1ReplayMicros, microsSince(startTime));
 }
 
-void service() { serviceImpl(false); }
+void service() {
+    const OSTime startTime = OSGetTime();
+    serviceImpl(false);
+#if defined(PORT_GAME_SMG)
+    smg_gphase_note_prod_service(microsSince(startTime));
+#endif
+}
 
 void stop() {
     if (!s_started) return;

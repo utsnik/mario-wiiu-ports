@@ -118,6 +118,9 @@ if(PORT_GAME STREQUAL "smg")
     ${CMAKE_CURRENT_SOURCE_DIR}/../../games/smg/platform/wiiu/${SMG_WIIU_RUNTIME_FILE}
     ${CMAKE_CURRENT_SOURCE_DIR}/../../games/smg/platform/wiiu/dol_data.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../../games/smg/platform/wiiu/alarm.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../games/smg/platform/wiiu/thp_mt.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../games/smg/platform/wiiu/j3dmt.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../games/smg/platform/wiiu/gphase.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../../games/smg/platform/wiiu/msl_printf.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../../games/smg/platform/wiiu/wstring.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../../games/smg/platform/wiiu/galaxy_link_stubs.cpp)
@@ -169,6 +172,13 @@ if(PORT_GAME STREQUAL "smg")
     -include ${CMAKE_CURRENT_SOURCE_DIR}/../../src/port_compat.h
     -include${CMAKE_CURRENT_SOURCE_DIR}/dolphin_externs.h)
 
+  # Vendored wiiu-dynres (plain C, no platform calls): Galaxy only. Sunshine's
+  # target does not list these files.
+  add_library(smg_dynres OBJECT
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/wiiu-dynres/dynres.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/wiiu-dynres/dynres_store.c)
+  target_compile_options(smg_dynres PRIVATE ${SMG_GAME_FLAGS})
+
   add_library(smg_game STATIC ${SMG_GAME_SOURCES})
   target_include_directories(smg_game BEFORE PRIVATE
     ${SMG_GAME_INCLUDE_DIRS}
@@ -180,6 +190,17 @@ if(PORT_GAME STREQUAL "smg")
     ${SMG_WIIU_OS_ADAPTER_DEFS} ${SMG_WIIU_SND_ADAPTER_DEFS})
   target_compile_options(smg_game PRIVATE ${SMG_GAME_FLAGS}
     -include ${CMAKE_CURRENT_SOURCE_DIR}/../../games/smg/include/port/compat.h)
+  # Opt-in link-time optimisation of the game code only. JKRHeap.cpp defines
+  # operator new/delete, which the smg link wraps (--wrap=_Znwj ...): inside one
+  # LTO unit its callers would bind to it directly and skip the wrapper, so new
+  # and delete stop pairing (a full -flto build crashed in _free_r at boot).
+  option(SMG_WIIU_LTO "LTO for the Galaxy game code (smg_game)" OFF)
+  if(SMG_WIIU_LTO)
+    target_compile_options(smg_game PRIVATE -flto=8 -fno-fat-lto-objects)
+    get_filename_component(SMG_JKRHEAP_SRC
+      ${CMAKE_CURRENT_SOURCE_DIR}/../../games/smg/decomp/src/JSystem/JKernel/JKRHeap.cpp ABSOLUTE)
+    set_source_files_properties(${SMG_JKRHEAP_SRC} PROPERTIES COMPILE_OPTIONS "-fno-lto")
+  endif()
   # Galaxy's THP player calls the same decoder entry points as Sunshine. Keep
   # the decoder sources in the shared platform/thp owner; only these C files
   # also need the Dolphin port compatibility helpers used by the patched
@@ -193,6 +214,7 @@ if(PORT_GAME STREQUAL "smg")
 
   add_executable(smg ${SMG_WIIU_PLATFORM_SOURCES}
     $<TARGET_OBJECTS:smg_wiiu_shared>
+    $<TARGET_OBJECTS:smg_dynres>
     $<TARGET_OBJECTS:smg_wiiu_asm>)
   target_include_directories(smg BEFORE PRIVATE
     ${SMG_GAME_INCLUDE_DIRS}
@@ -228,6 +250,9 @@ if(PORT_GAME STREQUAL "smg")
     -Wl,--wrap=_Znwj -Wl,--wrap=_Znaj -Wl,--wrap=_ZdlPv -Wl,--wrap=_ZdaPv
     -Wl,--wrap=_ZdlPvj -Wl,--wrap=_ZdaPvj
     "-Wl,-Map,${SMG_WIIU_BUILD_DIR}/smg.map")
+  if(SMG_WIIU_LTO)
+    target_link_options(smg PRIVATE -flto=8 -O2)
+  endif()
   find_package(SDL2 REQUIRED CONFIG)
   target_link_libraries(smg PRIVATE
     -Wl,--whole-archive smg_game -Wl,--no-whole-archive

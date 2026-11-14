@@ -39,6 +39,55 @@ extern "C" void sms_wiiu_gx2_target_present(void);
 #include <cstdint>
 #include <cstring>
 
+#include "../../games/smg/include/wiiu/pipe5.h"
+#if defined(PORT_GAME_SMG)
+extern "C" int64_t wut_OSGetTime_stub(void);
+extern "C" int sms_wiiu_pipe5_enabled(void);
+extern "C" uint32_t sms_wiiu_vsync_event_count(void);
+extern void smg_gphase_note_pipe5_game_frame(bool rendered);
+extern void smg_gphase_note_pipe5_present(const char* caller);
+extern void smg_gphase_note_pipe5_bad_frame();
+extern void smg_gphase_note_pipe5_gate_block();
+extern "C" void smg_wiiu_gpuframe_end(void);
+extern "C" void smg_wiiu_dynres_shutdown(void);
+#endif
+
+enum Pipe5TraceEvent { P5T_END_IN, P5T_END_OUT, P5T_SERVICE_LIST, P5T_FLUSH,
+	P5T_DRAIN_IN, P5T_DRAIN_OUT, P5T_SWAP, P5T_FLIP, P5T_PRESENT_WAIT_IN,
+	P5T_PRESENT_WAIT_OUT, P5T_FENCE_WAIT_IN, P5T_FENCE_WAIT_OUT, P5T_FENCE_ARM,
+	P5T_OWNED, P5T_FALLBACK, P5T_HAZARD, P5T_CONSUME };
+#if defined(PORT_GAME_SMG)
+struct Pipe5TraceRecord { int64_t time; uint32_t vi, core, event, count; };
+static Pipe5TraceRecord s_pipe5Trace[8192];
+static uint32_t s_pipe5TraceCount;
+static bool s_pipe5TraceDumped;
+static const char* pipe5TraceName(uint32_t event) {
+	static const char* names[] = {"endRender.in", "endRender.out", "service.list", "GX2Flush",
+		"deferred.in", "deferred.out", "swap", "flip", "presentWait.in", "presentWait.out",
+		"vertexWait.in", "vertexWait.out", "fenceArm", "owned", "fallback", "hazard", "consume"};
+	return event < sizeof(names) / sizeof(names[0]) ? names[event] : "?";
+}
+extern "C" void sms_wiiu_pipe5_trace(uint32_t event, uint32_t count) {
+	if (!sms_wiiu_pipe5_enabled() || s_pipe5TraceDumped) return;
+	const uint32_t vi = sms_wiiu_vsync_event_count();
+	if (!((vi >= 300 && vi < 330) || (vi >= 1400 && vi < 1430))) return;
+	if (s_pipe5TraceCount < sizeof(s_pipe5Trace) / sizeof(s_pipe5Trace[0]))
+		s_pipe5Trace[s_pipe5TraceCount++] = {wut_OSGetTime_stub(), vi, OSGetCoreId(), event, count};
+}
+static void pipe5TraceDump(void) {
+	if (s_pipe5TraceDumped || sms_wiiu_vsync_event_count() < 1430) return;
+	s_pipe5TraceDumped = true;
+	for (uint32_t i = 0; i < s_pipe5TraceCount; ++i) {
+		const Pipe5TraceRecord& r = s_pipe5Trace[i];
+		port_log("[pipe5trace] vi=%u t=%lld core=%u %s count=%u\n", r.vi,
+			(long long)r.time, r.core, pipe5TraceName(r.event), r.count);
+	}
+}
+#else
+extern "C" void sms_wiiu_pipe5_trace(uint32_t, uint32_t) {}
+static void pipe5TraceDump() {}
+#endif
+
 namespace {
 
 uint32_t s_present_count;
@@ -53,6 +102,11 @@ float s_widescreen = 1.0f;
 bool s_logged;
 bool s_gfx_initialized;
 bool s_frame_open;
+bool s_pipe5Presented;
+bool s_pipe5FrameEnded;
+bool s_pipe5Fallback;
+uint64_t s_pipe5GameFrame;
+uint64_t s_pipe5PresentedGameFrame;
 
 #if defined(PORT_GAME_SMG)
 alignas(64) uint8_t s_smg_fifo[64 * 1024];
@@ -66,6 +120,9 @@ extern "C" const GX2Surface* sms_wiiu_render_surface(void);
 extern "C" int sms_wiiu_pipe1_enabled(void);
 extern "C" int sms_wiiu_pipe2_enabled(void);
 extern "C" int sms_wiiu_pipe2_present_queued(void);
+extern "C" int sms_wiiu_pipe5_enabled(void);
+extern "C" int sms_wiiu_pipe5_scene_ready(void);
+extern "C" int sms_wiiu_gx2_renderer_pipe5_end_frame(int rendered, int bufferMode);
 extern "C" uint32_t sms_wiiu_vsync_event_count(void);
 extern "C" void sms_wiiu_dvd_pump(void);
 extern "C" void gxs_native_sleep_ticks(int64_t ticks) __asm__("OSSleepTicks");
@@ -77,6 +134,7 @@ extern "C" void sms_wiiu_gx2_renderer_shutdown(void);
 extern "C" void sms_wiiu_gx2_texture_pack_pump(void);
 extern "C" int sms_wiiu_gx2_renderer_has_draws(void);
 extern "C" void sms_wiiu_d1_note_present_core(void);
+extern "C" void sms_wiiu_d1_present_line(void);
 #if defined(PORT_GAME_SMG)
 extern "C" void sms_wiiu_gx2_renderer_foreground_release(void);
 extern "C" void sms_wiiu_gx2_renderer_foreground_acquire(void);
@@ -547,6 +605,10 @@ extern "C" void sms_wiiu_exit(void)
 	 * "exiting" line, so a repeat must show which step never returned. */
 	WHBLogPrintf("SMS Wii U: exit: audio shutdown");
 	gx::texturePackShutdown();
+#if defined(PORT_GAME_SMG)
+	WHBLogPrintf("SMS Wii U: exit: dynres save");
+	smg_wiiu_dynres_shutdown();
+#endif
 	sms_wiiu_audio_shutdown();
 	sms_wiiu_vsync_pace_stop();
 	sms_wiiu_dvd_shutdown();
@@ -634,17 +696,29 @@ static void pipe1_wait_previous_frame(void)
 		         (unsigned long long)GX2GetLastSubmittedTimeStamp());
 }
 
-static void present_finish_pipelined(void)
+static void present_finish_pipelined(const char* caller)
 {
 	static uint32_t s_d5sCalls;
 	const bool d5s = s_d5sCalls < 40;
 	uint64_t before = 0, afterSwap = 0, afterFlush = 0;
+#if defined(PORT_GAME_SMG)
+	if (sms_wiiu_pipe5_enabled())
+		smg_gphase_note_pipe5_present(caller);
+#endif
 	sms_wiiu_d1_note_present_core();
 	before = GX2GetLastSubmittedTimeStamp();
-	if (!sms_wiiu_d7_noswap()) GX2SwapScanBuffers();
+#if defined(PORT_GAME_SMG)
+	smg_wiiu_gpuframe_end();
+#endif
+	if (!sms_wiiu_d7_noswap()) {
+		GX2SwapScanBuffers();
+		uint32_t swaps = 0, flips = 0; OSTime lastFlip = 0, lastVsync = 0;
+		GX2GetSwapStatus(&swaps, &flips, &lastFlip, &lastVsync);
+		sms_wiiu_pipe5_trace(P5T_SWAP, swaps);
+	}
 	if (d5s) afterSwap = GX2GetLastSubmittedTimeStamp();
 	sms_wiiu_d4_event(D4_SWAP);
-	GX2Flush();
+	GX2Flush(); sms_wiiu_pipe5_trace(P5T_FLUSH, 0);
 	uint64_t submitted = GX2GetLastSubmittedTimeStamp();
 	/* d6: a present flush that did not submit (seen whenever the GPU had just
 	 * caught up) merges the scan copies and swap into the next frame's
@@ -685,10 +759,11 @@ static void present_finish_pipelined(void)
 }
 extern "C" void sms_wiiu_present_finish_pipelined_service(void)
 {
-	present_finish_pipelined();
+	present_finish_pipelined("service");
 }
 static void present_begin_pipelined(void)
 {
+	sms_wiiu_pipe5_trace(P5T_PRESENT_WAIT_IN, 0);
 	pipe1_wait_previous_frame();
 	const OSTime flipStart = wut_OSGetTime_stub();
 	const uint32_t vsyncStart = sms_wiiu_vsync_event_count();
@@ -714,6 +789,103 @@ static void present_begin_pipelined(void)
 	}
 	GX2SetContextState(WHBGfxGetTVContextState());
 	sms_wiiu_d4_event(D4_CONTEXT);
+	sms_wiiu_pipe5_trace(P5T_PRESENT_WAIT_OUT, 0);
+}
+
+extern "C" void sms_wiiu_pipe5_service_present_complete(void)
+{
+	#if !defined(PORT_GAME_SMG)
+	return;
+	#else
+	if (!sms_wiiu_pipe5_enabled() || !s_pipe5FrameEnded || s_pipe5Presented ||
+	    s_pipe5PresentedGameFrame == s_pipe5GameFrame) {
+		WHBLogPrintf("SMS Wii U: [pipe5] duplicate or out-of-order present completion");
+		smg_gphase_note_pipe5_bad_frame();
+		sms_wiiu_pipe5_trace(P5T_HAZARD, 3);
+		return;
+	}
+	s_pipe5Presented = true;
+	s_pipe5PresentedGameFrame = s_pipe5GameFrame;
+	#endif
+}
+
+extern "C" int sms_wiiu_pipe5_end_frame(int rendered, int bufferMode)
+{
+	sms_wiiu_pipe5_trace(P5T_END_IN, 0);
+	if (!sms_wiiu_pipe5_enabled())
+		return SmsWiiuPipe5Inactive;
+	const bool sceneReady = sms_wiiu_pipe5_scene_ready() != 0;
+	#if defined(PORT_GAME_SMG)
+	if (!sceneReady)
+		smg_gphase_note_pipe5_gate_block();
+	#endif
+	if (s_pipe5FrameEnded) {
+		WHBLogPrintf("SMS Wii U: [pipe5] game frame ended twice");
+	#if defined(PORT_GAME_SMG)
+		smg_gphase_note_pipe5_bad_frame();
+	#endif
+		sms_wiiu_pipe5_trace(P5T_HAZARD, 4);
+		s_pipe5Fallback = true;
+		return SmsWiiuPipe5Fallback;
+	}
+	s_pipe5FrameEnded = true;
+	++s_pipe5GameFrame;
+#if defined(PORT_GAME_SMG)
+	smg_gphase_note_pipe5_game_frame(rendered != 0);
+#endif
+	const int result = sms_wiiu_gx2_renderer_pipe5_end_frame(rendered, bufferMode);
+	if (result == SmsWiiuPipe5Fallback || !sceneReady ||
+	    (result == SmsWiiuPipe5OverlapOwned &&
+	     (!s_pipe5Presented || s_pipe5PresentedGameFrame != s_pipe5GameFrame))) {
+		if (!sceneReady)
+			sms_wiiu_pipe5_trace(P5T_FALLBACK, 6);
+		else
+			WHBLogPrintf("SMS Wii U: [pipe5] end-frame ownership failed for game frame %llu",
+			             (unsigned long long)s_pipe5GameFrame);
+	#if defined(PORT_GAME_SMG)
+		smg_gphase_note_pipe5_bad_frame();
+	#endif
+		sms_wiiu_pipe5_trace(P5T_HAZARD, 5);
+		sms_wiiu_pipe5_trace(P5T_FALLBACK, 1);
+		s_pipe5Fallback = true;
+		sms_wiiu_pipe5_trace(P5T_END_OUT, 0);
+		return SmsWiiuPipe5Fallback;
+	}
+	sms_wiiu_pipe5_trace(P5T_END_OUT, 0);
+	return result;
+}
+
+extern "C" void sms_wiiu_pipe5_consume_frame(void)
+{
+	if (!sms_wiiu_pipe5_enabled() || !s_pipe5FrameEnded || !s_gfx_initialized ||
+		!ProcUIInForeground() || !s_was_foreground)
+		return;
+
+	const bool presented = s_pipe5Presented;
+	const bool fallback = s_pipe5Fallback;
+	sms_wiiu_pipe5_trace(P5T_CONSUME, uint32_t(s_pipe5GameFrame));
+	s_pipe5FrameEnded = false;
+	s_pipe5Presented = false;
+	s_pipe5Fallback = false;
+	if (fallback) {
+		/* A failed opt-in ownership probe returns to the ordinary graphics
+		 * boundary: the main loop already performed its synchronous wait. */
+		sms_wiiu_gx2_target_present();
+		if (SMS_WIIU_PIPELINED_PRESENT)
+			present_finish_pipelined("fallback");
+		else
+			WHBGfxFinishRender();
+	}
+	if (presented || fallback) {
+		const int64_t beginStart = wut_OSGetTime_stub();
+		if (SMS_WIIU_PIPELINED_PRESENT) present_begin_pipelined();
+		else WHBGfxBeginRender();
+		s_presentBegin += wut_OSGetTime_stub() - beginStart;
+	}
+	sms_wiiu_gx2_texture_pack_pump();
+	sms_wiiu_gx2_target_begin();
+	sms_wiiu_gx2_renderer_begin();
+	s_frame_open = true;
 }
 
 /* Real vsyncs, counted by GX2's vsync event. The VI emulation advances its
@@ -727,7 +899,13 @@ static uint32_t s_vsyncsSeen;
 static int s_pace = -1;
 static uint32_t s_paceCalls, s_paceWaits, s_paceFields;
 
-static void on_vsync(GX2EventType, void*) { ++s_vsyncs; }
+static void on_vsync(GX2EventType, void*) {
+	++s_vsyncs;
+	uint32_t swaps = 0, flips = 0; OSTime lastFlip = 0, lastVsync = 0;
+	GX2GetSwapStatus(&swaps, &flips, &lastFlip, &lastVsync);
+	sms_wiiu_pipe5_trace(P5T_FLIP, flips);
+	pipe5TraceDump();
+}
 
 extern "C" uint32_t sms_wiiu_vsync_event_count(void)
 {
@@ -920,6 +1098,12 @@ extern "C" void sms_wiiu_gfx_frame(void)
 		sms_wiiu_gx2_renderer_begin();
 		s_frame_open = true;
 	}
+	if (sms_wiiu_pipe5_enabled()) {
+		/* The game loop consumes the producer boundary.  VIFlush may pump it
+		 * during endRender, and waitForTick may consume a queued JUTVideo
+		 * message without reaching VIWaitForRetrace. */
+		return;
+	}
 	/* Retraces with nothing drawn keep the last picture on screen. */
 	if (!sms_wiiu_gx2_renderer_has_draws())
 		return;
@@ -930,7 +1114,7 @@ extern "C" void sms_wiiu_gfx_frame(void)
 	const int64_t t0 = wut_OSGetTime_stub();
 	sms_wiiu_gx2_target_present();
 	if (SMS_WIIU_PIPELINED_PRESENT) {
-		if (!sms_wiiu_pipe2_present_queued()) present_finish_pipelined();
+		if (!sms_wiiu_pipe2_present_queued()) present_finish_pipelined("gfxFrame");
 	} else if (!sms_wiiu_pipe2_present_queued()) {
 		WHBGfxFinishRender();
 		sms_wiiu_d4_submit_at("whb-finish", 's', __LINE__, GX2GetLastSubmittedTimeStamp());

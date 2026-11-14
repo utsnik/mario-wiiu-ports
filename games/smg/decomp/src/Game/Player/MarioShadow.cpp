@@ -16,6 +16,12 @@
 #include <JSystem/JUtility/JUTVideo.hpp>
 #include <cstring>
 #include <revolution/gd.h>
+#if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
+#include "wiiu/gphase.h"
+#else
+#define smg_gphase_begin_timer(timer) 0
+#define smg_gphase_end_timer(timer, start) ((void)0)
+#endif
 
 void MarioShadow_FORCE_MATCH_SDATA2() {
     (void)1.0f;
@@ -429,7 +435,9 @@ void CollisionShadow::drawAndCaptureTex(J3DModelX* pModel, const TVec3f& rPositi
             pModel->mFlags.clear();
             pModel->mFlags._11 = true;
             pModel->mFlags._1E = true;
+            uint64_t gphase_start = smg_gphase_begin_timer(SmgGPhaseTimer_MarioShadowDirectDraw1);
             pModel->directDraw(nullptr);
+            smg_gphase_end_timer(SmgGPhaseTimer_MarioShadowDirectDraw1, gphase_start);
         }
 
         GXSetViewport(608 - _2FC, 0.0f, _2FC, _2FE, 0.0f, 1.0f);
@@ -438,7 +446,9 @@ void CollisionShadow::drawAndCaptureTex(J3DModelX* pModel, const TVec3f& rPositi
         pModel->setDrawView(2);
         pModel->mFlags.clear();
         pModel->mFlags._1E = true;
+        uint64_t gphase_start = smg_gphase_begin_timer(SmgGPhaseTimer_MarioShadowDirectDraw2);
         pModel->directDraw(nullptr);
+        smg_gphase_end_timer(SmgGPhaseTimer_MarioShadowDirectDraw2, gphase_start);
         pModel->mFlags._1E = false;
     }
 
@@ -452,21 +462,33 @@ void CollisionShadow::drawAndCaptureTex(J3DModelX* pModel, const TVec3f& rPositi
         f32 x = 608 - _2FC / 2;
         TVec3f center(x, y, 0.0f);
         TDDraw::fix2Dpos(&center);
+        uint64_t gphase_start = smg_gphase_begin_timer(SmgGPhaseTimer_MarioShadowFillCircle);
         TDDraw::drawFillCircle(center, _2FC / 2, 0xFFFFFFC0, 0, 16);
+        smg_gphase_end_timer(SmgGPhaseTimer_MarioShadowFillCircle, gphase_start);
         const ResTIMG* image = _300->getTexInfo();
         void* destination = const_cast< u8* >(reinterpret_cast< const u8* >(image) + image->mImageDataOffset);
         GXRenderModeObj* mode = JUTVideo::getManager()->getRenderMode();
         GXSetCopyFilter(GX_FALSE, mode->sample_pattern, GX_FALSE, mode->vfilter);
+        gphase_start = smg_gphase_begin_timer(SmgGPhaseTimer_MarioShadowCaptureDolTexture);
         JUTTexture::captureDolTexture(destination, _2FC, _2FE, 608 - _2FC, 0, false, GX_CTF_A8);
+        smg_gphase_end_timer(SmgGPhaseTimer_MarioShadowCaptureDolTexture, gphase_start);
         GXSetCopyFilter(GX_FALSE, mode->sample_pattern, GX_TRUE, mode->vfilter);
+        gphase_start = smg_gphase_begin_timer(SmgGPhaseTimer_MarioShadowGXInvalidateTexAll);
         GXInvalidateTexAll();
+        smg_gphase_end_timer(SmgGPhaseTimer_MarioShadowGXInvalidateTexAll, gphase_start);
     }
 
     GXSetAlphaUpdate(GX_FALSE);
     GXSetColorUpdate(GX_TRUE);
+    uint64_t gphase_start = smg_gphase_begin_timer(SmgGPhaseTimer_MarioShadowResetVcdVatCache);
     J3DShape::resetVcdVatCache();
+    smg_gphase_end_timer(SmgGPhaseTimer_MarioShadowResetVcdVatCache, gphase_start);
+    gphase_start = smg_gphase_begin_timer(SmgGPhaseTimer_MarioShadowDefaultViewportAndScissor);
     MR::setDefaultViewportAndScissor();
+    smg_gphase_end_timer(SmgGPhaseTimer_MarioShadowDefaultViewportAndScissor, gphase_start);
+    gphase_start = smg_gphase_begin_timer(SmgGPhaseTimer_MarioShadowCameraInit3D);
     TDDraw::cameraInit3D();
+    smg_gphase_end_timer(SmgGPhaseTimer_MarioShadowCameraInit3D, gphase_start);
     GXSetDstAlpha(GX_FALSE, 0);
 }
 

@@ -22,6 +22,10 @@
 
 #if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
 extern "C" int sms_wiiu_sd_marker(const char* name);
+#include "wiiu/gphase.h"
+#else
+#define smg_gphase_begin_timer(timer) 0
+#define smg_gphase_end_timer(timer, start) ((void)0)
 #endif
 
 void MarioActorShadow_FORCE_MATCH_SDATA2() {
@@ -341,7 +345,9 @@ void MarioActor::drawShadow() const {
     PSMTXScale(matrix.toMtxPtr(), mScale.x, mScale.y, mScale.z);
     PSMTXConcat(matrix.toMtxPtr(), _BC8.mMtx, matrix.toMtxPtr());
     PSMTXConcat(getJ3DModel()->getBaseTRMtx(), matrix.toMtxPtr(), pSimple->getBaseTRMtx());
+    uint64_t gphase_start = smg_gphase_begin_timer(SmgGPhaseTimer_MarioShadowCalcView);
     _214->calcView(pSimple, 2, getJ3DModel());
+    smg_gphase_end_timer(SmgGPhaseTimer_MarioShadowCalcView, gphase_start);
     if (mMario->mSinkTimer > 180) {
         return;
     }

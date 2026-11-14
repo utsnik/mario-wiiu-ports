@@ -2,6 +2,7 @@
 #ifdef TARGET_WIIU
 #include "port/port.h"
 extern "C" unsigned int sms_wiiu_frame_count();
+extern "C" void smg_wiiu_dynres_stage(const char* stage, const char* scene);
 #endif
 #include "Game/LiveActor/Nerve.hpp"
 #include "Game/NameObj/NameObjHolder.hpp"
@@ -215,6 +216,7 @@ void GameSystemSceneController::startScene() {
 #ifdef TARGET_WIIU
     port_log("[smg-scene] start scene=%s stage=%s frame=%u", mCurrSceneControlInfo.mScene,
              mCurrSceneControlInfo.mStage, sms_wiiu_frame_count());
+    smg_wiiu_dynres_stage(mCurrSceneControlInfo.mStage, mCurrSceneControlInfo.mScene);
 #endif
     mScene->start();
     GameSystemFunction::restartControllerLeaveWatcher();
@@ -456,11 +458,9 @@ bool GameSystemSceneController::isExistRequest() const {
            isCurrentNerve(GET_NERVE(GameSystemSceneController, GameSystemSceneControllerWaitDrawDoneScene));
 }
 
-#ifdef TARGET_PC
 bool GameSystemSceneController::isChangingScene() const {
     return mNextNerve != nullptr || !isCurrentNerve(GET_NERVE(GameSystemSceneController, GameSystemSceneControllerNormal));
 }
-#endif
 
 bool GameSystemSceneController::isSameAtNextSceneAndStage() const {
     return MR::isEqualString(mCurrSceneControlInfo.mScene, mNextSceneControlInfo.mScene) &&

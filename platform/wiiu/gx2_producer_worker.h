@@ -105,6 +105,7 @@ void drawown_owner_name(uint32_t owner, const char* name);
 void drawown_worker_push(uint32_t owner);
 void drawown_worker_pop();
 void drawown_worker_draw();
+uint32_t drawown_worker_current();
 void drawown_report(uint32_t frame);
 
 Counters counters();

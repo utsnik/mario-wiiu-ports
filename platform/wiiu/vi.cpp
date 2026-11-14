@@ -25,6 +25,7 @@ extern "C" volatile int sms_wiiu_menu_exit_pending;
 extern "C" {
 void sms_wiiu_gfx_frame(void);
 uint32_t sms_wiiu_vsync_fields(void);
+void sms_wiiu_gx2_renderer_exit_quiesce(void);
 int sms_wiiu_gfx_is_initialized(void);
 void sms_wiiu_exit(void);
 void sms_wiiu_dump_threads(void);
@@ -33,6 +34,12 @@ void sms_wiiu_profiler_stop(void);
 void sms_wiiu_dvd_pump(void);
 void sms_wiiu_crash_return_to_menu(void);
 void sms_wiiu_gx2_renderer_exit_drain(void);
+#if defined(PORT_GAME_SMG)
+void smg_vi_note_fields(u32 fields);
+#endif
+#if defined(PORT_GAME_SMG)
+int sms_wiiu_pipe5_enabled(void);
+#endif
 extern volatile int sms_wiiu_crash_pending;
 extern "C" volatile int sms_wiiu_crash_stage;
 /* wut symbols bound by name: the decomp's OSThread types clash with coreinit's. */
@@ -187,6 +194,7 @@ void sms_wiiu_frame_boundary(void)
 		WHBLogPrintf("SMS Wii U: exit drain: %s retired=%llu of %llu after %d kicks; asking for the Menu",
 		             GX2GetRetiredTimeStamp() >= target ? "done" : "GPU STUCK",
 		             (unsigned long long)GX2GetRetiredTimeStamp(), (unsigned long long)target, kicks);
+		sms_wiiu_gx2_renderer_exit_quiesce();
 		SYSLaunchMenu();
 #else
 		GX2DrawDone();
@@ -213,18 +221,43 @@ void sms_wiiu_frame_boundary(void)
 	sms_wiiu_dvd_pump();
 	sms_wiiu_input_poll();
 	/* The retrace count follows the TV: a retrace waits for a real vsync,
-	 * and one that ends late counts every field that passed. */
+	 * and one that ends late counts every field that passed.  Pipe5 has already
+	 * queued its swap from MainLoopFramework::endFrame; consume that handoff at
+	 * the normal graphics boundary after the fields calculation.  The Nov 8
+	 * present-before-vsync experiment let a service-side submission overlap
+	 * VIFlush/prepareCopyDisp and hung at the boot frame boundary. */
 #if defined(PORT_GAME_SMG)
 	sms_wiiu_frame_split_gpu_begin();
-#endif
+	/* Marker presentfirst remains available for non-pipe5 A/B runs.  Pipe5 is
+	 * intentionally excluded: its sole graphics handoff is below, after
+	 * sms_wiiu_vsync_fields(). */
+	static int s_presentFirst = -1;
+	if (s_presentFirst < 0) {
+		s_presentFirst = !sms_wiiu_pipe5_enabled() && sms_wiiu_sd_marker("presentfirst") ? 1 : 0;
+		port_log("SMG Wii U: presentfirst %s\n", s_presentFirst ? "on" : "off");
+	}
+	if (s_presentFirst)
+		sms_wiiu_gfx_frame();
+	#endif
 	const u32 fields = sms_wiiu_vsync_fields();
 #if defined(PORT_GAME_SMG)
 	sms_wiiu_frame_split_gpu_end();
 #endif
 	if (s_pre_callback)
 		s_pre_callback(s_retrace_count + fields);
+	#if defined(PORT_GAME_SMG)
+	/* Pipe5's single graphics handoff is here, after the fields calculation
+	 * (b224: excluding pipe5 here as well left s_pipe5FrameEnded set forever,
+	 * "game frame ended twice" every frame).  presentfirst already ran above. */
+	if (!s_presentFirst)
+		sms_wiiu_gfx_frame();
+	#else
 	sms_wiiu_gfx_frame();
+	#endif
 	s_retrace_count += fields;
+#if defined(PORT_GAME_SMG)
+	smg_vi_note_fields(fields);
+#endif
 	++s_frame_count;
 	s_current_framebuffer = s_next_framebuffer;
 	if (s_post_callback)
@@ -235,8 +268,13 @@ void sms_wiiu_frame_boundary(void)
 #if defined(PORT_GAME_SMG)
 	sms_wiiu_frame_split_end(fields);
 #endif
-	/* During boot, show where every game thread is waiting. */
-	if (s_frame_count % 600 == 0 && s_frame_count <= 3600)
+	/* During boot, show where every game thread is waiting. Opt-in (SD marker
+	 * thrdump): each dump symbolises and logs ~110 lines and stalls the frame
+	 * boundary ~150-200 ms, a visible hitch every 10 s in Logo/FileSelect. */
+	static int s_thrdump = -1;
+	if (s_thrdump < 0)
+		s_thrdump = sms_wiiu_sd_marker("thrdump") ? 1 : 0;
+	if (s_thrdump && s_frame_count % 600 == 0 && s_frame_count <= 3600)
 		sms_wiiu_dump_threads();
 	if (s_frame_count - s_last_heartbeat >= 60) {
 		s_last_heartbeat = s_frame_count;
@@ -276,6 +314,17 @@ void sms_wiiu_frame_boundary(void)
 }
 
 u32 sms_wiiu_frame_count(void) { return s_frame_count; }
+#if defined(PORT_GAME_SMG)
+/* Boundaries by caller (VIFlush from endRender, VIWaitForRetrace from
+ * waitForTick) and retrace fields counted, for gphase's [gframe] line. */
+static u32 s_bnd_flush, s_bnd_wait, s_bnd_fields;
+void smg_vi_take_boundary_counts(u32* flush, u32* wait, u32* fields)
+{
+	*flush = s_bnd_flush; *wait = s_bnd_wait; *fields = s_bnd_fields;
+	s_bnd_flush = s_bnd_wait = s_bnd_fields = 0;
+}
+void smg_vi_note_fields(u32 fields) { s_bnd_fields += fields; }
+#endif
 const char* sms_wiiu_stage_path(void) { return s_stage_path; }
 
 void VIInit(void) { port_vi_init(); }
@@ -289,6 +338,9 @@ void VIFlush(void)
 	sms_wiiu_d1_note_vi_flush();
 #endif
 	if (!s_flush_pumped) {
+#if defined(PORT_GAME_SMG)
+		++s_bnd_flush;
+#endif
 		sms_wiiu_frame_boundary();
 		s_flush_pumped = true;
 	}
@@ -320,8 +372,12 @@ void VIWaitForRetrace(void)
 	if (s_in_boundary)
 		return;
 #endif
-	if (!s_flush_pumped)
+	if (!s_flush_pumped) {
+#if defined(PORT_GAME_SMG)
+		++s_bnd_wait;
+#endif
 		sms_wiiu_frame_boundary();
+	}
 	s_flush_pumped = false;
 }
 

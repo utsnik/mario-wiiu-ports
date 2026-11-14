@@ -13,6 +13,9 @@
 #include <string>
 #include <stddef.h>
 #include <vector>
+#include "j3d_state_delta.h"
+
+struct SmsWiiuJpaFinalVxDesc;
 
 namespace gx {
 
@@ -171,6 +174,23 @@ inline void writeXF1(uint16_t addr, uint32_t v) { writeXF(addr, 1, &v); }
 void writeXFf(uint16_t addr, uint32_t count, const float* f);
 void resetState();
 
+// Optional worker-side measurement of state-only J3D display-list replays.
+void j3dStateDeltaSetEnabled(bool enabled);
+void j3dStateDeltaSetCheckEnabled(bool enabled);
+bool j3dStateDeltaCheckEnabled();
+uint32_t j3dStateDeltaPendingDirtyDomains();
+void j3dStateDeltaInvalidateAllDomains();
+void j3dStateDeltaConsumeDirtyDomains();
+void j3dStateDeltaBeginReplay();
+void j3dStateDeltaEndReplay();
+void j3dStateDeltaNoteCP(uint8_t reg, uint32_t value);
+void j3dStateDeltaNoteBP(uint32_t value);
+void j3dStateDeltaNoteXF(uint16_t addr, uint32_t count, const uint32_t* words);
+void j3dStateDeltaNoteDraw();
+void j3dStateDeltaNoteStateChange();
+bool j3dStateDeltaEnabled();
+extern "C" void sms_wiiu_j3d_state_delta_take(uint32_t* values, uint32_t valueCount);
+
 // Command-stream parsing.  Big-endian bytes.
 void runCommands(const uint8_t* data, uint32_t size);
 void callDisplayList(const uint8_t* data, uint32_t size);  // GXCallDisplayList: runCommands, cached
@@ -200,8 +220,25 @@ enum ProducerHostKind : uint8_t {
     kHostTcManual, kHostCopyDest, kHostTexImage, kHostCallDlPtr, kHostCallDlSize,
     kHostTlutPtr, kHostTlutOffset, kHostTlutLoad, kHostCopyOwner, kHostCopyDstWidth,
     kHostCopyDstHeight, kHostDrawownPush, kHostDrawownPop, kHostTexInvalidate,
+#if defined(PORT_GAME_SMG)
+    kHostTexStreamPtr, kHostTexStreamBytes, kHostTexStreamLinearBytes, kHostTexStreamPitch,
+    kHostGpuCat,  // marker gpucat: slot = kind, value = draw category id
+    kHostJpaFinalVx,
+#endif
 };
 void producerHostState(uint8_t kind, uint8_t slot, uint32_t value);
+bool producerHostStateTry(uint8_t kind, uint8_t slot, uint32_t value);
+extern "C" bool sms_wiiu_jpa_finalvx_begin_check(const ::SmsWiiuJpaFinalVxDesc* desc);
+extern "C" bool sms_wiiu_jpa_finalvx_submit(const ::SmsWiiuJpaFinalVxDesc* desc);
+void jpaFinalVxBeginCheck(const ::SmsWiiuJpaFinalVxDesc* desc);
+void jpaFinalVxSubmit(const ::SmsWiiuJpaFinalVxDesc* desc);
+#endif
+
+#if defined(PORT_GAME_SMG)
+void rendererGpuCatMark(uint8_t kind, uint32_t id);  // gpucat stamp (worker or core 1)
+void textureStreamWritten(const void* p, uint32_t bytes);
+void textureStreamWrittenLinear(const void* p, uint32_t bytes, uint32_t pitch);
+void textureStreamStats(uint32_t* refreshes, uint32_t* hashesSkipped);
 #endif
 
 // ---------------------------------------------------------------- vertices
@@ -287,9 +324,15 @@ bool arenaUpload(const uint8_t* verts, uint32_t count, uint32_t stride, const ui
 void appendArena(PrimClass cls, uint32_t fmt, uint32_t stride, const ArenaRef& ref, uint32_t count, uint32_t nidx,
                  const uint8_t* verts);
 bool batchUsesArena();
-void onStateChange(bool rendererStateRelevant = true);  // before a state write
+#ifdef __WIIU__
+void onStateChange(bool rendererStateRelevant = true, uint8_t writerDomain = 0);  // before a state write
+#else
+void onStateChange();
+#endif
 #ifdef __WIIU__
 void rendererStateWritten();
+void rendererStateWriterDomain(uint8_t writerDomain);
+void jpaMergeNoteBpReg(uint32_t reg);  // diagnostic: BP regs changed between JPA final-vx runs (workerprof)
 bool rendererFastStateUsesTevRegs();
 #endif
 void executeCopy(uint32_t execReg);

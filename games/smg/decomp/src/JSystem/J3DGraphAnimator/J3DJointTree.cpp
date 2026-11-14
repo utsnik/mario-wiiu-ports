@@ -3,6 +3,13 @@
 #include "JSystem/J3DGraphAnimator/J3DMaterialAttach.hpp"
 #include "JSystem/J3DGraphAnimator/J3DShapeTable.hpp"
 #include "JSystem/J3DGraphBase/J3DMaterial.hpp"
+#if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
+#include "Game/System/J3DMT.hpp"
+struct SmgJ3DMTCalcScope {
+    SmgJ3DMTCalcScope() { smg_j3dmt_calc_enter(); }
+    ~SmgJ3DMTCalcScope() { smg_j3dmt_calc_exit(); }
+};
+#endif
 
 enum {
     kTypeEnd = 0x00,
@@ -95,6 +102,9 @@ void J3DJointTree::findImportantMtxIndex() {
 }
 
 void J3DJointTree::calc(J3DMtxBuffer* pMtxBuffer, Vec const& scale, f32 const (&mtx)[3][4]) {
+#if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
+    SmgJ3DMTCalcScope smgJ3DMTCalcScope;
+#endif
     getBasicMtxCalc()->init(scale, mtx);
     getBasicMtxCalc()->setMtxBuffer(pMtxBuffer);
 

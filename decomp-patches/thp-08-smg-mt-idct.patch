@@ -1,0 +1,227 @@
+--- a/libs/dolphin/src/thp/THPDec.c
++++ b/libs/dolphin/src/thp/THPDec.c
+@@ -552,6 +552,10 @@
+ 	}
+ }
+ 
++#if defined(TARGET_PC) && defined(PORT_GAME_SMG)
++static int port_thp_decompress_mt(void* tileY, void* tileU, void* tileV, u16 currentY, u16 targetY);
++#endif
++
+ void __THPDecompressYUV(void* tileY, void* tileU, void* tileV)
+ {
+ 	u16 currentY, targetY;
+@@ -565,6 +569,13 @@
+ 	__THPGQRSetup();
+ 	__THPPrepBitStream();
+ 
++#if defined(TARGET_PC) && defined(PORT_GAME_SMG)
++	if (port_thp_decompress_mt(tileY, tileU, tileV, currentY, targetY)) {
++		__THPGQRRestore();
++		return;
++	}
++#endif
++
+ 	if (__THPInfo->xPixelSize == 512 && targetY == 448) {
+ 		while (currentY < targetY) {
+ 			__THPDecompressiMCURow512x448();
+@@ -897,11 +908,22 @@
+ // dequantise with Gq (already scaled by the AAN factors), transform, then
+ // out = x / 8 + 128 saturated to u8, stored into GX I8 tiles (8x4 pixels,
+ // 32 bytes) of a strip Gwid pixels wide; yTile selects the tile row.
++#if defined(PORT_GAME_SMG)
++static void port_thp_idct_p(const THPCoeff* in, u32 xPos, u32 yTile, THPSample* Gbase, u32 Gwid, const f32* q);
++static void port_thp_idct(THPCoeff* in, u32 xPos, u32 yTile) { port_thp_idct_p(in, xPos, yTile, Gbase, Gwid, Gq); }
++// Same transform, with the strip base, width and quantiser as parameters so
++// the movie helper threads (thp-08) can run it on their own rows.
++static void port_thp_idct_p(const THPCoeff* in, u32 xPos, u32 yTile, THPSample* Gbase, u32 Gwid, const f32* q)
++{
++	f32 ws[64];
++	int i;
++#else
+ static void port_thp_idct(THPCoeff* in, u32 xPos, u32 yTile)
+ {
+ 	f32 ws[64];
+ 	f32* q = Gq;
+ 	int i;
++#endif
+ 
+ 	for (i = 0; i < 8; i++) { // columns
+ 		f32 t0, t1, t2, t3, t4, t5, t6, t7, t10, t11, t12, t13, z5, z10, z11, z12, z13;
+@@ -2649,3 +2671,176 @@
+ 	__THPInitFlag = TRUE;
+ 	return TRUE;
+ }
++
++#if defined(TARGET_PC) && defined(PORT_GAME_SMG)
++// thp-08: Galaxy decodes a whole frame's coefficients on the game thread
++// (Huffman and DC prediction are sequential: the movies have no restart
++// markers), then the IDCT of its 16-line strips is shared with two helper
++// threads (games/smg/platform/wiiu/thp_mt.cpp) that write the destination
++// tiles directly. Output is identical to the strip-by-strip path above.
++#if defined(TARGET_WIIU)
++void smg_thp_mt_kick(void (*fn)(void*), void* ctx);
++s32 smg_thp_mt_add(volatile s32* p, s32 v);
++void smg_thp_mt_flush(void* p, u32 n);
++void smg_thp_mt_yield(void);
++#else
++static void smg_thp_mt_yield(void) {}
++static void smg_thp_mt_kick(void (*fn)(void*), void* ctx) { (void)fn; (void)ctx; }
++static s32 smg_thp_mt_add(volatile s32* p, s32 v) { s32 o = *p; *p = o + v; return o; }
++static void smg_thp_mt_flush(void* p, u32 n) { (void)p; (void)n; }
++#endif
++
++#if defined(TARGET_WIIU)
++#define PORT_THP_SYNC() __asm__ volatile("sync" ::: "memory")
++#else
++#define PORT_THP_SYNC() __sync_synchronize()
++#endif
++#define PORT_THP_MAX_BLOCKS (40 * 6 * 30) // 640x480
++static THPCoeff port_thp_coef[PORT_THP_MAX_BLOCKS][64] __attribute__((aligned(32)));
++
++typedef struct {
++	volatile s32 next; // next strip to claim; kept >= rows between frames
++	volatile s32 done; // strips finished this frame
++	volatile s32 busy; // helpers inside port_thp_mt_rows
++	volatile s32 ready; // strips whose coefficients are decoded
++	s32 rows;
++	u32 mcus;
++	u32 x;
++	u8* y;
++	u8* u;
++	u8* v;
++	const f32* q[3];
++} PortThpJob;
++static PortThpJob port_thp_job = { 0x7FFF0000, 0, 0, 0 };
++// Strips the game thread decoded itself vs all strips (the [thp] log line).
++u32 port_thp_rows_main, port_thp_rows_total;
++void port_thp_mt_stats(u32* mainRows, u32* totalRows)
++{
++	*mainRows = port_thp_rows_main;
++	*totalRows = port_thp_rows_total;
++	port_thp_rows_main = port_thp_rows_total = 0;
++}
++
++static u32 port_thp_mt_rows(PortThpJob* j)
++{
++	u32 done = 0;
++	for (;;) {
++		const s32 r = smg_thp_mt_add(&j->next, 1);
++		u32 m;
++		THPCoeff (*b)[64];
++		u8 *y, *u, *v;
++		if (r >= j->rows)
++			break;
++		// Helpers start while the game thread is still entropy-decoding.
++		while (j->ready <= r)
++			smg_thp_mt_yield();
++		PORT_THP_SYNC();
++		++done;
++		b = &port_thp_coef[(u32)r * j->mcus * 6];
++		y = j->y + (u32)r * j->x * 16;
++		u = j->u + (u32)r * j->x * 4;
++		v = j->v + (u32)r * j->x * 4;
++		for (m = 0; m < j->mcus; m++, b += 6) {
++			const u32 xp = m * 16;
++			port_thp_idct_p(b[0], xp, 0, y, j->x, j->q[0]);
++			port_thp_idct_p(b[1], xp + 8, 0, y, j->x, j->q[0]);
++			port_thp_idct_p(b[2], xp, 2, y, j->x, j->q[0]);
++			port_thp_idct_p(b[3], xp + 8, 2, y, j->x, j->q[0]);
++			port_thp_idct_p(b[4], xp / 2, 0, u, j->x / 2, j->q[1]);
++			port_thp_idct_p(b[5], xp / 2, 0, v, j->x / 2, j->q[2]);
++		}
++		smg_thp_mt_flush(y, j->x * 16);
++		smg_thp_mt_flush(u, j->x * 4);
++		smg_thp_mt_flush(v, j->x * 4);
++		__asm__ volatile("" ::: "memory");
++		smg_thp_mt_add(&j->done, 1);
++	}
++	return done;
++}
++
++static void port_thp_mt_helper(void* ctx)
++{
++	PortThpJob* j = (PortThpJob*)ctx;
++	smg_thp_mt_add(&j->busy, 1);
++	port_thp_mt_rows(j);
++	smg_thp_mt_add(&j->busy, -1);
++}
++
++static int port_thp_decompress_mt(void* tileY, void* tileU, void* tileV, u16 currentY, u16 targetY)
++{
++	THPFileInfo* info = __THPInfo;
++	PortThpJob* j     = &port_thp_job;
++	const u32 x       = info->xPixelSize;
++	const u32 mcus    = info->MCUsPerRow;
++	s32 rows, r;
++	u32 m;
++	THPCoeff (*b)[64];
++
++	if (currentY >= targetY || (x & 15) || mcus * 16 != x)
++		return 0;
++	rows = (targetY - currentY + 15) / 16;
++	if ((u32)rows * mcus * 6 > PORT_THP_MAX_BLOCKS)
++		return 0;
++
++	// Publish the frame: park "next" first and wait out any helper still in
++	// the previous frame's loop, so none claims a strip with stale fields.
++	j->next = 0x7FFF0000;
++	PORT_THP_SYNC();
++	while (j->busy)
++		smg_thp_mt_yield();
++	j->rows = rows;
++	j->mcus = mcus;
++	j->x    = x;
++	j->y    = (u8*)tileY;
++	j->u    = (u8*)tileU;
++	j->v    = (u8*)tileV;
++	j->q[0] = info->quantTabs[info->components[0].quantizationTableSelector];
++	j->q[1] = info->quantTabs[info->components[1].quantizationTableSelector];
++	j->q[2] = info->quantTabs[info->components[2].quantizationTableSelector];
++	j->done  = 0;
++	j->ready = 0;
++	PORT_THP_SYNC();
++	j->next = 0;
++	PORT_THP_SYNC();
++	smg_thp_mt_kick(port_thp_mt_helper, j);
++
++	// Entropy decode, in stream order, with the row decoders' restart handling.
++	b = port_thp_coef;
++	for (r = 0; r < rows; r++) {
++		for (m = 0; m < mcus; m++, b += 6) {
++			__THPHuffDecodeDCTCompY(info, b[0]);
++			__THPHuffDecodeDCTCompY(info, b[1]);
++			__THPHuffDecodeDCTCompY(info, b[2]);
++			__THPHuffDecodeDCTCompY(info, b[3]);
++			__THPHuffDecodeDCTCompU(info, b[4]);
++			__THPHuffDecodeDCTCompV(info, b[5]);
++			if (info->RST != 0) {
++				info->currMCU--;
++				if (info->currMCU == 0) {
++					info->currMCU = info->nMCU;
++					info->cnt     = 1 + ((info->cnt + 6) & 0xFFFFFFF8);
++					if (info->cnt > 32)
++						info->cnt = 33;
++					info->components[0].predDC = 0;
++					info->components[1].predDC = 0;
++					info->components[2].predDC = 0;
++				}
++			}
++		}
++		PORT_THP_SYNC();
++		j->ready = r + 1;
++	}
++
++	port_thp_rows_main += port_thp_mt_rows(j);
++	port_thp_rows_total += (u32)rows;
++	while (j->done < rows)
++		smg_thp_mt_yield(); // the decoder thread shares core 2 with a helper
++	PORT_THP_SYNC();
++
++	// The state the strip decoders leave behind.
++	info->dLC[0] = (u8*)tileY + (u32)rows * x * 16;
++	info->dLC[1] = (u8*)tileU + (u32)rows * x * 4;
++	info->dLC[2] = (u8*)tileV + (u32)rows * x * 4;
++	return 1;
++}
++#endif

@@ -3,6 +3,13 @@
 #include "JSystem/J3DGraphAnimator/J3DMaterialAnm.hpp"
 #include "JSystem/J3DGraphBase/J3DMaterial.hpp"
 #include "JSystem/J3DGraphBase/J3DShapeMtx.hpp"
+#if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
+#include "Game/System/J3DMT.hpp"
+struct SmgJ3DMTModelCalcScope {
+    SmgJ3DMTModelCalcScope() { smg_j3dmt_calc_enter(); }
+    ~SmgJ3DMTModelCalcScope() { smg_j3dmt_calc_exit(); }
+};
+#endif
 
 void J3DModel::initialize() {
     mModelData = NULL;
@@ -240,6 +247,9 @@ void J3DModel::calcDiffTexMtx() {
 }
 
 void J3DModel::calcAnmMtx() {
+#if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
+    SmgJ3DMTModelCalcScope smgJ3DMTModelCalcScope;
+#endif
     j3dSys.setModel(this);
 
     if (checkFlag(J3DMdlFlag_UseDefaultJ3D)) {
@@ -248,6 +258,58 @@ void J3DModel::calcAnmMtx() {
         getModelData()->getJointTree().calc(mMtxBuffer, mBaseScale, mBaseTransformMtx);
     }
 }
+
+#if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
+void J3DModel::calcBeforeAnmMtx() {
+    j3dSys.setModel(this);
+
+    if (checkFlag(J3DMdlFlag_SkinPosCpu)) {
+        j3dSys.onFlag(J3DSysFlag_SkinPosCpu);
+    } else {
+        j3dSys.offFlag(J3DSysFlag_SkinPosCpu);
+    }
+
+    if (checkFlag(J3DMdlFlag_SkinNrmCpu)) {
+        j3dSys.onFlag(J3DSysFlag_SkinNrmCpu);
+    } else {
+        j3dSys.offFlag(J3DSysFlag_SkinNrmCpu);
+    }
+
+    mModelData->syncJ3DSysFlags();
+    mVertexBuffer.setCurrentVtxPos(mVertexBuffer.mVtxPosArray[0]);
+    mVertexBuffer.setCurrentVtxNrm(mVertexBuffer.mVtxNrmArray[0]);
+    mVertexBuffer.setCurrentVtxCol(mVertexBuffer.mVtxColArray[0]);
+
+    if (mUnkCalc2 != NULL) {
+        mUnkCalc2->calc(mModelData);
+    }
+
+    if (mDeformData != NULL) {
+        mDeformData->deform(this);
+    }
+
+    if (mVtxColorCalc != NULL) {
+        mVtxColorCalc->calc(this);
+    }
+
+    if (mUnkCalc1 != NULL) {
+        mUnkCalc1->calc(this);
+    }
+}
+
+void J3DModel::calcAnmMtxPure() {
+    if (checkFlag(J3DMdlFlag_UseDefaultJ3D)) {
+        getModelData()->getJointTree().calc(mMtxBuffer, j3dDefaultScale, j3dDefaultMtx);
+    } else {
+        getModelData()->getJointTree().calc(mMtxBuffer, mBaseScale, mBaseTransformMtx);
+    }
+
+    if (getModelData()->getWEvlpMtxNum() != 0 && !checkFlag(J3DMdlFlag_EnableLOD) &&
+        !getModelData()->checkFlag(0x100)) {
+        mMtxBuffer->calcWeightEnvelopeMtx();
+    }
+}
+#endif
 
 void J3DModel::calcWeightEnvelopeMtx() {
     if (getModelData()->getWEvlpMtxNum() != 0 && !checkFlag(J3DMdlFlag_EnableLOD)) {

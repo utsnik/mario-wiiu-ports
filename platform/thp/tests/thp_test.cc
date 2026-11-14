@@ -21,6 +21,7 @@ typedef int32_t s32;
 
 extern "C" {
 s32 THPVideoDecode(void* file, void* tileY, void* tileU, void* tileV, void* work);
+s32 THPVideoDecodeLinear(void* file, void* y, void* u, void* v, void* work, u32 yPitch, u32 uvPitch);
 u32 THPAudioDecode(s16* audioBuffer, u8* audioFrame, s32 flag);
 int THPInit(void);
 void DCZeroRange(void* p, u32 n) { memset(p, 0, n); }
@@ -106,6 +107,11 @@ static u8 i8_at(const u8* tex, int w, int x, int y)
 	return tex[(y / 4) * (w * 4) + (x / 8) * 32 + (y % 4) * 8 + (x % 8)];
 }
 
+static u8 linear_at(const u8* tex, u32 pitch, int x, int y)
+{
+	return tex[(size_t)y * pitch + x];
+}
+
 static u8 clamp8(float v) { return v < 0 ? 0 : v > 255 ? 255 : (u8)lrintf(v); }
 
 int main(int argc, char** argv)
@@ -168,7 +174,9 @@ int main(int argc, char** argv)
 		fprintf(stderr, "THPInit failed\n");
 		return 1;
 	}
+	const u32 yPitch = (w + 63) & ~63u, uvPitch = (w / 2 + 63) & ~63u;
 	std::vector<u8> ty(w * h), tu(w * h / 4), tv(w * h / 4), work(0x10000);
+	std::vector<u8> ly((size_t)yPitch * h), lu((size_t)uvPitch * h / 2), lv((size_t)uvPitch * h / 2), linearWork(0x10000);
 	std::vector<u8> rgb(w * h * 3);
 	std::vector<s16> pcm, abuf(0x10000);
 	u32 dumps[] = { 1, frames / 4, frames / 2, frames * 3 / 4, frames - 1 };
@@ -187,6 +195,30 @@ int main(int argc, char** argv)
 						fprintf(stderr, "frame %u: THPVideoDecode error %d\n", i, err);
 					continue;
 				}
+				s32 linearErr = THPVideoDecodeLinear(p, ly.data(), lu.data(), lv.data(), linearWork.data(), yPitch, uvPitch);
+				if (linearErr) {
+					if (fails++ < 5)
+						fprintf(stderr, "frame %u: THPVideoDecodeLinear error %d\n", i, linearErr);
+					continue;
+				}
+				for (u32 py = 0; py < h; py++)
+					for (u32 px = 0; px < w; px++)
+						if (linear_at(ly.data(), yPitch, px, py) != i8_at(ty.data(), w, px, py)) {
+							if (fails++ < 5)
+								fprintf(stderr, "frame %u: Y mismatch at %u,%u\n", i, px, py);
+							py = h;
+							break;
+						}
+				for (u32 py = 0; py < h / 2; py++)
+					for (u32 px = 0; px < w / 2; px++) {
+						if (linear_at(lu.data(), uvPitch, px, py) != i8_at(tu.data(), w / 2, px, py) ||
+						    linear_at(lv.data(), uvPitch, px, py) != i8_at(tv.data(), w / 2, px, py)) {
+							if (fails++ < 5)
+								fprintf(stderr, "frame %u: UV mismatch at %u,%u\n", i, px, py);
+							py = h / 2;
+							break;
+						}
+					}
 				decoded++;
 				for (u32 y = 0; y < h; y++)
 					for (u32 x = 0; x < w; x++) {

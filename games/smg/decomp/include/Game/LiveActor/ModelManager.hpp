@@ -24,6 +24,9 @@ public:
 
     void update();
     void calcAnim();
+#if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
+    void calcBeforeAnmMtx();
+#endif
     void calcView();
     void entry();
     void newDifferedDLBuffer();

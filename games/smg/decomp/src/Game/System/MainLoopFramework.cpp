@@ -11,8 +11,14 @@
 #include <revolution/gx/GXRegs.h>
 #include <runtime.h>
 
+#if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
+#include "wiiu/gphase.h"
+#include "wiiu/pipe5.h"
+#endif
+
 #if defined(PORT_GAME_SMG)
 extern "C" void sms_wiiu_d1_note_copy_xfb_triple(void);
+extern "C" int sms_wiiu_pipe5_end_frame(int rendered, int bufferMode);
 #endif
 
 MainLoopFramework* MainLoopFramework::sManager;
@@ -226,12 +232,24 @@ void MainLoopFramework::endGX() {
                         1.0f);
     if (JUTConsoleManager::sManager) {
         ortho.setPort();
+#if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
+        uint64_t gphase_start = smg_gphase_begin_timer(SmgGPhaseTimer_EndRenderConsoleDraw);
+#endif
         JUTConsoleManager::sManager->draw();
+#if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
+        smg_gphase_end_timer(SmgGPhaseTimer_EndRenderConsoleDraw, gphase_start);
+#endif
     }
     if (_C || JUTXfb::sManager->mBufferNum == 1) {
         JUTAssertion::flushMessage_dbPrint();
     }
+#if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
+    uint64_t gphase_start = smg_gphase_begin_timer(SmgGPhaseTimer_EndRenderGXFlush);
+#endif
     GXFlush();
+#if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
+    smg_gphase_end_timer(SmgGPhaseTimer_EndRenderGXFlush, gphase_start);
+#endif
 }
 
 void MainLoopFramework::waitForRetrace() {
@@ -282,31 +300,75 @@ void MainLoopFramework::endRender() {
         JUTXfb* xfb = JUTXfb::sManager;
         switch (xfb->mBufferNum) {
         case 1:
+#if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
+            {
+                uint64_t gphase_start = smg_gphase_begin_timer(SmgGPhaseTimer_EndRenderDrawendXfb);
+#endif
             drawendXfb_single();
+#if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
+                smg_gphase_end_timer(SmgGPhaseTimer_EndRenderDrawendXfb, gphase_start);
+            }
+#endif
             break;
         case 2:
             break;
         case 3:
+#if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
+            {
+                uint64_t gphase_start = smg_gphase_begin_timer(SmgGPhaseTimer_EndRenderCopyXfb);
+#endif
             copyXfb_triple();
+#if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
+                smg_gphase_end_timer(SmgGPhaseTimer_EndRenderCopyXfb, gphase_start);
+            }
+#endif
             break;
         }
     }
+#if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
+    uint64_t gphase_start = smg_gphase_begin_timer(SmgGPhaseTimer_EndRenderCalcCombinationRatio);
+#endif
     calcCombinationRatio();
+#if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
+    smg_gphase_end_timer(SmgGPhaseTimer_EndRenderCalcCombinationRatio, gphase_start);
+#endif
 }
 
 void MainLoopFramework::endFrame() {
+    JUTXfb* xfb = mDoRenderFrame ? JUTXfb::sManager : nullptr;
+#if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
+    const int bufferMode = xfb ? xfb->mBufferNum : 0;
+    // Pipe5 may own only a rendered double/triple-buffered frame.  A
+    // single-buffer frame still needs drawendXfb_single()'s GXDrawDone
+    // contract, and marker-off execution must remain on the legacy path.
+    const int pipe5Result = sms_wiiu_pipe5_end_frame(mDoRenderFrame != 0, bufferMode);
+    if (pipe5Result == SmsWiiuPipe5OverlapOwned) {
+        smg_gphase_note_pipe5_owned();
+        smg_gphase_note_pipe5_skipped_wait();
+    } else if (pipe5Result == SmsWiiuPipe5Fallback) {
+        smg_gphase_note_pipe5_fallback();
+    }
+#endif
     if (mDoRenderFrame) {
-        JUTXfb* xfb = JUTXfb::sManager;
+#if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
+        const bool pipe5OwnsEndFrame = pipe5Result == SmsWiiuPipe5OverlapOwned;
+#else
+        const bool pipe5OwnsEndFrame = false;
+#endif
         switch (xfb->mBufferNum) {
         case 1:
             break;
         case 2:
-            ::waitDrawDoneAndSetAlarm();
-            GXFlush();
+            if (!pipe5OwnsEndFrame) {
+                ::waitDrawDoneAndSetAlarm();
+                GXFlush();
+            }
             break;
         case 3:
-            ::waitDrawDoneAndSetAlarm();
-            GXFlush();
+            if (!pipe5OwnsEndFrame) {
+                ::waitDrawDoneAndSetAlarm();
+                GXFlush();
+            }
             break;
         }
     }

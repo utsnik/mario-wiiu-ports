@@ -204,6 +204,77 @@ static inline uint8_t reverseBc1Row(uint8_t v) {
                    ((v << 2) & 0x30) | ((v << 6) & 0xc0));
 }
 
+#if defined(PORT_GAME_SMG)
+template <unsigned Format> struct NativeTile;
+
+template <> struct NativeTile<0> {
+    static const uint32_t w = 8, h = 8, bytes = 32, outBytes = 1;
+    static inline void row(const uint8_t* src, uint8_t* dst, uint32_t count) {
+        for (uint32_t x = 0; x < count; ++x) {
+            const uint8_t b = src[x >> 1];
+            dst[x] = uint8_t(((b >> ((x & 1) ? 0 : 4)) & 15) * 17);
+        }
+    }
+};
+
+template <> struct NativeTile<1> {
+    static const uint32_t w = 8, h = 4, bytes = 32, outBytes = 1;
+    static inline void row(const uint8_t* src, uint8_t* dst, uint32_t count) {
+        memcpy(dst, src, count);
+    }
+};
+
+template <> struct NativeTile<2> {
+    static const uint32_t w = 8, h = 4, bytes = 32, outBytes = 2;
+    static inline void row(const uint8_t* src, uint8_t* dst, uint32_t count) {
+        for (uint32_t x = 0; x < count; ++x) {
+            dst[2 * x] = uint8_t((src[x] & 15) * 17);
+            dst[2 * x + 1] = uint8_t((src[x] >> 4) * 17);
+        }
+    }
+};
+
+template <> struct NativeTile<3> {
+    static const uint32_t w = 4, h = 4, bytes = 32, outBytes = 2;
+    static inline void row(const uint8_t* src, uint8_t* dst, uint32_t count) {
+        for (uint32_t x = 0; x < count; ++x) {
+            dst[2 * x] = src[2 * x + 1];
+            dst[2 * x + 1] = src[2 * x];
+        }
+    }
+};
+
+template <> struct NativeTile<4> : NativeTile<3> {};
+
+template <unsigned Format>
+static void convertNativeTiled(const uint8_t* src, uint32_t w, uint32_t h, uint8_t* out) {
+    typedef NativeTile<Format> Tile;
+    const uint32_t cols = (w + Tile::w - 1) / Tile::w;
+    const uint32_t rows = (h + Tile::h - 1) / Tile::h;
+    const uint8_t* p = src;
+    for (uint32_t ty = 0; ty < rows; ++ty) {
+        for (uint32_t tx = 0; tx < cols; ++tx) {
+            const uint32_t x0 = tx * Tile::w, y0 = ty * Tile::h;
+            const bool interior = x0 + Tile::w <= w && y0 + Tile::h <= h;
+            if (interior) {
+                for (uint32_t row = 0; row < Tile::h; ++row) {
+                    uint8_t* d = out + (size_t(y0 + row) * w + x0) * Tile::outBytes;
+                    Tile::row(p + row * (Tile::bytes / Tile::h), d, Tile::w);
+                }
+            } else {
+                for (uint32_t row = 0; row < Tile::h && y0 + row < h; ++row) {
+                    const uint32_t count = (x0 < w) ? ((w - x0 < Tile::w) ? w - x0 : Tile::w) : 0;
+                    if (!count) continue;
+                    uint8_t* d = out + (size_t(y0 + row) * w + x0) * Tile::outBytes;
+                    Tile::row(p + row * (Tile::bytes / Tile::h), d, count);
+                }
+            }
+            p += Tile::bytes;
+        }
+    }
+}
+#endif
+
 void gx2ConvertTextureNative(const uint8_t* src, uint32_t fmt, uint32_t w, uint32_t h,
                              uint8_t* out) {
     fmt &= 15;
@@ -228,6 +299,17 @@ void gx2ConvertTextureNative(const uint8_t* src, uint32_t fmt, uint32_t w, uint3
         }
         return;
     }
+
+#if defined(PORT_GAME_SMG)
+    switch (fmt) {
+    case 0: convertNativeTiled<0>(src, w, h, out); return;
+    case 1: convertNativeTiled<1>(src, w, h, out); return;
+    case 2: convertNativeTiled<2>(src, w, h, out); return;
+    case 3: convertNativeTiled<3>(src, w, h, out); return;
+    case 4: convertNativeTiled<4>(src, w, h, out); return;
+    default: break;
+    }
+#endif
 
     const uint32_t tw = kTileW[fmt], th = kTileH[fmt], tileBytes = kTileBytes[fmt];
     const uint32_t cols = (w + tw - 1) / tw, rows = (h + th - 1) / th;

@@ -5,6 +5,9 @@
 #include <JSystem/JAudio2/JASAiCtrl.hpp>
 #include <JSystem/JKernel/JKRHeap.hpp>
 #include <cstring>
+#if defined(TARGET_WIIU)
+#include <gx2/surface.h>
+#endif
 
 static u16 VolumeTable[] = {0,     2,     8,     18,    32,    50,    73,    99,    130,   164,   203,   245,   292,   343,   398,   457,
                             520,   587,   658,   733,   812,   895,   983,   1074,  1170,  1269,  1373,  1481,  1592,  1708,  1828,  1952,
@@ -16,8 +19,182 @@ static u16 VolumeTable[] = {0,     2,     8,     18,    32,    50,    73,    99,
                             25484, 25941, 26402, 26868, 27337, 27810, 28288, 28769, 29255, 29744, 30238, 30736, 31238, 31744, 32254, 32768};
 
 extern "C" void GXPC_InvalidateTexturesAfterCpuWrite(void);
+#if defined(TARGET_WIIU)
+extern "C" void GXPC_TextureStreamWritten(const void*, u32);
+extern "C" void GXPC_TextureStreamWrittenLinear(const void*, u32, u32);
+extern "C" void GXPC_TextureStreamStats(u32*, u32*);
+extern "C" int sms_wiiu_sd_marker(const char*);
+extern "C" s32 THPVideoDecodeLinear(void*, void*, void*, void*, void*, u32, u32);
+#endif
+extern "C" void port_thp_mt_stats(u32* mainRows, u32* totalRows);
+#if defined(TARGET_WIIU)
+// Port: the decode of one movie frame runs on the core-2 decoder thread
+// (games/smg/platform/wiiu/thp_mt.cpp) while the game thread finishes the
+// frame; smgThpFinish() waits for it before the frame is drawn, before the
+// next decode, and before the read buffers are reset.
+extern "C" int smg_thp_async_start(void (*fn)(void*), void* ctx);
+extern "C" void smg_thp_async_wait(void);
+namespace {
+bool smgThpLinearEnabled();
+struct SmgThpAsync {
+    u8* file;
+    const u8* srcFile;   // the frame's video data in the read buffer (identity check)
+    volatile bool accepted;  // decode() asked for this frame (publish its frame number)
+    bool completed;      // finished but not yet accepted (a prediction)
+    THPTextureSet* set;
+    void* work;
+    s32 frameNumber;
+    u32 ysize, uvsize;
+    u32 ypitch, uvpitch;
+    bool linear;
+    volatile bool pending;
+    volatile bool failed;
+};
+SmgThpAsync sSmgThp;
+// Private copy of the compressed frame: decode() hands the read buffer back
+// to the DVD reader as soon as videoDecode returns.
+u8 sSmgThpFrame[256 * 1024] __attribute__((aligned(32)));
+OSTime sSmgThpWaitTicks, sSmgThpWaitMax;
+u32 sSmgThpFrames;
+u32 sSmgThpPredicted, sSmgThpAccepted, sSmgThpLateAccepted;
+
+void smgThpDecode(void* ctx) {
+    SmgThpAsync* a = static_cast<SmgThpAsync*>(ctx);
+    a->failed = (a->linear
+                     ? THPVideoDecodeLinear(a->file, a->set->ytexture, a->set->utexture, a->set->vtexture,
+                                            a->work, a->ypitch, a->uvpitch)
+                     : THPVideoDecode(a->file, a->set->ytexture, a->set->utexture, a->set->vtexture, a->work)) != 0;
+}
+
+void smgThpFinish() {
+    if (!sSmgThp.pending)
+        return;
+    const OSTime start = OSGetTime();
+    smg_thp_async_wait();
+    const OSTime t = OSGetTime() - start;
+    sSmgThp.pending = false;
+    // The two texture sets alternate: a decode only writes the set selected
+    // for the next frame, while smgThpFinish waits before that set can be
+    // drawn or reused. This keeps a linear image out of the GPU's sampling
+    // window without a fence in the decoder.
+    // The planes changed even for an unaccepted prediction.
+    DCFlushRange(sSmgThp.set->ytexture, sSmgThp.ysize);
+    DCFlushRange(sSmgThp.set->utexture, sSmgThp.uvsize);
+    DCFlushRange(sSmgThp.set->vtexture, sSmgThp.uvsize);
+#if defined(TARGET_WIIU)
+    if (sSmgThp.linear) {
+        GXPC_TextureStreamWrittenLinear(sSmgThp.set->ytexture, sSmgThp.ysize, sSmgThp.ypitch);
+        GXPC_TextureStreamWrittenLinear(sSmgThp.set->utexture, sSmgThp.uvsize, sSmgThp.uvpitch);
+        GXPC_TextureStreamWrittenLinear(sSmgThp.set->vtexture, sSmgThp.uvsize, sSmgThp.uvpitch);
+    } else {
+        GXPC_TextureStreamWritten(sSmgThp.set->ytexture, sSmgThp.ysize);
+        GXPC_TextureStreamWritten(sSmgThp.set->utexture, sSmgThp.uvsize);
+        GXPC_TextureStreamWritten(sSmgThp.set->vtexture, sSmgThp.uvsize);
+    }
+#endif
+    if (!sSmgThp.linear)
+        GXPC_InvalidateTexturesAfterCpuWrite();
+    if (!sSmgThp.failed && sSmgThp.accepted)
+        sSmgThp.set->frameNumber = sSmgThp.frameNumber;
+    sSmgThp.completed = !sSmgThp.failed && !sSmgThp.accepted;
+    sSmgThpWaitTicks += t;
+    if (t > sSmgThpWaitMax) sSmgThpWaitMax = t;
+    if (++sSmgThpFrames == 120) {
+        u32 mainRows = 0, totalRows = 0;
+        port_thp_mt_stats(&mainRows, &totalRows);
+        u32 texRefreshes = 0, texHashesSkipped = 0;
+#if defined(TARGET_WIIU)
+        GXPC_TextureStreamStats(&texRefreshes, &texHashesSkipped);
+#endif
+        port_log("[thp] async: game thread waited avg %lld us max %lld us per frame (120 frames), strips by decoder %u of %u, "
+                 "predicted %u accepted %u (already done %u), texstream refreshes=%u hashesSkipped=%u\n",
+                 (long long)OSTicksToMicroseconds(sSmgThpWaitTicks / 120), (long long)OSTicksToMicroseconds(sSmgThpWaitMax),
+                 (unsigned)mainRows, (unsigned)totalRows, (unsigned)sSmgThpPredicted, (unsigned)sSmgThpAccepted,
+                 (unsigned)sSmgThpLateAccepted, (unsigned)texRefreshes, (unsigned)texHashesSkipped);
+        sSmgThpPredicted = sSmgThpAccepted = sSmgThpLateAccepted = 0;
+        sSmgThpWaitTicks = sSmgThpWaitMax = 0;
+        sSmgThpFrames = 0;
+    }
+}
+bool smgThpKick(u8* pFile, const u8* bufPtr, u32 bufSize, THPTextureSet* set, void* work, u32 xSize, u32 ySize,
+                s32 frameNumber, bool accepted) {
+    const u8* bufEnd = bufPtr + bufSize;
+    const u32 copyBytes = pFile < bufEnd ? u32(bufEnd - pFile) : 0;
+    if (!copyBytes || copyBytes > sizeof(sSmgThpFrame))
+        return false;
+    memcpy(sSmgThpFrame, pFile, copyBytes);
+    sSmgThp.file = sSmgThpFrame;
+    sSmgThp.srcFile = pFile;
+    sSmgThp.set = set;
+    sSmgThp.work = work;
+    sSmgThp.frameNumber = frameNumber;
+    GX2Surface ysurface = {}, uvsurface = {};
+    ysurface.use = GX2_SURFACE_USE_TEXTURE;
+    ysurface.dim = GX2_SURFACE_DIM_TEXTURE_2D;
+    ysurface.width = xSize;
+    ysurface.height = ySize;
+    ysurface.depth = 1;
+    ysurface.mipLevels = 1;
+    ysurface.format = GX2_SURFACE_FORMAT_UNORM_R8;
+    ysurface.aa = GX2_AA_MODE1X;
+    ysurface.tileMode = GX2_TILE_MODE_LINEAR_ALIGNED;
+    uvsurface = ysurface;
+    uvsurface.width = xSize / 2;
+    uvsurface.height = ySize / 2;
+    GX2CalcSurfaceSizeAndAlignment(&ysurface);
+    GX2CalcSurfaceSizeAndAlignment(&uvsurface);
+    sSmgThp.linear = smgThpLinearEnabled();
+    sSmgThp.ysize = sSmgThp.linear ? ysurface.imageSize : OSRoundUp32B(xSize * ySize);
+    sSmgThp.uvsize = sSmgThp.linear ? uvsurface.imageSize : OSRoundUp32B(xSize * ySize / 4);
+    sSmgThp.ypitch = ysurface.pitch;
+    sSmgThp.uvpitch = uvsurface.pitch;
+    sSmgThp.failed = false;
+    sSmgThp.accepted = accepted;
+    sSmgThp.completed = false;
+    if (!smg_thp_async_start(smgThpDecode, &sSmgThp))
+        return false;
+    sSmgThp.pending = true;
+    return true;
+}
+}  // namespace
+#endif
 
 static s32 WorkBuffer[16] __attribute__((aligned(32)));
+
+#if defined(TARGET_WIIU)
+namespace {
+GX2Surface smgThpSurface(u32 width, u32 height) {
+    GX2Surface surface = {};
+    surface.use = GX2_SURFACE_USE_TEXTURE;
+    surface.dim = GX2_SURFACE_DIM_TEXTURE_2D;
+    surface.width = width;
+    surface.height = height;
+    surface.depth = 1;
+    surface.mipLevels = 1;
+    surface.format = GX2_SURFACE_FORMAT_UNORM_R8;
+    surface.aa = GX2_AA_MODE1X;
+    surface.tileMode = GX2_TILE_MODE_LINEAR_ALIGNED;
+    GX2CalcSurfaceSizeAndAlignment(&surface);
+    return surface;
+}
+
+u32 smgThpSurfaceReserve(const GX2Surface& surface) {
+    return surface.imageSize + surface.alignment - 1;
+}
+
+u8* smgThpAlign(u8* buffer, u32 alignment) {
+    const uintptr_t value = reinterpret_cast<uintptr_t>(buffer);
+    return reinterpret_cast<u8*>((value + alignment - 1) & ~(uintptr_t)(alignment - 1));
+}
+
+bool smgThpLinearEnabled() {
+    static int enabled = -1;
+    if (enabled < 0)
+        enabled = sms_wiiu_sd_marker("nothplinear") ? 0 : 1;
+    return enabled != 0;
+}
+}
+#endif
 
 // One stereo frame of s16 samples.  The original clears with sizeof(s16*),
 // which is the same 4 bytes on the Wii but overruns the mix buffer on 64-bit.
@@ -134,6 +311,9 @@ bool THPSimplePlayerWrapper::open(const char* pName) {
 }
 
 bool THPSimplePlayerWrapper::close() {
+#if defined(TARGET_WIIU)
+    smgThpFinish();
+#endif
     if (mOpen) {
         if (mPreFetchState == 0) {
             if (mAudioExist) {
@@ -165,9 +345,15 @@ u32 THPSimplePlayerWrapper::calcNeedMemory() {
     }
 
     u32 size = OSRoundUp32B(mHeader.bufSize) * 20;
+#if defined(TARGET_WIIU)
+    const GX2Surface ysurface = smgThpSurface(mVideoInfo.xSize, mVideoInfo.ySize);
+    const GX2Surface uvsurface = smgThpSurface(mVideoInfo.xSize / 2, mVideoInfo.ySize / 2);
+    size += 2 * (smgThpSurfaceReserve(ysurface) + 2 * smgThpSurfaceReserve(uvsurface));
+#else
     size += OSRoundUp32B(mVideoInfo.xSize * mVideoInfo.ySize * 2);
     size += OSRoundUp32B(mVideoInfo.xSize * mVideoInfo.ySize >> 1 & 0x7FFFFFFE);
     size += OSRoundUp32B(mVideoInfo.xSize * mVideoInfo.ySize >> 1 & 0x7FFFFFFE);
+#endif
 
     if (mAudioExist) {
         size += (OSRoundUp32B(mHeader.audioMaxSamples * 4) * 20);
@@ -185,6 +371,39 @@ bool THPSimplePlayerWrapper::setBuffer(u8* pBuffer) {
 
         u32 ysize = OSRoundUp32B(mVideoInfo.xSize * mVideoInfo.ySize);
         u32 uvsize = OSRoundUp32B(mVideoInfo.xSize * mVideoInfo.ySize / 4);
+#if defined(TARGET_WIIU)
+        const GX2Surface ysurface = smgThpSurface(mVideoInfo.xSize, mVideoInfo.ySize);
+        const GX2Surface uvsurface = smgThpSurface(mVideoInfo.xSize / 2, mVideoInfo.ySize / 2);
+        if (smgThpLinearEnabled()) {
+        ysize = ysurface.imageSize;
+        uvsize = uvsurface.imageSize;
+        pBuffer = smgThpAlign(pBuffer, ysurface.alignment);
+        mTextureSet[0].ytexture = pBuffer;
+        pBuffer += ysize;
+        pBuffer = smgThpAlign(pBuffer, uvsurface.alignment);
+        mTextureSet[0].utexture = pBuffer;
+        pBuffer += uvsize;
+        pBuffer = smgThpAlign(pBuffer, uvsurface.alignment);
+        mTextureSet[0].vtexture = pBuffer;
+        pBuffer += uvsize;
+        pBuffer = smgThpAlign(pBuffer, ysurface.alignment);
+        mTextureSet[1].ytexture = pBuffer;
+        pBuffer += ysize;
+        pBuffer = smgThpAlign(pBuffer, uvsurface.alignment);
+        mTextureSet[1].utexture = pBuffer;
+        pBuffer += uvsize;
+        pBuffer = smgThpAlign(pBuffer, uvsurface.alignment);
+        mTextureSet[1].vtexture = pBuffer;
+        pBuffer += uvsize;
+        DCInvalidateRange(mTextureSet[0].ytexture, ysize);
+        DCInvalidateRange(mTextureSet[0].utexture, uvsize);
+        DCInvalidateRange(mTextureSet[0].vtexture, uvsize);
+        DCInvalidateRange(mTextureSet[1].ytexture, ysize);
+        DCInvalidateRange(mTextureSet[1].utexture, uvsize);
+        DCInvalidateRange(mTextureSet[1].vtexture, uvsize);
+        } else
+#endif
+        {
         mTextureSet[0].ytexture = pBuffer;
         DCInvalidateRange(pBuffer, ysize);
         pBuffer += ysize;
@@ -203,6 +422,7 @@ bool THPSimplePlayerWrapper::setBuffer(u8* pBuffer) {
         mTextureSet[1].vtexture = pBuffer;
         DCInvalidateRange(pBuffer, uvsize);
         pBuffer += uvsize;
+        }
 
         for (s32 i = 0; i < 20; i++) {
             mReadBuffer[i].ptr = pBuffer;
@@ -243,6 +463,9 @@ bool THPSimplePlayerWrapper::preLoad(s32 loop) {
 }
 
 bool THPSimplePlayerWrapper::loadStop() {
+#if defined(TARGET_WIIU)
+    smgThpFinish();
+#endif
     if (mOpen && !mAudioState) {
         mPreFetchState = 0;
 
@@ -343,6 +566,9 @@ s32 THPSimplePlayerWrapper::decode(s32 audio) {
 }
 
 s32 THPSimplePlayerWrapper::drawCurrentFrame(_GXRenderModeObj* rmode, u32 x, u32 y, u32 polyW, u32 polyH) {
+#if defined(TARGET_WIIU)
+    smgThpFinish();
+#endif
     if (mTextureSet[_310].frameNumber < 0) {
         return -1;
     }
@@ -353,6 +579,24 @@ s32 THPSimplePlayerWrapper::drawCurrentFrame(_GXRenderModeObj* rmode, u32 x, u32
     THPGXRestore();
     s32 ret = mTextureSet[_310].frameNumber;
     _310 = _310 == 0;
+#if defined(TARGET_WIIU)
+    // Decode one frame ahead: start the next ready frame now, into the set
+    // the next decode() will write, so it overlaps the next frame's logic.
+    if (!sSmgThp.pending && mReadBuffer[mNextDecodeIndex].isValid == true) {
+        u8* buf = mReadBuffer[mNextDecodeIndex].ptr;
+        const u32* compSize = reinterpret_cast<const u32*>(buf) + 2;
+        u8* p = buf + mFrameComp.numComponents * 4 + 8;
+        for (s32 i = 0; i < mFrameComp.numComponents; i++) {
+            if (mFrameComp.frameComp[i] == 0) {
+                if (smgThpKick(p, buf, mHeader.bufSize, &mTextureSet[_310], mTHPWork, mVideoInfo.xSize, mVideoInfo.ySize,
+                               mReadBuffer[mNextDecodeIndex].frameNumber, false))
+                    ++sSmgThpPredicted;
+                break;
+            }
+            p += compSize[i];
+        }
+    }
+#endif
     return ret;
 }
 
@@ -381,20 +625,99 @@ s32 THPSimplePlayerWrapper::getTotalFrame() const {
     return 0;
 }
 
+#if defined(TARGET_PC)
+extern "C" void port_thp_mt_stats(u32* mainRows, u32* totalRows);
+#endif
 bool THPSimplePlayerWrapper::videoDecode(u8* pFile) {
-    if (THPVideoDecode(pFile, mTextureSet[_310].ytexture, mTextureSet[_310].utexture, mTextureSet[_310].vtexture, mTHPWork)) {
+#if defined(TARGET_WIIU)
+    // A frame predicted after the last draw: accept it if it is this frame
+    // decoded into this texture set.
+    if ((sSmgThp.pending || sSmgThp.completed) && sSmgThp.srcFile == pFile && sSmgThp.set == &mTextureSet[_310]) {
+        sSmgThp.frameNumber = mReadBuffer[mNextDecodeIndex].frameNumber;
+        ++sSmgThpAccepted;
+        if (!sSmgThp.pending) ++sSmgThpLateAccepted;
+        if (sSmgThp.pending) {
+            sSmgThp.accepted = true;
+        } else {
+            sSmgThp.completed = false;
+            sSmgThp.set->frameNumber = sSmgThp.frameNumber;
+        }
+        return true;
+    }
+    smgThpFinish();
+    sSmgThp.completed = false;
+    if (smgThpKick(pFile, mReadBuffer[mNextDecodeIndex].ptr, mHeader.bufSize, &mTextureSet[_310], mTHPWork,
+                   mVideoInfo.xSize, mVideoInfo.ySize, mReadBuffer[mNextDecodeIndex].frameNumber, true))
+        return true;
+#endif
+#if defined(TARGET_PC)
+    // Port timing: average and worst THPVideoDecode per 120 movie frames.
+    static OSTime sDecodeTicks, sDecodeMax;
+    static u32 sDecodeFrames;
+    const OSTime decodeStart = OSGetTime();
+#endif
+#if defined(TARGET_WIIU)
+    smgThpDecode(&sSmgThp);
+    const s32 decodeError = sSmgThp.failed;
+#else
+    const s32 decodeError = THPVideoDecode(pFile, mTextureSet[_310].ytexture, mTextureSet[_310].utexture, mTextureSet[_310].vtexture, mTHPWork);
+#endif
+    if (decodeError) {
         return false;
     }
+#if defined(TARGET_PC)
+    {
+        const OSTime t = OSGetTime() - decodeStart;
+        sDecodeTicks += t;
+        if (t > sDecodeMax) sDecodeMax = t;
+        if (++sDecodeFrames == 120) {
+            u32 mainRows = 0, totalRows = 0;
+            port_thp_mt_stats(&mainRows, &totalRows);
+            port_log("[thp] %ux%u decode avg %lld us max %lld us (120 frames), strips by game thread %u of %u\n",
+                     (unsigned)mVideoInfo.xSize, (unsigned)mVideoInfo.ySize,
+                     (long long)OSTicksToMicroseconds(sDecodeTicks / 120), (long long)OSTicksToMicroseconds(sDecodeMax),
+                     (unsigned)mainRows, (unsigned)totalRows);
+            sDecodeTicks = sDecodeMax = 0;
+            sDecodeFrames = 0;
+        }
+    }
+#endif
 
     // The decoder alternates two fixed Y/U/V sets.  Publish each decoded
     // frame before GX samples those same addresses again; on Wii U this also
     // stamps the ranges used by the GX2 texture hash/cache invalidation path.
-    const u32 ysize = OSRoundUp32B(mVideoInfo.xSize * mVideoInfo.ySize);
-    const u32 uvsize = OSRoundUp32B(mVideoInfo.xSize * mVideoInfo.ySize / 4);
+    const u32 ysize =
+#if defined(TARGET_WIIU)
+        sSmgThp.ysize;
+#else
+        OSRoundUp32B(mVideoInfo.xSize * mVideoInfo.ySize);
+#endif
+    const u32 uvsize =
+#if defined(TARGET_WIIU)
+        sSmgThp.uvsize;
+#else
+        OSRoundUp32B(mVideoInfo.xSize * mVideoInfo.ySize / 4);
+#endif
     DCFlushRange(mTextureSet[_310].ytexture, ysize);
     DCFlushRange(mTextureSet[_310].utexture, uvsize);
     DCFlushRange(mTextureSet[_310].vtexture, uvsize);
+#if defined(TARGET_WIIU)
+    if (sSmgThp.linear) {
+        GXPC_TextureStreamWrittenLinear(mTextureSet[_310].ytexture, ysize, sSmgThp.ypitch);
+        GXPC_TextureStreamWrittenLinear(mTextureSet[_310].utexture, uvsize, sSmgThp.uvpitch);
+        GXPC_TextureStreamWrittenLinear(mTextureSet[_310].vtexture, uvsize, sSmgThp.uvpitch);
+    } else {
+        GXPC_TextureStreamWritten(mTextureSet[_310].ytexture, ysize);
+        GXPC_TextureStreamWritten(mTextureSet[_310].utexture, uvsize);
+        GXPC_TextureStreamWritten(mTextureSet[_310].vtexture, uvsize);
+    }
+#endif
+#if !defined(TARGET_WIIU)
     GXPC_InvalidateTexturesAfterCpuWrite();
+#elif defined(TARGET_WIIU)
+    if (!sSmgThp.linear)
+        GXPC_InvalidateTexturesAfterCpuWrite();
+#endif
 
     mTextureSet[_310].frameNumber = mReadBuffer[mNextDecodeIndex].frameNumber;
     return true;

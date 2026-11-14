@@ -71,6 +71,11 @@ struct Table {
 	// function and its callees cost together (inclusive).
 	uint32_t incPc[kIncSlots], incCount[kIncSlots];
 	uint32_t incDropped;
+	// Worker table only: samples where the worker was NOT the interrupted
+	// thread, by every return address on the worker's saved stack (where it
+	// is blocked or waiting).
+	uint32_t bkPc[kIncSlots], bkCount[kIncSlots];
+	uint32_t blocked;
 };
 
 alignas(64) uint8_t s_alarm[0x80];
@@ -125,6 +130,37 @@ void count_inclusive(Table& t, const uint8_t* ctx)
 			if (probe == 32) { ++t.incDropped; break; }
 			if (t.incPc[slot] == ret) { ++t.incCount[slot]; break; }
 			if (!t.incPc[slot]) { t.incPc[slot] = ret; t.incCount[slot] = 1; break; }
+		}
+	}
+}
+
+void count_blocked(Table& t, const uint8_t* ctx)
+{
+	const uint32_t top = *reinterpret_cast<const volatile uint32_t*>(ctx + kStackStartOffset);
+	const uint32_t bottom = *reinterpret_cast<const volatile uint32_t*>(ctx + kStackEndOffset);
+	uint32_t sp = *reinterpret_cast<const volatile uint32_t*>(ctx + kSpOffset);
+	uint32_t rets[24];
+	uint32_t n = 0;
+	const uint32_t lr = *reinterpret_cast<const volatile uint32_t*>(ctx + kLrOffset);
+	const uint32_t srr0 = *reinterpret_cast<const volatile uint32_t*>(ctx + kSrr0Offset);
+	if (code_addr_(srr0)) rets[n++] = srr0;
+	if (code_addr_(lr)) rets[n++] = lr;
+	for (int depth = 0; depth < 20 && n < 24; ++depth) {
+		if (sp < bottom || sp + 8 > top || (sp & 3)) break;
+		const uint32_t next = *reinterpret_cast<const volatile uint32_t*>(sp);
+		if (next <= sp || next + 8 > top) break;
+		const uint32_t ret = *reinterpret_cast<const volatile uint32_t*>(next + 4);
+		sp = next;
+		if (code_addr_(ret)) rets[n++] = ret;
+	}
+	for (uint32_t k = 0; k < n; ++k) {
+		bool dup = false;
+		for (uint32_t j = 0; j < k; ++j) dup |= rets[j] == rets[k];
+		if (dup) continue;
+		uint32_t slot = (rets[k] >> 2) * 2654435761u % kIncSlots;
+		for (uint32_t probe = 0; probe < 32; ++probe, slot = (slot + 1) % kIncSlots) {
+			if (t.bkPc[slot] == rets[k]) { ++t.bkCount[slot]; break; }
+			if (!t.bkPc[slot]) { t.bkPc[slot] = rets[k]; t.bkCount[slot] = 1; break; }
 		}
 	}
 }
@@ -289,6 +325,10 @@ void split_frame_begin()
 	s_splitGpuTicks = 0;
 }
 
+#if defined(PORT_GAME_SMG)
+void slow_frame_end(uint32_t logicUs);
+#endif
+
 void split_frame_end(uint32_t fields)
 {
 	if (!s_splitFrameActive)
@@ -311,6 +351,9 @@ void split_frame_end(uint32_t fields)
 		logic = 0;
 	else
 		logic -= s_splitGpuTicks;
+#if defined(PORT_GAME_SMG)
+	slow_frame_end(split_to_us(logic));
+#endif
 	split_add(kLogicCpu, logic);
 	split_add(kGxTranslate, s_splitGxTicks);
 	split_add(kGpuWait, s_splitGpuTicks);
@@ -371,8 +414,133 @@ void split_audio_end()
 }
 #endif
 
+#if defined(PORT_GAME_SMG)
+// SD marker "perfslow" (with perfdiag): samples are held per frame and only
+// counted for frames whose game logic ran >= kSlowLogicUs, to find what makes
+// the slow frames slow. The frame that prints a report is never counted.
+constexpr uint32_t kSlowLogicUs = 12000;
+constexpr uint32_t kRecs = 96;
+constexpr uint32_t kRecDepth = 32;
+struct SampleRec {
+	uint32_t pc, lr, up;
+	void* context;
+	uint8_t main, depth;
+	uint32_t ret[kRecDepth];
+};
+SampleRec s_rec[2][kRecs];
+volatile uint32_t s_recCount[2];
+volatile uint32_t s_recIdx;
+int s_slowMode = -1;
+bool s_reportThisFrame;
+uint32_t s_slowFrames, s_allFrames;
+
+void count_inclusive_ret(Table& t, uint32_t ret)
+{
+	uint32_t slot = (ret >> 2) * 2654435761u % kIncSlots;
+	for (uint32_t probe = 0;; ++probe, slot = (slot + 1) % kIncSlots) {
+		if (probe == 32) { ++t.incDropped; break; }
+		if (t.incPc[slot] == ret) { ++t.incCount[slot]; break; }
+		if (!t.incPc[slot]) { t.incPc[slot] = ret; t.incCount[slot] = 1; break; }
+	}
+}
+
+void count_call_values(Table& t, uint32_t pc, uint32_t lr, uint32_t up)
+{
+	uint32_t slot = slot_of(lr ^ (up * 31u), kCallSlots);
+	for (uint32_t probe = 0; probe < 32; ++probe, slot = (slot + 1) % kCallSlots) {
+		if (t.callCount[slot] && t.callLr[slot] == lr && t.callUp[slot] == up) { ++t.callCount[slot]; return; }
+		if (!t.callCount[slot]) {
+			t.callPc[slot] = pc; t.callLr[slot] = lr; t.callUp[slot] = up; t.callCount[slot] = 1;
+			return;
+		}
+	}
+	++t.callDropped;
+}
+
+void record_sample(void* mainThread, void* context)
+{
+	const uint32_t idx = s_recIdx & 1;
+	const uint32_t n = s_recCount[idx];
+	if (n >= kRecs) return;
+	SampleRec& r = s_rec[idx][n];
+	const uint8_t* ctx = static_cast<const uint8_t*>(context);
+	r.pc = *reinterpret_cast<const uint32_t*>(ctx + kSrr0Offset);
+	r.lr = *reinterpret_cast<const uint32_t*>(ctx + kLrOffset);
+	r.up = 0;
+	const uint32_t sp0 = *reinterpret_cast<const uint32_t*>(ctx + kSpOffset);
+	if (stack_addr(sp0)) {
+		const uint32_t next = *reinterpret_cast<const volatile uint32_t*>(sp0);
+		if (stack_addr(next) && next > sp0 && next - sp0 < 0x10000u)
+			r.up = *reinterpret_cast<const volatile uint32_t*>(next + 4);
+	}
+	if (!code_addr(r.up)) r.up = 0;
+	r.context = context;
+	r.main = context == mainThread;
+	r.depth = 0;
+	if (r.main) {
+		const uint32_t top = *reinterpret_cast<const uint32_t*>(ctx + kStackStartOffset);
+		const uint32_t bottom = *reinterpret_cast<const uint32_t*>(ctx + kStackEndOffset);
+		uint32_t sp = sp0;
+		for (int depth = 0; depth < 32; ++depth) {
+			if (sp < bottom || sp + 8 > top || (sp & 3)) break;
+			const uint32_t next = *reinterpret_cast<const volatile uint32_t*>(sp);
+			if (next <= sp || next + 8 > top) break;
+			const uint32_t ret = *reinterpret_cast<const volatile uint32_t*>(next + 4);
+			sp = next;
+			if (code_addr_(ret) && r.depth < kRecDepth) r.ret[r.depth++] = ret;
+		}
+	}
+	s_recCount[idx] = n + 1;
+}
+
+void replay_records(Table& t, uint32_t idx)
+{
+	const uint32_t n = s_recCount[idx];
+	for (uint32_t i = 0; i < n; ++i) {
+		const SampleRec& r = s_rec[idx][i];
+		++t.samples;
+		if (r.main) {
+			++t.main;
+			for (uint32_t d = 0; d < r.depth; ++d) count_inclusive_ret(t, r.ret[d]);
+		}
+		uint32_t tid = 0;
+		for (; tid < kThreads; ++tid) {
+			if (t.thread[tid] == r.context) { ++t.threadCount[tid]; break; }
+			if (!t.thread[tid]) { t.thread[tid] = r.context; t.threadCount[tid] = 1; break; }
+		}
+		if (is_leaf_pc(r.pc)) count_call_values(t, r.pc, r.lr, r.up);
+		uint32_t slot = slot_of(r.pc ^ (tid << 28), kSlots);
+		bool placed = false;
+		for (uint32_t probe = 0; probe < 32; ++probe, slot = (slot + 1) % kSlots) {
+			if (t.pc[slot] == r.pc && t.tid[slot] == tid) { ++t.count[slot]; placed = true; break; }
+			if (!t.pc[slot]) { t.pc[slot] = r.pc; t.tid[slot] = (uint8_t)tid; t.count[slot] = 1; placed = true; break; }
+		}
+		if (!placed) ++t.dropped;
+	}
+}
+
+// Called at each frame end on the main thread with that frame's logic time.
+void slow_frame_end(uint32_t logicUs)
+{
+	if (s_slowMode <= 0) return;
+	const uint32_t done = s_recIdx & 1;
+	s_recCount[done ^ 1] = 0;
+	s_recIdx = done ^ 1;  // the alarm now records into the other buffer
+	++s_allFrames;
+	if (logicUs >= kSlowLogicUs && !s_reportThisFrame) {
+		++s_slowFrames;
+		replay_records(s_tables[s_active & 1], done);
+	}
+	s_reportThisFrame = false;
+}
+
+#endif
+
 void sample(Table& t, void* mainThread, void* context)
 {
+#if defined(PORT_GAME_SMG)
+	if (s_slowMode > 0) { record_sample(mainThread, context); return; }
+#endif
 	const uint32_t pc = *reinterpret_cast<const uint32_t*>(static_cast<const uint8_t*>(context) + kSrr0Offset);
 	++t.samples;
 	if (context == mainThread) {
@@ -393,8 +561,27 @@ void sample(Table& t, void* mainThread, void* context)
 	++t.dropped;
 }
 
-void on_alarm(void*, void* context) { sample(s_tables[s_active & 1], s_mainThread, context); }
-void on_walarm(void*, void* context) { sample(s_wtables[s_wactive & 1], s_workerThread, context); }
+void on_alarm(void*, void* context)
+{
+	Table& t = s_tables[s_active & 1];
+	sample(t, s_mainThread, context);
+#if defined(PORT_GAME_SMG)
+	if (s_slowMode > 0) return;
+#endif
+	if (context != s_mainThread && s_mainThread) {
+		++t.blocked;
+		count_blocked(t, static_cast<const uint8_t*>(s_mainThread));
+	}
+}
+void on_walarm(void*, void* context)
+{
+	Table& t = s_wtables[s_wactive & 1];
+	sample(t, s_workerThread, context);
+	if (context != s_workerThread && s_workerThread) {
+		++t.blocked;
+		count_blocked(t, static_cast<const uint8_t*>(s_workerThread));
+	}
+}
 
 // Leaves whose samples are worth charging to their callers.
 bool leaf_name(const char* name)
@@ -438,8 +625,15 @@ struct Func {
 	uint32_t count;
 };
 
+void dump_raw(const char* prefix, const char* tag, uint32_t* pcs, uint32_t* counts, uint32_t slots, uint8_t* tids, uint32_t wantTid, int maxN);
+
 void report(Table& t)
 {
+	// Main thread: run = samples that interrupted it, blocked = samples on
+	// core 1 while it was not running; bk = return addresses on its saved
+	// stack then (where it waits).  Raw PCs: symbolise host-side.
+	port_log("[prof] mainrun=%u mainblocked=%u samples=%u\n", (unsigned)t.main, (unsigned)t.blocked, (unsigned)t.samples);
+	dump_raw("[prof]", "bk", t.bkPc, t.bkCount, kIncSlots, nullptr, 0, 64);
 	static Func funcs[512];
 	uint32_t nfuncs = 0, other = 0;
 	for (uint32_t i = 0; i < kSlots; ++i) {
@@ -554,21 +748,50 @@ void report(Table& t)
 	std::memset(&t, 0, sizeof(t));
 }
 
+void dump_raw(const char* prefix, const char* tag, uint32_t* pcs, uint32_t* counts, uint32_t slots, uint8_t* tids, uint32_t wantTid, int maxN)
+{
+	char line[400];
+	int len = 0, inLine = 0;
+	for (int rank = 0; rank < maxN; ++rank) {
+		uint32_t best = slots;
+		for (uint32_t i = 0; i < slots; ++i)
+			if (pcs[i] && counts[i] && (!tids || tids[i] == wantTid) && (best == slots || counts[i] > counts[best])) best = i;
+		if (best == slots || counts[best] < 2) break;
+		len += std::snprintf(line + len, sizeof(line) - len, " %08x:%u", (unsigned)pcs[best], (unsigned)counts[best]);
+		counts[best] = 0;
+		if (++inLine == 16) { port_log("%s %s%s\n", prefix, tag, line); len = inLine = 0; }
+	}
+	if (inLine) port_log("%s %s%s\n", prefix, tag, line);
+}
+
 void report_worker(Table& t)
 {
 	port_log("[wprof] samples=%u dropped=%u thread=%p\n",
 	         (unsigned)t.samples, (unsigned)t.dropped, s_workerThread);
-	for (int rank = 0; rank < 12; ++rank) {
-		uint32_t best = kSlots;
-		for (uint32_t i = 0; i < kSlots; ++i)
-			if (t.pc[i] && (best == kSlots || t.count[i] > t.count[best])) best = i;
-		if (best == kSlots) break;
-		char name[64] = {};
-		wut_OSGetSymbolName(t.pc[best], name, sizeof(name));
-		port_log("[wprof] %2d %5.1f pct %5u %s\n", rank,
-		         t.samples ? 100.0f * t.count[best] / t.samples : 0.0f,
-		         (unsigned)t.count[best], short_name(name));
-		t.count[best] = 0;
+	// Raw PCs for host-side symbolisation with nm of the exact build's ELF
+	// (game .text runs at link address + 0x0A000000; OSGetSymbolName names
+	// game PCs after the nearest coreinit export).  run = samples that
+	// interrupted the worker itself; blocked = samples on its core while the
+	// worker was not running (bk = return addresses on its saved stack).
+	uint32_t wtid = kThreads;
+	for (uint32_t i = 0; i < kThreads; ++i)
+		if (t.thread[i] == s_workerThread) wtid = i;
+	port_log("[wprof] run=%u blocked=%u samples=%u threads=%u/%u/%u/%u\n", (unsigned)t.main, (unsigned)t.blocked,
+	         (unsigned)t.samples, (unsigned)t.threadCount[0], (unsigned)t.threadCount[1], (unsigned)t.threadCount[2],
+	         (unsigned)t.threadCount[3]);
+	dump_raw("[wprof]", "pc", t.pc, t.count, kSlots, t.tid, wtid, 320);
+	dump_raw("[wprof]", "inc", t.incPc, t.incCount, kIncSlots, nullptr, 0, 96);
+	dump_raw("[wprof]", "bk", t.bkPc, t.bkCount, kIncSlots, nullptr, 0, 64);
+	// Leaf samples (memcpy, memset, ...) by caller: raw leaf pc, lr (the
+	// caller) and the caller's caller, for host-side symbolisation.
+	for (int rank = 0; rank < 24; ++rank) {
+		uint32_t best = kCallSlots;
+		for (uint32_t i = 0; i < kCallSlots; ++i)
+			if (t.callCount[i] && (best == kCallSlots || t.callCount[i] > t.callCount[best])) best = i;
+		if (best == kCallSlots || t.callCount[best] < 2) break;
+		port_log("[wprof] via %08x:%08x:%08x:%u\n", (unsigned)t.callPc[best], (unsigned)t.callLr[best],
+		         (unsigned)t.callUp[best], (unsigned)t.callCount[best]);
+		t.callCount[best] = 0;
 	}
 	std::memset(&t, 0, sizeof(t));
 }
@@ -605,6 +828,7 @@ extern "C" void sms_wiiu_profiler_tick(void)
 	static unsigned s_jpaWindowFrames;
 	sms_wiiu_jpa_diag_stage_tick();
 	if (++s_jpaWindowFrames == 30) {
+		sms_wiiu_jpa_finalvx_report();
 		port_log("[jpa] particles=%u draws=%u splits=%u batched=%u rejType=%u rejCallback=%u rejPrj=%u rejIneligible=%u rejTex=%u rejColorRgb=%u rejColorAlpha=%u rejScale=%u rejPrjMode=%u rejBlendZ=%u rejChild=%u rejOther=%u t2=%u t3=%u t4=%u\n",
 		         (unsigned)s_jpaParticles, (unsigned)s_jpaDraws,
 		         (unsigned)s_jpaSplits, (unsigned)s_jpaBatched,
@@ -637,6 +861,16 @@ extern "C" void sms_wiiu_profiler_tick(void)
 		if (f)
 			std::fclose(f);
 		port_log("[prof] sampler %s (SD marker perfdiag)\n", s_enabled ? "on" : "off");
+#if defined(PORT_GAME_SMG)
+		std::snprintf(path, sizeof(path), "%sperfslow", sms_wiiu_app_root());
+		f = std::fopen(path, "rb");
+		s_slowMode = s_enabled && f != nullptr;
+		if (f)
+			std::fclose(f);
+		if (s_slowMode)
+			port_log("[prof] slow-frame mode: only frames with logic >= %u us are counted (needs framesplit)\n",
+			         (unsigned)kSlowLogicUs);
+#endif
 	}
 	if (!s_enabled)
 		return;
@@ -653,6 +887,13 @@ extern "C" void sms_wiiu_profiler_tick(void)
 	s_lastReport = now;
 	const uint32_t done = s_active & 1;
 	s_active = done ^ 1;
+#if defined(PORT_GAME_SMG)
+	if (s_slowMode > 0) {
+		port_log("[prof] slow frames %u of %u since the last report\n", (unsigned)s_slowFrames, (unsigned)s_allFrames);
+		s_slowFrames = s_allFrames = 0;
+		s_reportThisFrame = true;
+	}
+#endif
 	report(s_tables[done]);
 	if (s_wrunning) {
 		const uint32_t wdone = s_wactive & 1;
@@ -667,6 +908,77 @@ uint32_t s_jpaRejectType, s_jpaRejectCallback, s_jpaRejectPrj, s_jpaRejectInelig
 uint32_t s_jpaRejectTexture, s_jpaRejectColorRgb, s_jpaRejectColorAlpha, s_jpaRejectScale;
 uint32_t s_jpaRejectProjection, s_jpaRejectBlendZmode, s_jpaRejectChild, s_jpaRejectOther;
 uint32_t s_jpaType2, s_jpaType3, s_jpaType4;
+volatile uint32_t s_jpaFinalVxRuns, s_jpaFinalVxParticles, s_jpaFinalVxVertices, s_jpaFinalVxBytes;
+volatile uint32_t s_jpaFinalVxCheckRuns, s_jpaFinalVxMismatches;
+volatile uint32_t s_jpaFinalVxFallbacks[SMS_WIIU_JPA_FINALVX_FALLBACK_REASON_COUNT];
+volatile uint32_t s_jpaFinalVxFirstMismatchSet;
+char s_jpaFinalVxFirstMismatch[64];
+
+extern "C" void sms_wiiu_jpa_finalvx_run(unsigned particles, unsigned vertices, unsigned bytes)
+{
+	__sync_fetch_and_add(&s_jpaFinalVxRuns, 1);
+	__sync_fetch_and_add(&s_jpaFinalVxParticles, particles);
+	__sync_fetch_and_add(&s_jpaFinalVxVertices, vertices);
+	__sync_fetch_and_add(&s_jpaFinalVxBytes, bytes);
+}
+
+extern "C" void sms_wiiu_jpa_finalvx_fallback(unsigned reason)
+{
+	if (reason < SMS_WIIU_JPA_FINALVX_FALLBACK_REASON_COUNT)
+		__sync_fetch_and_add(&s_jpaFinalVxFallbacks[reason], 1);
+}
+
+extern "C" void sms_wiiu_jpa_finalvx_check_run(void)
+{
+	__sync_fetch_and_add(&s_jpaFinalVxCheckRuns, 1);
+}
+
+extern "C" void sms_wiiu_jpa_finalvx_check_mismatch(const char* field)
+{
+	__sync_fetch_and_add(&s_jpaFinalVxMismatches, 1);
+	if (!field) field = "unknown";
+	if (__sync_bool_compare_and_swap(&s_jpaFinalVxFirstMismatchSet, 0, 1))
+		std::strncpy(s_jpaFinalVxFirstMismatch, field, sizeof(s_jpaFinalVxFirstMismatch) - 1);
+}
+
+extern "C" void sms_wiiu_jpa_finalvx_report(void)
+{
+	bool active = s_jpaFinalVxRuns || s_jpaFinalVxCheckRuns || s_jpaFinalVxMismatches;
+	for (unsigned i = 0; i < SMS_WIIU_JPA_FINALVX_FALLBACK_REASON_COUNT; ++i)
+		if (s_jpaFinalVxFallbacks[i]) { active = true; break; }
+	if (!active) return;
+	const uint32_t runs = __sync_lock_test_and_set(&s_jpaFinalVxRuns, 0);
+	const uint32_t particles = __sync_lock_test_and_set(&s_jpaFinalVxParticles, 0);
+	const uint32_t vertices = __sync_lock_test_and_set(&s_jpaFinalVxVertices, 0);
+	const uint32_t bytes = __sync_lock_test_and_set(&s_jpaFinalVxBytes, 0);
+	const uint32_t checkRuns = __sync_lock_test_and_set(&s_jpaFinalVxCheckRuns, 0);
+	const uint32_t mismatches = __sync_lock_test_and_set(&s_jpaFinalVxMismatches, 0);
+	char first[sizeof(s_jpaFinalVxFirstMismatch)] = {};
+	if (s_jpaFinalVxFirstMismatchSet) {
+		__sync_synchronize();
+		std::strncpy(first, s_jpaFinalVxFirstMismatch, sizeof(first) - 1);
+	}
+	if (!first[0]) std::strcpy(first, "none");
+	port_log("[jpafinalvx] check runs=%u mismatches=%u first=%s\n",
+		         (unsigned)checkRuns, (unsigned)mismatches, first);
+	port_log("[jpafinalvx] runs=%u particles=%u vertices=%u bytes=%u fallback vat=%u alloc=%u slot-full=%u slot-busy=%u record-full=%u dl-cache=%u check-split=%u unsupported=%u worker-baddesc=%u worker-cold=%u worker-inactive=%u worker-dlopen=%u worker-dlpending=%u\n",
+		         (unsigned)runs, (unsigned)particles, (unsigned)vertices, (unsigned)bytes,
+		         (unsigned)__sync_lock_test_and_set(&s_jpaFinalVxFallbacks[SMS_WIIU_JPA_FINALVX_FALLBACK_VAT], 0),
+		         (unsigned)__sync_lock_test_and_set(&s_jpaFinalVxFallbacks[SMS_WIIU_JPA_FINALVX_FALLBACK_ALLOC], 0),
+		         (unsigned)__sync_lock_test_and_set(&s_jpaFinalVxFallbacks[SMS_WIIU_JPA_FINALVX_FALLBACK_SLOT_FULL], 0),
+		         (unsigned)__sync_lock_test_and_set(&s_jpaFinalVxFallbacks[SMS_WIIU_JPA_FINALVX_FALLBACK_SLOT_BUSY], 0),
+		         (unsigned)__sync_lock_test_and_set(&s_jpaFinalVxFallbacks[SMS_WIIU_JPA_FINALVX_FALLBACK_RECORD_FULL], 0),
+		         (unsigned)__sync_lock_test_and_set(&s_jpaFinalVxFallbacks[SMS_WIIU_JPA_FINALVX_FALLBACK_DL_CACHE], 0),
+		         (unsigned)__sync_lock_test_and_set(&s_jpaFinalVxFallbacks[SMS_WIIU_JPA_FINALVX_FALLBACK_CHECK_SPLIT], 0),
+		         (unsigned)__sync_lock_test_and_set(&s_jpaFinalVxFallbacks[SMS_WIIU_JPA_FINALVX_FALLBACK_UNSUPPORTED], 0),
+	         (unsigned)__sync_lock_test_and_set(&s_jpaFinalVxFallbacks[SMS_WIIU_JPA_FINALVX_FALLBACK_WORKER_BADDESC], 0),
+	         (unsigned)__sync_lock_test_and_set(&s_jpaFinalVxFallbacks[SMS_WIIU_JPA_FINALVX_FALLBACK_WORKER_COLD], 0),
+	         (unsigned)__sync_lock_test_and_set(&s_jpaFinalVxFallbacks[SMS_WIIU_JPA_FINALVX_FALLBACK_WORKER_INACTIVE], 0),
+	         (unsigned)__sync_lock_test_and_set(&s_jpaFinalVxFallbacks[SMS_WIIU_JPA_FINALVX_FALLBACK_WORKER_DLOPEN], 0),
+	         (unsigned)__sync_lock_test_and_set(&s_jpaFinalVxFallbacks[SMS_WIIU_JPA_FINALVX_FALLBACK_WORKER_DLPENDING], 0));
+	s_jpaFinalVxFirstMismatch[0] = '\0';
+	__sync_lock_test_and_set(&s_jpaFinalVxFirstMismatchSet, 0);
+}
 struct JPAHistogramBucket {
 	unsigned type, count, emitters;
 	const char* func;

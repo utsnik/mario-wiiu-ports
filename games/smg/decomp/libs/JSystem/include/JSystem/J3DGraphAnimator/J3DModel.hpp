@@ -52,6 +52,10 @@ public:
     s32 setSkinDeform(J3DSkinDeform*, u32);
     void calcAnmMtx();
     void calcWeightEnvelopeMtx();
+#if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
+    void calcBeforeAnmMtx();
+    void calcAnmMtxPure();
+#endif
     inline void calcNrmMtx();
     void calcBumpMtx();
     void calcBBoardMtx();

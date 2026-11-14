@@ -48,8 +48,14 @@
 #include "gx2_texture.h"
 #include "gx2_texture_pack.h"
 #include "imgfx_copy.h"
+#include "jpa_final_vertex.h"
+#if defined(PORT_GAME_SMG)
+#include "jpa_counters.h"
+#endif
+#include "../../games/smg/include/wiiu/pipe5.h"
 #if defined(PORT_GAME_SMG)
 #include "gx2_ztex.h"
+#include "gx2_vs_dense.h"
 #include "drawown.h"
 #endif
 
@@ -74,6 +80,11 @@
 #include <whb/gfx.h>
 #include <proc_ui/procui.h>
 #include <whb/log.h>
+#if defined(PORT_GAME_SMG)
+#include "../../games/smg/include/wiiu/gphase.h"
+#include "third_party/wiiu-dynres/dynres.h"
+#include "third_party/wiiu-dynres/dynres_store.h"
+#endif
 
 #include <algorithm>
 #include <cmath>
@@ -91,6 +102,9 @@
 extern "C" void sms_wiiu_d1_note_draw_core(void);
 extern "C" void sms_wiiu_gx2prod_reset_draw_sync_jobs(void);
 extern "C" void sms_wiiu_present_finish_pipelined_service(void);
+#if defined(PORT_GAME_SMG)
+extern "C" void sms_wiiu_pipe5_service_present_complete(void);
+#endif
 
 namespace gx {
 
@@ -111,15 +125,179 @@ uint32_t g_displayFrames = 0;
 // GX2WaitTimeStamp; forcepres = the d6 forced present segment.
 static bool s_d7NoSwap, s_d7FencePoll, s_d6Force;
 static bool s_tv720Marker;
+#if defined(PORT_GAME_SMG)
+static bool s_tinyScissor;  // marker tinyscissor (read at init)
+// SD file tinycat (diagnostic A/B): gpucat ids (DrawType, 100+/150+ DrawBuffer
+// opa/xlu, 200 image effects, 201 draw2D) whose draws get the 64x64 scissor.
+static bool s_tinyCatOn, s_tinyActive;
+static bool s_tinyCat[256];
+// SD file catstats (diagnostic): per listed gpucat id, what its draws are
+// (logged by the worker every 120 frames): draws, indices, TEV stages,
+// indirect stages, PS GPRs, textures and their texels, blend and depth state.
+static bool s_catStatsOn, s_catStat[256];
+static int s_curCat = -1;
+struct TevShader;
+struct CatStats {
+    uint32_t draws, indices, stages, indStages, gprs, textures, blend, ztest, zwrite, killed;
+    uint64_t texels;
+    uint32_t maxTexW, maxTexH, shaders, linearTex, maxTexTile, maxTexFmt;
+    uint32_t cullNone, mipTex, mipLevels, bundles, maxBundles, psBytes;
+    const TevShader* maxShader;
+    const void* shaderSeen[16];
+};
+static CatStats s_catStats[256];
+static uint32_t s_catIdxHint;  // indices of the draw being stat'ed (set by flushBatch)
+// Marker tinytex (with tinycat): the listed categories keep their full scissor
+// but every pixel texture they bind is a 4x4 dummy.  A gain like tinycat's means
+// the cost is texture fetch; none means coverage/ROP/raster.
+static bool s_tinyTex;
+static bool s_tinyDup, s_tinyHalf;
+// GPR split between vertex and pixel shaders (total 248). Generated vertex programs reserve 64, so the
+// default 64-GPR VS pool runs ONE vertex wavefront per SIMD (b215: Planet 104 is per-vertex bound).
+static uint32_t s_vsGprPool = 64, s_psGprPool = 184;  // diag: tinycat categories draw twice / draw half their triangles (full scissor)
+// catstats also brackets every category run with an occlusion query (CPU
+// result), so [catpix] reports depth-passing samples per category per frame.
+// Slot 255 is "no category".  A ring read at frame boundaries, never blocking.
+extern "C" void GX2QueryBegin(uint32_t type, void* data);
+extern "C" void GX2QueryEnd(uint32_t type, void* data);
+extern "C" BOOL GX2QueryGetOcclusionResult(void* data, uint64_t* result);
+static constexpr uint32_t kCpQueryOcclusionCpu = 0, kCpSlots = 1024, kCpStride = 256;
+static uint8_t* s_cpData;
+static uint8_t s_cpCat[kCpSlots];
+static uint32_t s_cpHead, s_cpTail, s_cpOpenSlot = ~0u, s_cpDrops, s_cpNotReady;
+static uint64_t s_cpPix[256];
+#endif
 static bool s_imgfxNative;
 static bool s_nativeQuads;
+static bool s_jpaFinalVxMarker;
+static bool s_jpaFinalVxCheckMarker;
+static bool s_jpaFinalVxCopyMarker;
+static bool s_jpaFinalVxViaBatchMarker;  // diagnostic: worker draws every payload through flushBatch
+static bool s_jpaFinalVxNoBillboardMarker; // keep billboard runs (stage 2) on the GX path
+static bool s_jpaFinalVxGateLogged;
+static bool s_jpaFinalVxCompactWarmed;
+#if defined(PORT_GAME_SMG)
+static bool s_jpaCullStatsMarker;
+static bool s_jpaThinOffMarker, s_jpaThinMarker;
+static uint32_t s_jpaThinRuns, s_jpaThinOffSkip, s_jpaThinSmallSkip;
+static uint32_t s_jpaThinLoadFrames, s_jpaThinFrames, s_jpaThinLastWorkerBusy;
+static bool s_jpaThinLoaded;
+static OSTime s_jpaThinLastReport;
+struct JpaCullClass { bool off, partial, ortho; uint32_t area; };
+static bool jpaCullClassify(const SmsWiiuJpaFinalVxDesc* desc, JpaCullClass* result);
+static void jpaCullStatsSubmit(const SmsWiiuJpaFinalVxDesc* desc, const JpaCullClass& cls);
+static void jpaThinFrame();
+#endif
+#if defined(PORT_GAME_SMG)
+enum { JPA_MERGE_BP = 1u, JPA_MERGE_XF = 2u, JPA_MERGE_CP = 4u, JPA_MERGE_OTHER = 8u };
+static uint32_t s_jpaMergeRuns, s_jpaMergeable, s_jpaMergeAfterDraw;
+static uint32_t s_jpaMergeChgBp, s_jpaMergeChgXf, s_jpaMergeChgCp, s_jpaMergeChgOther;
+static uint32_t s_jpaMergeVtx;
+static uint32_t s_jpaMergeBpPending[8];   // bitset of BP regs changed since the previous run
+static uint32_t s_jpaMergeBpHist[256];    // non-mergeable runs per changed BP reg
+static uint32_t s_jpaMergePendingDomains;
+static uint8_t s_jpaMergeStateDomain;
+static bool s_jpaMergeHaveRun, s_jpaMergePreviousRun, s_jpaMergeDrawIntervened;
+static OSTime s_jpaMergeLastLog;
+
+static void jpaMergeReport() {
+    if (!g_smg_wprof_on || !s_jpaMergeRuns) return;
+    const OSTime now = OSGetTime();
+    if (s_jpaMergeLastLog && now - s_jpaMergeLastLog < OSSecondsToTicks(2)) return;
+    port_log("[jpamerge] runs=%u mergeable=%u afterDraw=%u chgBP=%u chgXF=%u chgCP=%u chgOther=%u vtx=%u\n",
+             unsigned(s_jpaMergeRuns), unsigned(s_jpaMergeable), unsigned(s_jpaMergeAfterDraw),
+             unsigned(s_jpaMergeChgBp), unsigned(s_jpaMergeChgXf), unsigned(s_jpaMergeChgCp),
+             unsigned(s_jpaMergeChgOther), unsigned(s_jpaMergeVtx));
+    s_jpaMergeRuns = s_jpaMergeable = s_jpaMergeAfterDraw = 0;
+    s_jpaMergeChgBp = s_jpaMergeChgXf = s_jpaMergeChgCp = s_jpaMergeChgOther = s_jpaMergeVtx = 0;
+    {
+        char line[200]; int used = std::snprintf(line, sizeof line, "[jpamergebp]");
+        for (int rank = 0; rank < 10; ++rank) {
+            int best = -1;
+            for (int r = 0; r < 256; ++r)
+                if (s_jpaMergeBpHist[r] && (best < 0 || s_jpaMergeBpHist[r] > s_jpaMergeBpHist[best])) best = r;
+            if (best < 0) break;
+            used += std::snprintf(line + used, sizeof line - used, " %02x:%u", best, unsigned(s_jpaMergeBpHist[best]));
+            s_jpaMergeBpHist[best] = 0;
+            if (used >= int(sizeof line) - 12) break;
+        }
+        std::memset(s_jpaMergeBpHist, 0, sizeof s_jpaMergeBpHist);
+        port_log("%s\n", line);
+    }
+    s_jpaMergeLastLog = now;
+}
+
+static void jpaMergeRun(unsigned vertices) {
+    if (!g_smg_wprof_on) return;
+    // CP is marked on every writeCP (equal values too) and final particle vertices do not use the CP
+    // vertex format, so chgCP is informational only and does not block a merge here.
+    const bool mergeable = s_jpaMergeHaveRun && s_jpaMergePreviousRun &&
+                           (s_jpaMergePendingDomains & ~uint32_t(JPA_MERGE_CP)) == 0 && !s_jpaMergeDrawIntervened;
+    ++s_jpaMergeRuns;
+    if (mergeable) ++s_jpaMergeable;
+    else if (s_jpaMergeHaveRun) {
+        if (s_jpaMergeDrawIntervened) ++s_jpaMergeAfterDraw;
+        if (s_jpaMergePendingDomains & JPA_MERGE_BP) ++s_jpaMergeChgBp;
+        if (s_jpaMergePendingDomains & JPA_MERGE_XF) ++s_jpaMergeChgXf;
+        if (s_jpaMergePendingDomains & JPA_MERGE_CP) ++s_jpaMergeChgCp;
+        if (s_jpaMergePendingDomains & JPA_MERGE_OTHER) ++s_jpaMergeChgOther;
+    }
+    s_jpaMergeHaveRun = s_jpaMergePreviousRun = true;
+    if (!mergeable && s_jpaMergeHaveRun)
+        for (int w = 0; w < 8; ++w)
+            for (uint32_t bits = s_jpaMergeBpPending[w]; bits; bits &= bits - 1)
+                ++s_jpaMergeBpHist[w * 32 + __builtin_ctz(bits)];
+    std::memset(s_jpaMergeBpPending, 0, sizeof s_jpaMergeBpPending);
+    s_jpaMergePendingDomains = 0;
+    s_jpaMergeDrawIntervened = false;
+    s_jpaMergeVtx += vertices;
+    jpaMergeReport();
+}
+
+static void jpaMergeOtherDraw() {
+    if (g_smg_wprof_on) s_jpaMergeDrawIntervened = true;
+}
+#else
+static void jpaMergeRun(unsigned) {}
+static void jpaMergeOtherDraw() {}
+#endif
 static bool s_pipe1Marker;
 static bool s_pipe2Marker;
+static bool s_pipe5Marker;
 static bool s_gx2ProdEnabled;
+static uint64_t s_pipe5ResourceFence;
+static bool s_pipe5ResourceFencePending;
+static bool s_pipe5FrameStarted;
+static uint32_t s_pipe5DrainRuns;
 extern "C" int sms_wiiu_d7_noswap(void) { return s_d7NoSwap ? 1 : 0; }
 extern "C" int sms_wiiu_d6_force(void) { return s_d6Force ? 1 : 0; }
 extern "C" int sms_wiiu_pipe1_enabled(void) { return s_pipe1Marker ? 1 : 0; }
 extern "C" int sms_wiiu_pipe2_enabled(void) { return s_pipe2Marker && s_gx2ProdEnabled ? 1 : 0; }
+extern "C" int sms_wiiu_pipe5_enabled(void) {
+    // Stage 1 is deliberately opt-in: pipe5 needs the producer, and it is
+    // mutually exclusive with pipe2's two-frame callback pipeline.
+    return s_pipe5Marker && !s_pipe2Marker && s_gx2ProdEnabled ? 1 : 0;
+}
+extern "C" void sms_wiiu_pipe5_wait_resource_fence(void) {
+    if (!sms_wiiu_pipe5_enabled() || !s_pipe5ResourceFencePending)
+        return;
+    smg_gphase_note_pipe5_resource_fence();
+    GX2WaitTimeStamp(s_pipe5ResourceFence);
+    s_pipe5ResourceFencePending = false;
+}
+#if defined(PORT_GAME_SMG)
+/* Keep the fence rule at the allocator boundary as well as at the higher-level
+ * replacement paths.  This covers shader programs, fetch shaders, surfaces,
+ * command buffers, and staging buffers added by later SMG paths. */
+#define MEMAllocFromDefaultHeapEx(size, alignment) \
+    (sms_wiiu_pipe5_wait_resource_fence(), ::MEMAllocFromDefaultHeapEx(size, alignment))
+#define MEMAllocFromExpHeapEx(heap, size, alignment) \
+    (sms_wiiu_pipe5_wait_resource_fence(), ::MEMAllocFromExpHeapEx(heap, size, alignment))
+#define MEMFreeToDefaultHeap(pointer) \
+    (sms_wiiu_pipe5_wait_resource_fence(), ::MEMFreeToDefaultHeap(pointer))
+#define MEMFreeToExpHeap(heap, pointer) \
+    (sms_wiiu_pipe5_wait_resource_fence(), ::MEMFreeToExpHeap(heap, pointer))
+#endif
 extern "C" int sms_wiiu_pipe2_present_queued(void);
 struct D4Segment {
     uint64_t ts;
@@ -216,8 +394,16 @@ static bool s_earlyZMarker;
 static bool s_hizMarker;
 static bool s_peek2Marker;
 static bool s_peekColFrameMarker;
+static bool s_peekZProdMarker;
+static bool s_peekZLinMarker;   // default-on "peekzlin" (nopeekzlin opts out): GXPeekZ converts depth straight into the linear readback target
+static bool s_peekZRectMarker;  // opt-in "peekzrect": the tiled->linear copy covers only last period's peek rect
 static bool s_peekAsyncMarker;
 static bool s_mem1CopyMarker;
+static bool s_clearDrawActive;      // clearfast v2: this batch draws with ztex off and depth range [d, d]
+static float s_clearDrawDepth;
+static uint32_t s_clearDrawSavedZtex2;
+static bool s_clearZFastMarker;    // default-on "clearzfast" (noclearzfast opts out); b221 v3: perfdiag/workerprof clean, Ice GPU -1.6 ms: MR::clearZBuffer quad -> GX2 depth clear
+static bool s_clearEfbFastMarker;  // default-on "clearefbfast" (noclearefbfast opts out): clearEfb quad -> GX2 colour+depth clear
 #endif
 bool g_dlPromoteFirst = false;
 bool g_dlIgnoreExternal = false;
@@ -232,9 +418,19 @@ static bool s_vertexSelfCheck;
 static uint32_t s_vertexSelfCheckMismatches;
 static uint32_t s_vertexSelfCheckSamples;
 static bool initTevVertex();
+static void initJpaFinalVxArena();
 #if defined(PORT_GAME_SMG)
 extern "C" void sms_wiiu_gx2_renderer_begin(void);
 extern "C" void sms_wiiu_gx2_renderer_end(void);
+#if defined(PORT_GAME_SMG)
+extern "C" void sms_wiiu_pipe5_trace(uint32_t event, uint32_t count);
+#else
+static inline void sms_wiiu_pipe5_trace(uint32_t, uint32_t) {}
+#endif
+enum { P5T_END_IN, P5T_END_OUT, P5T_SERVICE_LIST, P5T_FLUSH, P5T_DRAIN_IN,
+       P5T_DRAIN_OUT, P5T_SWAP, P5T_FLIP, P5T_PRESENT_WAIT_IN, P5T_PRESENT_WAIT_OUT,
+       P5T_FENCE_WAIT_IN, P5T_FENCE_WAIT_OUT, P5T_FENCE_ARM, P5T_OWNED,
+       P5T_FALLBACK, P5T_HAZARD, P5T_CONSUME };
 static bool s_drawown;
 static constexpr unsigned kDrawownMaxOwners = 1024;
 static constexpr unsigned kDrawownMaxStack = 32;
@@ -610,6 +806,8 @@ struct TevShader {
     void* psProgram;
     uint32_t textureMask;
     uint32_t foldedStages;
+    uint32_t aluBundles, killed;  // catstats: ALU instruction groups, emits KILL
+    char breakdown[96];           // catstats: groups per generator section
 };
 
 struct VertexKey {
@@ -794,6 +992,10 @@ struct Batch {
     uint32_t count = 0;
     PrimClass cls = PRIM_TRIS;
 };
+static const SmsWiiuJpaFinalVxDesc* s_jpaCheckDesc;
+static bool s_jpaCheckInProgress;
+static bool s_jpaCheckBoundaryFlush;
+static bool s_jpaCheckSplit;
 // These containers must not be constructed by the Wii U image's static
 // initializer.  Cemu reaches that initializer before the port has installed
 // its MEM2 heap, so construct them on the first renderer call instead.
@@ -815,6 +1017,9 @@ struct TextureEntry {
     uint32_t checkedFrame = 0;
     uint64_t dataHash = 0;
     uint64_t tlutHash = 0;
+#if defined(PORT_GAME_SMG)
+    uint32_t streamSerial = 0;
+#endif
     bool hashAlways = false;
     GX2Texture texture;
     GX2Sampler sampler;
@@ -858,6 +1063,78 @@ static std::deque<TextureEntry>& textureCache() {
 #define s_textures (textureCache())
 static uint32_t s_textureGeneration = 1;
 static uint32_t s_texNativeCounts[16];
+#if defined(PORT_GAME_SMG)
+struct TextureStreamSource {
+    const uint8_t* source;
+    uint32_t bytes;
+    uint32_t pitch;
+    bool linear;
+    uint32_t serial;
+};
+static TextureStreamSource s_textureStreams[8] = {};
+static uint32_t s_textureStreamNextSerial;
+static uint32_t s_textureStreamNextSlot;
+static bool s_textureStreamEnabled;
+static volatile uint32_t s_textureStreamRefreshes;
+static volatile uint32_t s_textureStreamHashesSkipped;
+
+static bool textureStreamSerial(const uint8_t* source, uint32_t* bytes, uint32_t* pitch, bool* linear,
+                                uint32_t* serial) {
+    if (!s_textureStreamEnabled || !source) return false;
+    for (const TextureStreamSource& stream : s_textureStreams) {
+        if (stream.source == source) {
+            *bytes = stream.bytes;
+            *pitch = stream.pitch;
+            *linear = stream.linear;
+            *serial = stream.serial;
+            return true;
+        }
+    }
+    return false;
+}
+
+void textureStreamWritten(const void* p, uint32_t bytes) {
+    if (!s_textureStreamEnabled || !p || !bytes) return;
+    const uint8_t* source = static_cast<const uint8_t*>(p);
+    for (TextureStreamSource& stream : s_textureStreams) {
+        if (stream.source == source && stream.bytes == bytes) {
+            stream.serial = ++s_textureStreamNextSerial;
+            return;
+        }
+    }
+    TextureStreamSource& stream = s_textureStreams[s_textureStreamNextSlot++ % 8];
+    stream.source = source;
+    stream.bytes = bytes;
+    stream.pitch = 0;
+    stream.linear = false;
+    stream.serial = ++s_textureStreamNextSerial;
+}
+
+void textureStreamWrittenLinear(const void* p, uint32_t bytes, uint32_t pitch) {
+    if (!s_textureStreamEnabled || !p || !bytes || !pitch) return;
+    const uint8_t* source = static_cast<const uint8_t*>(p);
+    for (TextureStreamSource& stream : s_textureStreams) {
+        if (stream.source == source) {
+            stream.bytes = bytes;
+            stream.pitch = pitch;
+            stream.linear = true;
+            stream.serial = ++s_textureStreamNextSerial;
+            return;
+        }
+    }
+    TextureStreamSource& stream = s_textureStreams[s_textureStreamNextSlot++ % 8];
+    stream.source = source;
+    stream.bytes = bytes;
+    stream.pitch = pitch;
+    stream.linear = true;
+    stream.serial = ++s_textureStreamNextSerial;
+}
+
+void textureStreamStats(uint32_t* refreshes, uint32_t* hashesSkipped) {
+    if (refreshes) *refreshes = s_textureStreamRefreshes;
+    if (hashesSkipped) *hashesSkipped = s_textureStreamHashesSkipped;
+}
+#endif
 // source address -> newest entry for it; every bind looked through all entries.
 static unsigned char s_textureIndexStorage[sizeof(std::unordered_map<const uint8_t*, uint32_t>)]
     __attribute__((aligned(8)));
@@ -875,6 +1152,11 @@ static void* alignedZero(size_t alignment, size_t size) {
     if (p) memset(p, 0, size);
     return p;
 }
+#if defined(PORT_GAME_SMG)
+static void* alignedNoZero(size_t alignment, size_t size) {
+    return MEMAllocFromDefaultHeapEx(uint32_t(size), int(alignment));
+}
+#endif
 
 // `stride` is the number of XF words held by one uniform vector.  Normal
 // matrices are 3x3 with three-word rows, so they are spread one row per
@@ -912,14 +1194,51 @@ static int s_padUniforms;  // shot A/B: 2 = a full upload's volume to unused reg
 static uint32_t s_copyGeneration;  // bumped by every EFB copy (copy rectangles feed the uniforms)
 static bool s_gpuDiag;  // SD marker "perfdiag": GPU timestamps and command-stream counters
 static bool s_uniblock; // SD marker "uniblock": generated shaders use uniform blocks
+#if defined(PORT_GAME_SMG)
+static bool s_vsDense;  // SD marker "vsdense": compact generated vertex GPRs
+#endif
 static bool s_fastState, s_fastLive, s_fastStateCheck;
+static bool s_j3dStateDeltaCheck;
 static uint64_t s_rendererGeneration;
 static uint32_t s_fsReuse, s_fsMiss, s_flReuse, s_fsCheckMismatch;
 void rendererStateWritten() {
+#if defined(PORT_GAME_SMG)
+    if (g_smg_wprof_on) {
+        s_jpaMergePendingDomains |= s_jpaMergeStateDomain ? s_jpaMergeStateDomain : JPA_MERGE_OTHER;
+        s_jpaMergeStateDomain = 0;
+    }
+#endif
     if (s_fastState) ++s_rendererGeneration;
+}
+void jpaMergeNoteBpReg(uint32_t reg) {
+#if defined(PORT_GAME_SMG)
+    if (g_smg_wprof_on) s_jpaMergeBpPending[(reg >> 5) & 7] |= 1u << (reg & 31);
+#else
+    (void)reg;
+#endif
+}
+void rendererStateWriterDomain(uint8_t writerDomain) {
+#if defined(PORT_GAME_SMG)
+    if (g_smg_wprof_on) s_jpaMergePendingDomains |= writerDomain ? writerDomain : JPA_MERGE_OTHER;
+#else
+    (void)writerDomain;
+#endif
 }
 static bool s_shaderModeBlock;
 static bool s_tevFold;  // SD marker "tevfold": fold stable TEV inputs into generated code
+static bool s_tevMulAdd;  // SD marker "tevmuladd" (SMG): exact MULADD forms in the TEV pixel generator
+static bool s_arenaDcbz;  // SD marker "arenadcbz" (SMG): dcbz the compact vertex block and index lists
+static bool s_tevRowPack;  // SD marker "tevrowpack" (SMG, with tevmuladd): both indirect matrix rows per constant address
+static bool s_vxDot4;  // SD marker "vxdot4" (SMG): generated vertex programs use DOT4 groups for dot products
+static bool s_tevIndFast;  // SD marker "tevindfast" (SMG, with tevmuladd): float indirect offsets for the common key
+static bool s_tevPcSkip, s_tevBiasMerge;  // SD markers "tevpcskip"/"tevbiasmerge": testGZ cleanups (visual bug in one, b195)
+static bool s_tevCport;   // SD marker "tevcport" (SMG): R700 constant read-port rule only (no same-channel split)
+// Whether any indirect stage of the key adds the previous stage's coordinate.
+static bool tevKeyUsesIndFb(const TevKey& key) {
+    for (uint32_t s = 0; s < key.stages && s < 16; ++s)
+        if ((key.ind[s] >> 20) & 1) return true;
+    return false;
+}
 static constexpr uint32_t kTevFoldVariantCap = 8;
 bool rendererFastStateUsesTevRegs() { return s_tevFold; }
 
@@ -1037,6 +1356,9 @@ static void bindPixelTexture(GX2Texture* texture, GX2Sampler* sampler, uint32_t 
                      unsigned(sf.imageSize), unsigned(sf.mipLevels), unsigned(sf.use), unsigned(sf.dim));
     }
     if (s_d8NoTex) texture = d8DummyTexture();
+#if defined(PORT_GAME_SMG)
+    else if (s_tinyTex && s_tinyActive) texture = d8DummyTexture();
+#endif
     BoundPixelTexture& b = s_boundPixelTex[unit];
     if (!b.valid || b.image != texture->surface.image || b.mipmaps != texture->surface.mipmaps ||
         b.compMap != texture->compMap ||
@@ -1188,6 +1510,22 @@ static uint32_t s_vertexArenaOverflows;
 static OSTime s_vertexFenceWait;
 static uint32_t s_vertexFenceDiagCount;
 static bool s_vertexArenaInvalidated;
+static constexpr uint32_t kJpaFinalVxSlots = 3;
+static constexpr uint32_t kJpaFinalVxSlotBytes = 512u << 10;
+static uint8_t* s_jpaFinalVxArena;
+static uint32_t s_jpaFinalVxSlot = kJpaFinalVxSlots - 1;
+static uint32_t s_jpaFinalVxUsed;
+static uint32_t s_jpaFinalVxFrame = ~0u;
+static bool s_jpaFinalVxSlotBlocked;
+static uint32_t s_jpaFinalVxInvalidatedArena = ~0u;
+static uint32_t s_jpaFinalVxInvalidatedSlots;
+static volatile uint32_t s_jpaFinalVxAllocFailureReason = SMS_WIIU_JPA_FINALVX_FALLBACK_ALLOC;
+static volatile uint64_t s_jpaSlotFence[kJpaFinalVxSlots];
+static volatile uint32_t s_jpaSlotPending[kJpaFinalVxSlots];
+// SUBMIT records published by core 1 and not yet handled by the worker, per slot:
+// a slot with an outstanding record must never be reused (core 1 could otherwise
+// overwrite a payload the worker has not read yet when it runs >= 3 frames ahead).
+static volatile uint32_t s_jpaSlotOutstanding[kJpaFinalVxSlots];
 static constexpr uint32_t kUniformRingBytes = 16u << 20;
 struct UniformRingCache {
     uint8_t* data;
@@ -1217,16 +1555,24 @@ static constexpr uint32_t kGx2DlReserveBytes = 512u << 10;
 static constexpr uint32_t kGx2DlMaxDraws = 48;
 enum { kDlSplitCopy, kDlSplitClear, kDlSplitContext, kDlSplitFrame };
 static void gx2DlSplit(int reason);
+#if defined(PORT_GAME_SMG)
+// Marker gpucat: GPU timestamps around EFB copies (id 0) and the scan copy (id 1).
+extern "C" void smg_wiiu_gpucat_copy(int begin, int id);
+#define GX2CopySurface(...) (gx2DlSplit(kDlSplitCopy), sms_wiiu_d4_event(D4_EFB_COPY), smg_wiiu_gpucat_copy(1, 0), ::GX2CopySurface(__VA_ARGS__), smg_wiiu_gpucat_copy(0, 0))
+#define GX2CopySurfaceEx(...) (gx2DlSplit(kDlSplitCopy), sms_wiiu_d4_event(D4_EFB_COPY), smg_wiiu_gpucat_copy(1, 0), ::GX2CopySurfaceEx(__VA_ARGS__), smg_wiiu_gpucat_copy(0, 0))
+#define GX2CopyColorBufferToScanBuffer(...) (gx2DlSplit(kDlSplitCopy), sms_wiiu_d4_event(D4_SCAN_COPY), smg_wiiu_gpucat_copy(1, 1), ::GX2CopyColorBufferToScanBuffer(__VA_ARGS__), smg_wiiu_gpucat_copy(0, 1))
+#else
 #define GX2CopySurface(...) (gx2DlSplit(kDlSplitCopy), sms_wiiu_d4_event(D4_EFB_COPY), ::GX2CopySurface(__VA_ARGS__))
 #define GX2CopySurfaceEx(...) (gx2DlSplit(kDlSplitCopy), sms_wiiu_d4_event(D4_EFB_COPY), ::GX2CopySurfaceEx(__VA_ARGS__))
 #define GX2CopyColorBufferToScanBuffer(...) (gx2DlSplit(kDlSplitCopy), sms_wiiu_d4_event(D4_SCAN_COPY), ::GX2CopyColorBufferToScanBuffer(__VA_ARGS__))
+#endif
 #define GX2ClearColor(...) (gx2DlSplit(kDlSplitClear), sms_wiiu_d4_event(D4_CLEAR_COLOR), ::GX2ClearColor(__VA_ARGS__))
 #define GX2ClearDepthStencilEx(...) (gx2DlSplit(kDlSplitClear), sms_wiiu_d4_event(D4_CLEAR_DEPTH), ::GX2ClearDepthStencilEx(__VA_ARGS__))
 #define GX2SetContextState(...) (gx2DlSplit(kDlSplitContext), sms_wiiu_d4_event(D4_CONTEXT), ::GX2SetContextState(__VA_ARGS__))
 #define GX2SetColorBuffer(...) (gx2DlSplit(kDlSplitContext), sms_wiiu_d4_event(D4_TARGET), ::GX2SetColorBuffer(__VA_ARGS__))
 #define GX2SetDepthBuffer(...) (gx2DlSplit(kDlSplitContext), sms_wiiu_d4_event(D4_TARGET), ::GX2SetDepthBuffer(__VA_ARGS__))
 #define GX2DrawDone(...) (gx2DlSplit(kDlSplitFrame), ::GX2DrawDone(__VA_ARGS__), sms_wiiu_d4_submit_at("done", 'r', __LINE__, (::GX2GetLastSubmittedTimeStamp)()))
-#define GX2Flush(...) (gx2DlSplit(kDlSplitFrame), ::GX2Flush(__VA_ARGS__), sms_wiiu_d4_submit_at("flush", 'r', __LINE__, (::GX2GetLastSubmittedTimeStamp)()))
+#define GX2Flush(...) (gx2DlSplit(kDlSplitFrame), ::GX2Flush(__VA_ARGS__), sms_wiiu_pipe5_trace(P5T_FLUSH, 0), sms_wiiu_d4_submit_at("flush", 'r', __LINE__, (::GX2GetLastSubmittedTimeStamp)()))
 #define GX2GetLastSubmittedTimeStamp(...) (gx2DlSplit(kDlSplitFrame), ::GX2GetLastSubmittedTimeStamp(__VA_ARGS__))
 #define GX2WaitTimeStamp(...) (s_dlMerge ? gx2DlSplit(kDlSplitFrame) : (void)0, ::GX2WaitTimeStamp(__VA_ARGS__))
 static uint8_t* s_gx2DlArena[kVertexArenas];
@@ -1423,6 +1769,7 @@ static void freeDeferred(const DeferredFree& entry);
 static void deferFree(void* p, MEMHeapHandle mem1Heap = nullptr, uint32_t imageBytes = 0) {
     if (!p) return;
     if (s_deferredFreeCount == 256) {
+        sms_wiiu_pipe5_wait_resource_fence();
         if (s_gx2ProdEnabled) {
             WHBLogPrintf("SMS Wii U: [gx2prod] deferred-free queue full; retaining resources");
             return;
@@ -1435,13 +1782,19 @@ static void deferFree(void* p, MEMHeapHandle mem1Heap = nullptr, uint32_t imageB
 }
 
 static void beginVertexArena() {
+    // Pipe5 rotates the three arenas only from its ordered end-frame service.
+    // The marker-off path keeps the existing synchronous rotation below.
     s_vertexArenaIndex = (s_vertexArenaIndex + 1) % kVertexArenas;
     s_vertexArenaUsed = 0;
     s_uniformRingUsed[s_vertexArenaIndex] = 0;
     memset(s_uniformRingCache[s_vertexArenaIndex], 0, sizeof(s_uniformRingCache[s_vertexArenaIndex]));
     s_vertexArenaInvalidated = false;
     if (s_vertexArenaFence[s_vertexArenaIndex]) {
+        sms_wiiu_pipe5_trace(P5T_FENCE_WAIT_IN, 0);
         const OSTime t0 = OSGetTime();
+        const uint64_t fenceTimer = sms_wiiu_pipe5_enabled()
+                                         ? smg_gphase_begin_timer(SmgGPhaseTimer_Pipe5VertexFenceWait)
+                                         : 0;
         const OSTime retiredBefore = ::GX2GetRetiredTimeStamp();
         const OSTime fence = s_vertexArenaFence[s_vertexArenaIndex];
         BOOL rc;
@@ -1467,6 +1820,9 @@ static void beginVertexArena() {
         } else {
             rc = GX2WaitTimeStamp(fence);
         }
+        if (fenceTimer)
+            smg_gphase_end_timer(SmgGPhaseTimer_Pipe5VertexFenceWait, fenceTimer);
+        sms_wiiu_pipe5_trace(P5T_FENCE_WAIT_OUT, 0);
         const OSTime elapsed = OSGetTime() - t0;
         s_vertexFenceWait += elapsed;
         if (elapsed > OSMillisecondsToTicks(1) && s_vertexFenceDiagCount < 200) {
@@ -1496,10 +1852,84 @@ static void beginVertexArena() {
     s_deferredFreeCount = kept;
 }
 
-static void endVertexArena() {
-    s_vertexArenaFence[s_vertexArenaIndex] = GX2GetLastSubmittedTimeStamp();
+static void endVertexArena(uint64_t completedFence = 0) {
+    // An unused arena has no GPU user; do not inherit the previous frame's
+    // swap timestamp as its fence.
+    bool jpaSlotPending = false;
+    for (uint32_t i = 0; i < kJpaFinalVxSlots; ++i)
+        jpaSlotPending = jpaSlotPending || s_jpaSlotPending[i] != 0;
+    s_vertexArenaFence[s_vertexArenaIndex] = s_vertexArenaUsed == 0 && !jpaSlotPending
+        ? 0 : (completedFence ? completedFence : GX2GetLastSubmittedTimeStamp());
     if (s_pipe1Marker)
         s_pipe1DlArenaFence[s_pipe1DlArenaSlot] = s_vertexArenaFence[s_vertexArenaIndex];
+    const uint64_t fence = s_vertexArenaFence[s_vertexArenaIndex];
+    for (uint32_t i = 0; i < kJpaFinalVxSlots; ++i) {
+        if (!s_jpaSlotPending[i]) continue;
+        s_jpaSlotFence[i] = fence;
+        __sync_synchronize();
+        s_jpaSlotPending[i] = 0;
+    }
+}
+
+static bool jpaFinalVxSlotReusable(uint32_t slot) {
+    if (s_jpaSlotOutstanding[slot] || s_jpaSlotPending[slot]) return false;
+    const uint64_t fence = s_jpaSlotFence[slot];
+    return fence == 0 || GX2GetRetiredTimeStamp() >= fence;
+}
+
+extern "C" void* sms_wiiu_jpa_finalvx_alloc(uint32_t bytes, uint32_t alignment,
+                                               uint32_t* slotOut) {
+    s_jpaFinalVxAllocFailureReason = SMS_WIIU_JPA_FINALVX_FALLBACK_ALLOC;
+    if (OSGetCoreId() != 1 || bytes == 0 || alignment == 0 || (alignment & (alignment - 1)) != 0) {
+        s_jpaFinalVxAllocFailureReason = SMS_WIIU_JPA_FINALVX_FALLBACK_UNSUPPORTED;
+        return nullptr;
+    }
+    const uint32_t frame = sms_wiiu_frame_count();
+    if (frame != s_jpaFinalVxFrame) {
+        s_jpaFinalVxFrame = frame;
+        s_jpaFinalVxSlot = (s_jpaFinalVxSlot + 1) % kJpaFinalVxSlots;
+        s_jpaFinalVxUsed = 0;
+        s_jpaFinalVxSlotBlocked = !jpaFinalVxSlotReusable(s_jpaFinalVxSlot);
+    }
+    if (s_jpaFinalVxSlotBlocked) {
+        s_jpaFinalVxAllocFailureReason = SMS_WIIU_JPA_FINALVX_FALLBACK_SLOT_BUSY;
+        return nullptr;
+    }
+    if (bytes > kJpaFinalVxSlotBytes) {
+        s_jpaFinalVxAllocFailureReason = SMS_WIIU_JPA_FINALVX_FALLBACK_SLOT_FULL;
+        return nullptr;
+    }
+    if (!s_jpaFinalVxArena)
+        return nullptr;
+    const uint32_t aligned = (s_jpaFinalVxUsed + alignment - 1) & ~(alignment - 1);
+    if (aligned > kJpaFinalVxSlotBytes || bytes > kJpaFinalVxSlotBytes - aligned) {
+        s_jpaFinalVxAllocFailureReason = SMS_WIIU_JPA_FINALVX_FALLBACK_SLOT_FULL;
+        return nullptr;
+    }
+    uint8_t* slotBase = s_jpaFinalVxArena + size_t(s_jpaFinalVxSlot) * kJpaFinalVxSlotBytes;
+    void* result = slotBase + aligned;
+    s_jpaFinalVxUsed = aligned + bytes;
+    if (slotOut) *slotOut = s_jpaFinalVxSlot;
+    return result;
+}
+
+extern "C" unsigned sms_wiiu_jpa_finalvx_alloc_failure_reason(void) {
+    return s_jpaFinalVxAllocFailureReason;
+}
+
+extern "C" void sms_wiiu_jpa_finalvx_slot_pending(uint32_t slot) {
+    if (slot < kJpaFinalVxSlots) {
+        __sync_lock_test_and_set(&s_jpaSlotPending[slot], 1u);
+        __sync_synchronize();
+    }
+}
+
+static void initJpaFinalVxArena() {
+    if (s_jpaFinalVxArena || !s_jpaFinalVxMarker) return;
+    s_jpaFinalVxArena = static_cast<uint8_t*>(MEMAllocFromDefaultHeapEx(
+        kJpaFinalVxSlots * kJpaFinalVxSlotBytes, 256));
+    if (!s_jpaFinalVxArena)
+        WHBLogPrintf("SMS Wii U: [jpafinalvx] payload arena allocation failed");
 }
 
 static float* allocVertices(uint32_t bytes) {
@@ -1547,11 +1977,12 @@ static void setGeneratedShaderMode(bool block) {
     if (!s_uniblock || s_shaderModeBlock == block) return;
     rendererStateWritten();
     GX2SetShaderModeEx(block ? GX2_SHADER_MODE_UNIFORM_BLOCK : GX2_SHADER_MODE_UNIFORM_REGISTER,
-                       64, 64, 0, 0, 184, 192);
+                       s_vsGprPool, 64, 0, 0, s_psGprPool, 192);
     s_shaderModeBlock = block;
 }
 
 static void destroyShader(FixedShader& shader) {
+    sms_wiiu_pipe5_wait_resource_fence();
     MEMFreeToDefaultHeap(shader.vsProgram);
     MEMFreeToDefaultHeap(shader.psProgram);
     MEMFreeToDefaultHeap(shader.fetch.program);
@@ -1573,6 +2004,7 @@ static void addAttribute(FixedShader& shader, uint32_t location, uint32_t compon
 static bool initShader(FixedShader& shader, const unsigned char* vs, size_t vsSize,
                        const uint32_t* vsRegs, const unsigned char* ps, size_t psSize,
                        const uint32_t* psRegs, bool textured) {
+    sms_wiiu_pipe5_wait_resource_fence();
     memset(&shader, 0, sizeof(shader));
     shader.textured = textured;
     shader.vsProgram = alignedZero(GX2_SHADER_PROGRAM_ALIGNMENT, vsSize);
@@ -1856,7 +2288,10 @@ static uint32_t tevSwapChannel(const TevKey& k, uint32_t table, uint32_t channel
 // The colour channels (and alpha, when its equation has the same shape) run
 // as one instruction group per operation, one slot per channel.
 #if defined(PORT_GAME_SMG)
-static const uint32_t kTevUniforms = 48;
+// C48-C53 (SMG): the three indirect matrices pre-scaled to texels for the
+// tevindfast path: C48+2m = (m00, m10, m01, m11) * s / 1024, C49+2m = (m02,
+// m12, 0, 0) * s / 1024 (s = the exponent's power of two).
+static const uint32_t kTevUniforms = 54;
 #else
 static const uint32_t kTevUniforms = 47;
 #endif
@@ -1986,6 +2421,8 @@ struct TevIns {
     uint64_t code;
     uint32_t dstCh;
     TevSource s0, s1;
+    TevSource s2;   // OP3 (MULADD) only, read in cycle 2
+    bool has2;
 };
 
 static bool tevIsGpr(TevSource s) { return (s.sel & 0x1fff & ~(1u << 12)) < 128; }
@@ -2000,15 +2437,17 @@ static uint32_t tevSelNoNeg(TevSource s) { return s.sel & ~(1u << 12); }
 static bool tevFits(const std::vector<TevIns>& group, const TevIns& ins) {
     for (const TevIns& g : group) {
         if (g.dstCh == ins.dstCh) return false;
-        const TevSource gs[2] = {g.s0, g.s1}, is[2] = {ins.s0, ins.s1};
-        for (int cyc = 0; cyc < 2; ++cyc) {
-            for (int j = 0; j < 2; ++j) {
+        const TevSource gs[3] = {g.s0, g.s1, g.s2}, is[3] = {ins.s0, ins.s1, ins.s2};
+        const int gn = g.has2 ? 3 : 2, in = ins.has2 ? 3 : 2;
+        for (int cyc = 0; cyc < in; ++cyc) {
+            for (int j = 0; j < gn; ++j) {
                 const TevSource a = gs[j], b = is[cyc];
                 // GPR ports, per cycle
                 if (j == cyc && tevIsGpr(a) && tevIsGpr(b) && a.chan == b.chan &&
                     tevSelNoNeg(a) != tevSelNoNeg(b)) return false;
-                // constant ports, any cycle
-                if (tevIsConst(a) && tevIsConst(b) && a.chan == b.chan && tevSelNoNeg(a) != tevSelNoNeg(b))
+                // constant ports, any cycle (marker tevcport: R700 only limits the
+                // group to two (address, xy|zw) ports, Mesa reserve_cfile, checked below)
+                if (!s_tevCport && tevIsConst(a) && tevIsConst(b) && a.chan == b.chan && tevSelNoNeg(a) != tevSelNoNeg(b))
                     return false;
             }
         }
@@ -2020,8 +2459,8 @@ static bool tevFits(const std::vector<TevIns>& group, const TevIns& ins) {
             if (consts[i][0] == tevSelNoNeg(s) && consts[i][1] == s.chan / 2) return;
         if (n < 8) { consts[n][0] = tevSelNoNeg(s); consts[n][1] = s.chan / 2; ++n; }
     };
-    for (const TevIns& g : group) { add(g.s0); add(g.s1); }
-    add(ins.s0); add(ins.s1);
+    for (const TevIns& g : group) { add(g.s0); add(g.s1); if (g.has2) add(g.s2); }
+    add(ins.s0); add(ins.s1); if (ins.has2) add(ins.s2);
     return n <= 2;
 }
 
@@ -2049,6 +2488,10 @@ static TevIns tevOp1(uint32_t inst, uint32_t dst, uint32_t ch, TevSource s0) {
     return {ALU_OP2(inst, _R(dst), ch, s0.sel, s0.chan, ALU_SRC_0, 0, ALU_OMOD_OFF), ch, s0, {ALU_SRC_0, 0}};
 }
 static TevSource tevNeg(TevSource s) { return {s.sel | (1u << 12), s.chan}; }
+static constexpr uint32_t kOp3MulAdd = ALU_OP3_INST_MULADD;
+static TevIns tevOp3(uint32_t inst, uint32_t dst, uint32_t ch, TevSource s0, TevSource s1, TevSource s2) {
+    return {ALU_OP3(inst, _R(dst), ch, s0.sel, s0.chan, s1.sel, s1.chan, s2.sel, s2.chan), ch, s0, s1, s2, true};
+}
 static TevSource tevC(uint32_t reg, uint32_t chan) { return {_GX2_C(reg), chan}; }
 static TevSource tevG(uint32_t gpr, uint32_t chan) { return {_R(gpr), chan}; }
 enum : uint32_t { kOpAdd = 0x0, kOpMul = 0x1, kOpMax = 0x3, kOpMin = 0x4, kOpRndne = 0x13, kOpFloor = 0x14, kOpMov = 0x19 };
@@ -2155,6 +2598,18 @@ static void vertexEmitDot4(std::vector<uint64_t>& ops, uint32_t dst, uint32_t ds
     // matrix rows and lighting vectors; scalar multiply-adds avoid DOT4's
     // reduction broadcast clobbering the other components under Cemu's
     // legacy decompiler.
+#if defined(PORT_GAME_SMG)
+    // Marker vxdot4 (hardware): one DOT4 group instead of four serial groups;
+    // only the destination channel's slot writes (the others are masked).
+    // Planet draws are vertex-bound (b201); programs are 110-336 groups.
+    if (s_vxDot4) {
+        vertexEmit(ops, {ALU_DOT4(dstChan == 0 ? _R(dst) : __, _x, src0, _x, src1, _x),
+                         ALU_DOT4(dstChan == 1 ? _R(dst) : __, _y, src0, _y, src1, _y),
+                         ALU_DOT4(dstChan == 2 ? _R(dst) : __, _z, src0, _z, src1, _z),
+                         ALU_DOT4(dstChan == 3 ? _R(dst) : __, _w, src0, _w, src1, _w)});
+        return;
+    }
+#endif
     vertexEmit(ops, {ALU_MUL(_R(dst), dstChan, src0, _x, src1, _x)});
     vertexEmit(ops, {ALU_MULADD(_R(dst), dstChan, src0, _y, src1, _y, _R(dst), dstChan)});
     vertexEmit(ops, {ALU_MULADD(_R(dst), dstChan, src0, _z, src1, _z, _R(dst), dstChan)});
@@ -2599,7 +3054,70 @@ static uint64_t blockAluExtended(const UniformClauseLayout& layout) {
                     CF_ALU_EXT_WORD1(0, 0, 0, CF_INST_ALU_EXT));
 }
 
+#if defined(PORT_GAME_SMG)
+// Keep the dense pass at the last common boundary: block-mode source
+// rewriting is complete, while the ALU/export vectors are still separate from
+// the program allocation.  The input vectors are only replaced after the
+// helper and its independent final decode both accept the candidate.
+static bool compactGeneratedVertexProgram(std::vector<uint64_t>& alu,
+                                          std::vector<uint64_t>& exports,
+                                          smg_vs_dense::DenseResult& result) {
+    std::vector<uint32_t> aluWords;
+    std::vector<uint32_t> groupOffsets;
+    std::vector<uint32_t> exportWords;
+    aluWords.reserve(alu.size() * 2);
+    groupOffsets.reserve(alu.size());
+    for (size_t at = 0; at < alu.size();) {
+        groupOffsets.push_back(uint32_t(at));
+        bool ended = false;
+        do {
+            const uint64_t op = alu[at++];
+            const uint32_t word0 = __builtin_bswap32(uint32_t(op >> 32));
+            aluWords.push_back(word0);
+            const uint32_t word1 = __builtin_bswap32(uint32_t(op));
+            aluWords.push_back(word1);
+            ended = (word0 & (1u << 31)) != 0;
+        } while (at < alu.size() && !ended);
+        if (!ended) {
+            result = {};
+            result.reason = "malformed-groups";
+            return false;
+        }
+    }
+    for (uint64_t op : exports) {
+        exportWords.push_back(__builtin_bswap32(uint32_t(op >> 32)));
+        exportWords.push_back(__builtin_bswap32(uint32_t(op)));
+    }
+    smg_vs_dense::DenseInput input = {
+        aluWords.data(), aluWords.size(), groupOffsets.data(), groupOffsets.size(),
+        exportWords.data(), exports.size(), 14,
+    };
+    if (!smg_vs_dense::compactGeneratedVertexGprs(input, result)) return false;
+
+    // This is intentionally a second decode at the runtime boundary.  The
+    // helper also checks itself, but keeping this assertion beside publication
+    // prevents a future caller from bypassing the final-word invariant.
+    smg_vs_dense::DenseResult checked = {};
+    if (!smg_vs_dense::measureDenseProgram(input, checked) ||
+        !checked.accepted || checked.declaredCount != result.declaredCount ||
+        checked.declaredCount != checked.physicalMaximum + 1 ||
+        checked.declaredCount > smg_vs_dense::kVsDenseHardMaxCount) {
+        result = checked;
+        result.accepted = false;
+        result.reason = "runtime-self-check";
+        return false;
+    }
+    result = checked;
+    for (size_t i = 0; i < alu.size(); ++i)
+        alu[i] = to_QWORD(to_LE(aluWords[2 * i]), to_LE(aluWords[2 * i + 1]));
+    for (size_t i = 0; i < exports.size(); ++i)
+        exports[i] = to_QWORD(to_LE(exportWords[2 * i]), to_LE(exportWords[2 * i + 1]));
+    return true;
+}
+#endif
+
 static bool initVertexProgram(VertexProgram& shader) {
+    sms_wiiu_pipe5_wait_resource_fence();
     s_vertexRejectReason = "unknown";
     if (!vertexKeySupported(shader.key)) {
         s_vertexRejectReason = "key-range";
@@ -2865,6 +3383,29 @@ static bool initVertexProgram(VertexProgram& shader) {
             blockExtra += blockLayouts[clause].extended ? 1 : 0;
         }
     }
+#if defined(PORT_GAME_SMG)
+    uint32_t denseDeclaredCount = 64;
+    if (s_vsDense) {
+        smg_vs_dense::DenseResult denseResult = {};
+        if (compactGeneratedVertexProgram(alu, exports, denseResult)) {
+            denseDeclaredCount = denseResult.declaredCount;
+            WHBLogPrintf("SMG Wii U: [vsdense] key=%u/%u/%u/%u logical=%u physical=%u declared=%u path=%s",
+                         unsigned(key.outputMode), unsigned(key.fixedCoord), unsigned(key.fixedTextured),
+                         unsigned(key.uniformMode), unsigned(denseResult.logicalMaximum),
+                         unsigned(denseResult.physicalMaximum), unsigned(denseResult.declaredCount),
+                         denseResult.declaredCount <= smg_vs_dense::kVsDenseTargetCount ? "target" : "hard-ceiling");
+        } else {
+            // The original vectors were not modified on failure.  Publish
+            // them with the marker-off declaration for this key and retain a
+            // bounded diagnostic rather than binding an unproven candidate.
+            WHBLogPrintf("SMG Wii U: [vsdense] fallback key=%u/%u/%u/%u logical=%u physical=%u declared=%u reason=%s",
+                         unsigned(key.outputMode), unsigned(key.fixedCoord), unsigned(key.fixedTextured),
+                         unsigned(key.uniformMode), unsigned(denseResult.logicalMaximum),
+                         unsigned(denseResult.physicalMaximum), unsigned(denseResult.declaredCount),
+                         denseResult.reason ? denseResult.reason : "unknown");
+        }
+    }
+#endif
     const size_t cfCount = 1 + clauses + blockExtra + exports.size();
     const size_t aluOffset = (cfCount + 1) & ~size_t(1);
     std::vector<uint64_t> program(aluOffset, 0);
@@ -2894,7 +3435,14 @@ static bool initVertexProgram(VertexProgram& shader) {
     }
     memcpy(shader.vsProgram, program.data(), bytes);
     memset(&shader.vertex, 0, sizeof(shader.vertex));
+#if defined(PORT_GAME_SMG)
+    if (s_vsDense)
+        shader.vertex.regs.sq_pgm_resources_vs = denseDeclaredCount | (1u << 8);
+    else
+        shader.vertex.regs.sq_pgm_resources_vs = 64 | (1u << 8);
+#else
     shader.vertex.regs.sq_pgm_resources_vs = 64 | (1u << 8);
+#endif
     shader.vertex.regs.spi_vs_out_config = key.outputMode ? (4 << 1) : (9 << 1);
     shader.vertex.regs.num_spi_vs_out_id = 3;
     memset(shader.vertex.regs.spi_vs_out_id, 0xff, sizeof(shader.vertex.regs.spi_vs_out_id));
@@ -2975,6 +3523,109 @@ static bool initVertexProgram(VertexProgram& shader) {
 // constant attribute element in buffer 1.  The generated vertex programs read
 // the same 13 locations as the raw HostVertex fetch ABI.
 static bool s_compactVx;
+static bool jpaFinalVxGate() {
+    return s_jpaFinalVxMarker && s_gx2ProdEnabled && s_compactVx && s_gpuXfEnabled &&
+           s_ready && s_jpaFinalVxCompactWarmed && !s_pipe5Marker && !s_pipe2Marker;
+}
+static bool flushAndPublishJpaFinalVx(const SmsWiiuJpaFinalVxDesc* desc, uint8_t phase) {
+    if (!desc || !desc->vertices || !desc->indices || !desc->vertexBytes || !desc->indexBytes ||
+        !s_gx2ProdEnabled || OSGetCoreId() != 1) return false;
+    DCFlushRange(const_cast<uint8_t*>(desc->vertices), desc->vertexBytes);
+    DCFlushRange(const_cast<uint32_t*>(desc->indices), desc->indexBytes);
+    DCFlushRange(const_cast<uint8_t*>(desc->compactDefaults), sizeof(desc->compactDefaults));
+    DCFlushRange(const_cast<SmsWiiuJpaFinalVxDesc*>(desc), sizeof(*desc));
+    const bool submit = phase == SMS_WIIU_JPA_FINALVX_SUBMIT && desc->slot < kJpaFinalVxSlots;
+    if (submit) __sync_fetch_and_add(&s_jpaSlotOutstanding[desc->slot], 1u);
+    const bool ok = producerHostStateTry(kHostJpaFinalVx, phase,
+                                         static_cast<uint32_t>(reinterpret_cast<uintptr_t>(desc)));
+    if (!ok && submit) __sync_fetch_and_sub(&s_jpaSlotOutstanding[desc->slot], 1u);
+    return ok;
+}
+extern "C" bool sms_wiiu_jpa_finalvx_begin_check(const SmsWiiuJpaFinalVxDesc* desc) {
+    return flushAndPublishJpaFinalVx(desc, SMS_WIIU_JPA_FINALVX_BEGIN_CHECK);
+}
+extern "C" bool sms_wiiu_jpa_finalvx_submit(const SmsWiiuJpaFinalVxDesc* desc) {
+#if defined(PORT_GAME_SMG)
+    if ((s_jpaCullStatsMarker || s_jpaThinOffMarker || s_jpaThinMarker) &&
+        desc && OSGetCoreId() == 1) {
+        JpaCullClass cls;
+        if (jpaCullClassify(desc, &cls)) {
+            if (s_jpaCullStatsMarker) jpaCullStatsSubmit(desc, cls);
+            if ((s_jpaThinOffMarker || s_jpaThinMarker) && !cls.ortho) {
+                ++s_jpaThinRuns;
+                if (cls.off) { ++s_jpaThinOffSkip; return true; }
+                if (s_jpaThinMarker && s_jpaThinLoaded && cls.area < 1024) {
+                    ++s_jpaThinSmallSkip;
+                    return true;
+                }
+            }
+        }
+    }
+#endif
+    return flushAndPublishJpaFinalVx(desc, SMS_WIIU_JPA_FINALVX_SUBMIT);
+}
+static void drawJpaFinalVx(const SmsWiiuJpaFinalVxDesc* desc);
+void jpaFinalVxBeginCheck(const SmsWiiuJpaFinalVxDesc* desc) {
+    s_jpaCheckInProgress = false;
+    s_jpaCheckSplit = false;
+    if (!desc) return;
+    s_jpaCheckBoundaryFlush = true;
+    flushBatch();
+    s_jpaCheckBoundaryFlush = false;
+    s_jpaCheckDesc = desc;
+    s_jpaCheckInProgress = true;
+    sms_wiiu_jpa_finalvx_slot_pending(desc->slot);
+    sms_wiiu_jpa_finalvx_check_run();
+}
+void jpaFinalVxSubmit(const SmsWiiuJpaFinalVxDesc* desc) {
+    if (!desc) return;
+    sms_wiiu_jpa_finalvx_slot_pending(desc->slot);
+    if (desc->slot < kJpaFinalVxSlots) __sync_fetch_and_sub(&s_jpaSlotOutstanding[desc->slot], 1u);
+    if (s_jpaCheckInProgress && s_jpaCheckDesc == desc) {
+        if (s_jpaCheckSplit) {
+            sms_wiiu_jpa_finalvx_fallback(SMS_WIIU_JPA_FINALVX_FALLBACK_CHECK_SPLIT);
+            s_jpaCheckInProgress = false;
+            flushBatch();
+            s_jpaCheckDesc = nullptr;
+            return;
+        }
+        const uint32_t normalVertices = s_batch.stride ? uint32_t(s_batch.vertices.size() / s_batch.stride) : 0;
+        const uint32_t normalIndices = uint32_t(s_batch.indices.size());
+        const char* mismatch = nullptr;
+        if (s_batch.fmt != desc->packedFmt) mismatch = "format";
+        else if (s_batch.stride != desc->vertexStride) mismatch = "stride";
+        else if (uint32_t(s_batch.cls) != desc->primitiveClass) mismatch = "primitive";
+        else if (normalVertices != desc->vertexCount) mismatch = "vertex-count";
+        else if (normalIndices != desc->indexCount) mismatch = "index-count";
+        else if (desc->vertexBytes != s_batch.vertices.size()) mismatch = "vertex-bytes";
+        else if (desc->indexBytes != s_batch.indices.size() * sizeof(uint32_t)) mismatch = "index-bytes";
+        else if (memcmp(s_batch.vertices.data(), desc->vertices, desc->vertexBytes) != 0) mismatch = "vertex";
+        else if (memcmp(s_batch.indices.data(), desc->indices, desc->indexBytes) != 0) mismatch = "index";
+        s_jpaCheckInProgress = false;
+        s_jpaCheckDesc = nullptr;
+        if (mismatch) {
+            sms_wiiu_jpa_finalvx_check_mismatch(mismatch);
+        }
+        // Check mode validates the producer record and slot bookkeeping, but
+        // always renders the normal batch so it cannot alter draw ordering.
+        flushBatch();
+        return;
+    }
+    if (!s_batch.indices.empty()) flushBatch();
+    drawJpaFinalVx(desc);
+}
+extern "C" int sms_wiiu_jpa_finalvx_enabled(void) {
+    return jpaFinalVxGate() ? 1 : 0;
+}
+extern "C" int sms_wiiu_jpa_finalvx_check_enabled(void) {
+    return jpaFinalVxGate() && s_jpaFinalVxCheckMarker ? 1 : 0;
+}
+extern "C" int sms_wiiu_jpa_finalvx_billboard_enabled(void) {
+    return s_jpaFinalVxNoBillboardMarker ? 0 : 1;
+}
+extern "C" int sms_wiiu_jpa_finalvx_native_quads(void) {
+    return s_nativeQuads ? 1 : 0;
+}
 struct CompactFetch {
     uint32_t fmt;
     bool ok;
@@ -2988,6 +3639,7 @@ static GX2FetchShader* compactFetchFor(uint32_t fmt) {
     for (uint32_t i = 0; i < s_compactFetchCount; ++i)
         if (s_compactFetch[i].fmt == fmt) return s_compactFetch[i].ok ? &s_compactFetch[i].fetch : nullptr;
     if (s_compactFetchCount == sizeof(s_compactFetch) / sizeof(s_compactFetch[0])) return nullptr;
+    sms_wiiu_pipe5_wait_resource_fence();
     CompactFetch& c = s_compactFetch[s_compactFetchCount++];
     c.fmt = fmt;
     c.ok = false;
@@ -3057,11 +3709,15 @@ static GX2FetchShader* compactFetchFor(uint32_t fmt) {
 static ShaderKeyIndex<VertexProgram> s_vertexProgramIndex;
 
 static VertexProgram* vertexShaderForKey(const VertexKey& key) {
+#if defined(PORT_GAME_SMG)
+    SmgWProfScope wprof(SmgWBucket_Shader);
+#endif
     const uint32_t hash = shaderKeyHash(key);
     if (VertexProgram* hit = s_vertexProgramIndex.find(key, hash)) return hit->failed ? nullptr : hit;
     if (s_vertexProgramIndex.full)
         for (VertexProgram* shader : s_vertexPrograms)
             if (!memcmp(&shader->key, &key, sizeof(key))) return shader->failed ? nullptr : shader;
+    sms_wiiu_pipe5_wait_resource_fence();
     VertexProgram* shader = new VertexProgram();
     memset(shader, 0, sizeof(*shader));
     shader->key = key;
@@ -3326,7 +3982,24 @@ struct TevStep {
     int dst;          // 0..2: temporary, 3: the destination
     TevSource s0, s1;
     uint32_t omod;
+    TevSource s2;     // MULADD only (has2): dst = s0 * s1 + s2
+    bool has2;
 };
+// One OP3 instruction: at most two constant-file read ports (address, xy|zw)
+// and no two constants on one channel from different addresses.
+static bool tevOp3Ok(TevSource s0, TevSource s1, TevSource s2) {
+    const TevSource s[3] = {s0, s1, s2};
+    uint32_t addr[3][2], n = 0;
+    for (int i = 0; i < 3; ++i) {
+        if (!tevIsConst(s[i])) continue;
+        for (int j = 0; j < i; ++j)
+            if (!s_tevCport && tevIsConst(s[j]) && s[j].chan == s[i].chan && tevSelNoNeg(s[j]) != tevSelNoNeg(s[i])) return false;
+        bool seen = false;
+        for (uint32_t k = 0; k < n; ++k) seen |= addr[k][0] == tevSelNoNeg(s[i]) && addr[k][1] == s[i].chan / 2;
+        if (!seen) { addr[n][0] = tevSelNoNeg(s[i]); addr[n][1] = s[i].chan / 2; ++n; }
+    }
+    return n <= 2;
+}
 static bool tevConstConflict(TevSource a, TevSource b) {
     return tevIsConst(a) && tevIsConst(b) && a.chan == b.chan && tevSelNoNeg(a) != tevSelNoNeg(b);
 }
@@ -3366,27 +4039,51 @@ static void tevChannelSteps(std::vector<TevStep>& st, const TevPart& t, uint32_t
         st.back().dst = 3;
         return;
     }
+    // MULADD form (s_tevMulAdd): the same integers, fewer instruction groups.
+    // Every value is an integer below 2^19 (or one with 8 fraction bits after
+    // the / 256), so each multiply and add is exact in fp32, fused or not, and
+    // d + floor(x / 256) == floor(x / 256 + d) for the integer d.
+    auto op3 = [&](int dst, TevSource s0, TevSource s1, TevSource s2) {
+        if (!tevOp3Ok(s0, s1, s2)) return false;
+        st.push_back({kOp3MulAdd, dst, s0, s1, ALU_OMOD_OFF, s2, true});
+        return true;
+    };
+    bool dDone = false;
     if (t.lerp == kLerpA) cur = a;
     else if (t.lerp == kLerpB) cur = b;
     else {
         // C' = C + (C >= 128)
         op(ALU_OP2_INST_SETGE, 0, c, k128(c));
         op(kOpAdd, 0, c, T(0));
+        bool rounded = false;  // + 128 already added
         if (t.lerp == kLerpAZero) {
-            op(kOpMul, 1, b, T(0));
+            if (s_tevMulAdd && op3(1, b, T(0), k128(b))) rounded = true;
+            else op(kOpMul, 1, b, T(0));
         } else {
             op(kOpAdd, 1, b, tevNeg(a));
-            op(kOpMul, 1, T(1), T(0));
-            op(kOpMul, 2, a, tevC(12, _x));
-            op(kOpAdd, 1, T(1), T(2));
+            if (s_tevMulAdd && tevOp3Ok(a, tevC(12, _x), tevC(12, _z))) {
+                op3(2, a, tevC(12, _x), tevC(12, _z));   // a * 256 + 128
+                op3(1, T(1), T(0), T(2));                // (b - a) * C' + a * 256 + 128
+                rounded = true;
+            } else {
+                op(kOpMul, 1, T(1), T(0));
+                op(kOpMul, 2, a, tevC(12, _x));
+                op(kOpAdd, 1, T(1), T(2));
+            }
         }
-        op(kOpAdd, 1, T(1), tevC(11, _y));
-        op(kOpMul, 1, T(1), tevC(12, _y));
+        if (!rounded) op(kOpAdd, 1, T(1), tevC(11, _y));
+        if (s_tevMulAdd && !t.lerpZero && !t.dZero && !t.op && op3(1, T(1), tevC(12, _y), d)) {
+            dDone = true;  // x / 256 + d
+        } else {
+            op(kOpMul, 1, T(1), tevC(12, _y));
+        }
         op(kOpFloor, 1, T(1), {ALU_SRC_0, 0});
         cur = T(1);
     }
     if (t.lerpZero) {
         cur = d;
+    } else if (dDone) {
+        // d was added before the floor
     } else if (t.dZero) {
         if (t.op) op(kOpAdd, 1, {ALU_SRC_0, 0}, tevNeg(cur));
         if (t.op) cur = T(1);
@@ -3424,7 +4121,8 @@ static void tevEmitSteps(std::vector<uint64_t>& program, std::vector<TevStep>* s
             if (k < skip) continue;
             const TevStep& st = steps[i][k - skip];
             const uint32_t to = st.dst == 3 ? dst : s_ra.t[st.dst];
-            g.push_back(tevOp(st.inst, to, chs[i], st.s0, st.s1, st.omod));
+            g.push_back(st.has2 ? tevOp3(st.inst, to, chs[i], st.s0, st.s1, st.s2)
+                                : tevOp(st.inst, to, chs[i], st.s0, st.s1, st.omod));
         }
         tevEmitGroup(program, g);
         g.clear();
@@ -3432,6 +4130,7 @@ static void tevEmitSteps(std::vector<uint64_t>& program, std::vector<TevStep>* s
 }
 
 static bool initTevVertex() {
+    sms_wiiu_pipe5_wait_resource_fence();
     std::vector<uint64_t> program;
     program.reserve(64);
     program.push_back(CALL_FS NO_BARRIER);
@@ -3590,7 +4289,14 @@ static void tevEmitIndirectStage(std::vector<uint64_t>& program, const TevKey& k
     auto flush = [&]() { tevEmitGroup(program, g); g.clear(); };
     // The lookup is (a, b, g): s, t, u.
     const TevSource in[3] = {tevG(I, _w), tevG(I, _z), tevG(I, _y)};
-    if (fmt == 0) {
+    bool biasDone = false;
+    if (fmt == 0 && bias && s_tevMulAdd && s_tevBiasMerge) {
+        // The copy and the bias in one group (the bump below reads the lookup, not V).
+        for (uint32_t c = 0; c < 3; ++c)
+            g.push_back((bias & (1u << c)) ? tevOp(kOpAdd, V, c, in[c], tevC(14, _x)) : tevOp1(kOpMov, V, c, in[c]));
+        flush();
+        biasDone = true;
+    } else if (fmt == 0) {
         for (uint32_t c = 0; c < 3; ++c) g.push_back(tevOp1(kOpMov, V, c, in[c]));
         flush();
     } else {
@@ -3601,10 +4307,16 @@ static void tevEmitIndirectStage(std::vector<uint64_t>& program, const TevKey& k
         flush();
         for (uint32_t c = 0; c < 3; ++c) g.push_back(tevOp1(kOpFloor, V, c, tevG(V, c)));
         flush();
-        for (uint32_t c = 0; c < 3; ++c) g.push_back(tevOp(kOpMul, V, c, tevG(V, c), size));
-        flush();
-        for (uint32_t c = 0; c < 3; ++c) g.push_back(tevOp(kOpAdd, V, c, in[c], tevNeg(tevG(V, c))));
-        flush();
+        if (s_tevMulAdd && tevOp3Ok(tevG(V, 0), tevNeg(size), in[0])) {
+            // in - floor(in / size) * size; size is a power of two, so exact
+            for (uint32_t c = 0; c < 3; ++c) g.push_back(tevOp3(kOp3MulAdd, V, c, tevG(V, c), tevNeg(size), in[c]));
+            flush();
+        } else {
+            for (uint32_t c = 0; c < 3; ++c) g.push_back(tevOp(kOpMul, V, c, tevG(V, c), size));
+            flush();
+            for (uint32_t c = 0; c < 3; ++c) g.push_back(tevOp(kOpAdd, V, c, in[c], tevNeg(tevG(V, c))));
+            flush();
+        }
     }
     if (bs) {
         // bumpA = (s, s, t, u)[bs] & 0xf8 of the unmasked lookup; y: bumpA | bumpA >> 5
@@ -3616,12 +4328,32 @@ static void tevEmitIndirectStage(std::vector<uint64_t>& program, const TevKey& k
         g.push_back(tevOp1(kOpFloor, P, _y, tevG(P, _y))); flush();
         g.push_back(tevOp(kOpAdd, P, _y, tevG(P, _y), tevG(P, _x))); flush();
     }
-    if (bias) {
+    if (bias && !biasDone) {
         const TevSource bv = fmt == 0 ? tevC(14, _x) : TevSource{ALU_SRC_1, _x};
         for (uint32_t c = 0; c < 3; ++c)
             if (bias & (1u << c)) g.push_back(tevOp(kOpAdd, V, c, tevG(V, c), bv));
         flush();
     }
+#if defined(PORT_GAME_SMG)
+    // Marker tevindfast: the common key (format 0, no bump, no wrap, no
+    // add-previous anywhere, a matrix) in float: the base-texel round trip is
+    // the identity, so scoord = coord + (M . V) * s / 1024 * k / size, without
+    // GX's 1/128-texel floors and 24-bit wrap (sub-texel differences only).
+    if (s_tevIndFast && s_tevMulAdd && fmt == 0 && bs == 0 && sw == 0 && tw == 0 && !fb && mid >= 1 && mid <= 3 &&
+        !tevKeyUsesIndFb(key)) {
+        const uint32_t m = mid - 1, f0 = 48 + 2 * m, f1 = 49 + 2 * m;
+        for (uint32_t r = 0; r < 2; ++r) g.push_back(tevOp(kOpMul, T, r, tevC(f0, r), tevG(V, _x)));
+        flush();
+        for (uint32_t r = 0; r < 2; ++r) g.push_back(tevOp3(kOp3MulAdd, T, r, tevC(f0, 2 + r), tevG(V, _y), tevG(T, r)));
+        flush();
+        for (uint32_t r = 0; r < 2; ++r) g.push_back(tevOp3(kOp3MulAdd, T, r, tevC(f1, r), tevG(V, _z), tevG(T, r)));
+        flush();
+        for (uint32_t c = 0; c < 2; ++c)
+            g.push_back(tevOp3(kOp3MulAdd, ra.scoord[stage], c, tevG(T, c), tevC(31 + map, c), tevG(ra.coord[coord], c)));
+        flush();
+        return;
+    }
+#endif
     // The base coordinate in texels of the map: (uv - o) * size / k.
     const TevSource A = tevC(23 + map, 0);
     g.push_back(tevOp(kOpAdd, B, _x, tevG(ra.coord[coord], _x), tevNeg(tevC(23 + map, _x))));
@@ -3655,25 +4387,54 @@ static void tevEmitIndirectStage(std::vector<uint64_t>& program, const TevKey& k
         // exponent, kept to 24 bits, in 1/128 texels.
         const uint32_t m = mid - 1;
         const uint32_t row[2] = {17 + 2 * m, 18 + 2 * m};
-        for (uint32_t r = 0; r < 2; ++r) g.push_back(tevOp(kOpMul, T, r, tevC(row[r], _x), tevG(V, _x)));
+        // Marker tevrowpack: C17+2m = (m00, m10, m01, m11), C18+2m = (m02,
+        // m12, scale, 0), so both rows of a column come from one address on
+        // different channels and share a group under the constant-port rules.
+        const bool pack = s_tevRowPack && s_tevMulAdd;
+        auto col = [&](uint32_t c, uint32_t r) -> TevSource {
+            if (!pack) return tevC(row[r], c);
+            return c < 2 ? tevC(row[0], 2 * c + r) : tevC(row[1], r);
+        };
+        const TevSource scaleSrc = pack ? tevC(row[1], _z) : tevC(row[0], _w);
+        for (uint32_t r = 0; r < 2; ++r) g.push_back(tevOp(kOpMul, T, r, col(0, r), tevG(V, _x)));
         flush();
-        for (uint32_t r = 0; r < 2; ++r) g.push_back(tevOp(kOpMul, U, r, tevC(row[r], _y), tevG(V, _y)));
-        flush();
-        for (uint32_t r = 0; r < 2; ++r) g.push_back(tevOp(kOpAdd, T, r, tevG(T, r), tevG(U, r)));
-        flush();
-        for (uint32_t r = 0; r < 2; ++r) g.push_back(tevOp(kOpMul, U, r, tevC(row[r], _z), tevG(V, _z)));
-        flush();
-        for (uint32_t r = 0; r < 2; ++r) g.push_back(tevOp(kOpAdd, T, r, tevG(T, r), tevG(U, r)));
-        flush();
+        if (s_tevMulAdd) {
+            // Integer products below 2^18: the MULADD chain is exact.
+            for (uint32_t r = 0; r < 2; ++r) g.push_back(tevOp3(kOp3MulAdd, T, r, col(1, r), tevG(V, _y), tevG(T, r)));
+            flush();
+            for (uint32_t r = 0; r < 2; ++r) g.push_back(tevOp3(kOp3MulAdd, T, r, col(2, r), tevG(V, _z), tevG(T, r)));
+            flush();
+        } else {
+            for (uint32_t r = 0; r < 2; ++r) g.push_back(tevOp(kOpMul, U, r, tevC(row[r], _y), tevG(V, _y)));
+            flush();
+            for (uint32_t r = 0; r < 2; ++r) g.push_back(tevOp(kOpAdd, T, r, tevG(T, r), tevG(U, r)));
+            flush();
+            for (uint32_t r = 0; r < 2; ++r) g.push_back(tevOp(kOpMul, U, r, tevC(row[r], _z), tevG(V, _z)));
+            flush();
+            for (uint32_t r = 0; r < 2; ++r) g.push_back(tevOp(kOpAdd, T, r, tevG(T, r), tevG(U, r)));
+            flush();
+        }
         for (uint32_t r = 0; r < 2; ++r) g.push_back(tevOp(kOpMul, T, r, tevG(T, r), tevC(42, _y)));
         flush();
         for (uint32_t r = 0; r < 2; ++r) g.push_back(tevOp1(kOpFloor, T, r, tevG(T, r)));
         flush();
-        for (uint32_t r = 0; r < 2; ++r) g.push_back(tevOp(kOpMul, T, r, tevG(T, r), tevC(row[0], _w)));
+        for (uint32_t r = 0; r < 2; ++r) g.push_back(tevOp(kOpMul, T, r, tevG(T, r), scaleSrc));
         flush();
         for (uint32_t r = 0; r < 2; ++r) g.push_back(tevOp1(kOpFloor, T, r, tevG(T, r)));
         flush();
         // 24-bit wrap: T - 2^24 * floor((T + 2^23) / 2^24)
+        if (s_tevMulAdd) {
+            // T / 2^24 + 1/2 is (T + 2^23) / 2^24 scaled by a power of two: the
+            // same rounding.  2^24 * floor(..) and T / 128 are exact.
+            for (uint32_t r = 0; r < 2; ++r) g.push_back(tevOp3(kOp3MulAdd, U, r, tevG(T, r), tevC(41, _w), {ALU_SRC_0_5, _x}));
+            flush();
+            for (uint32_t r = 0; r < 2; ++r) g.push_back(tevOp1(kOpFloor, U, r, tevG(U, r)));
+            flush();
+            for (uint32_t r = 0; r < 2; ++r) g.push_back(tevOp3(kOp3MulAdd, T, r, tevG(U, r), tevNeg(tevC(41, _z)), tevG(T, r)));
+            flush();
+            for (uint32_t c = 0; c < 2; ++c) g.push_back(tevOp3(kOp3MulAdd, B, c, tevG(T, c), tevC(40, _z), tevG(B, c)));
+            flush();
+        } else {
         for (uint32_t r = 0; r < 2; ++r) g.push_back(tevOp(kOpAdd, U, r, tevG(T, r), tevC(42, _x)));
         flush();
         for (uint32_t r = 0; r < 2; ++r) g.push_back(tevOp(kOpMul, U, r, tevG(U, r), tevC(41, _w)));
@@ -3688,18 +4449,28 @@ static void tevEmitIndirectStage(std::vector<uint64_t>& program, const TevKey& k
         flush();
         for (uint32_t c = 0; c < 2; ++c) g.push_back(tevOp(kOpAdd, B, c, tevG(B, c), tevG(T, c)));
         flush();
+        }
     }
     if (fb) {
         for (uint32_t c = 0; c < 2; ++c) g.push_back(tevOp(kOpAdd, B, c, tevG(B, c), tevG(ra.prevTc, c)));
         flush();
     }
-    for (uint32_t c = 0; c < 2; ++c) g.push_back(tevOp1(kOpMov, ra.prevTc, c, tevG(B, c)));
-    flush();
+    if (!(s_tevPcSkip && !tevKeyUsesIndFb(key))) {  // only a later add-previous stage reads it
+        for (uint32_t c = 0; c < 2; ++c) g.push_back(tevOp1(kOpMov, ra.prevTc, c, tevG(B, c)));
+        flush();
+    }
     // Back to the shader coordinate: o + texel * k / size.
-    for (uint32_t c = 0; c < 2; ++c) g.push_back(tevOp(kOpMul, B, c, tevG(B, c), tevC(31 + map, c)));
-    flush();
-    for (uint32_t c = 0; c < 2; ++c) g.push_back(tevOp(kOpAdd, ra.scoord[stage], c, tevG(B, c), tevC(23 + map, c)));
-    flush();
+    if (s_tevMulAdd && tevOp3Ok(tevG(B, 0), tevC(31 + map, 0), tevC(23 + map, 0)) &&
+        tevOp3Ok(tevG(B, 1), tevC(31 + map, 1), tevC(23 + map, 1))) {
+        for (uint32_t c = 0; c < 2; ++c)
+            g.push_back(tevOp3(kOp3MulAdd, ra.scoord[stage], c, tevG(B, c), tevC(31 + map, c), tevC(23 + map, c)));
+        flush();
+    } else {
+        for (uint32_t c = 0; c < 2; ++c) g.push_back(tevOp(kOpMul, B, c, tevG(B, c), tevC(31 + map, c)));
+        flush();
+        for (uint32_t c = 0; c < 2; ++c) g.push_back(tevOp(kOpAdd, ra.scoord[stage], c, tevG(B, c), tevC(23 + map, c)));
+        flush();
+    }
 }
 
 // ALU clauses of at most 128 slots, split between instruction groups.
@@ -3734,6 +4505,7 @@ static void tevTexClauses(std::vector<uint64_t>& program, size_t& cf, size_t off
 }
 
 static bool initTevPixel(TevShader& shader) {
+    sms_wiiu_pipe5_wait_resource_fence();
     s_tevGroups = 0;
     const size_t kCfSlots = 128;
     std::vector<uint64_t> program(kCfSlots, 0);
@@ -3821,6 +4593,17 @@ static bool initTevPixel(TevShader& shader) {
     static const uint32_t kAll[4] = {0, 1, 2, 3};
     std::vector<TevIns> g;
     auto flush = [&]() { tevEmitGroup(program, g); g.clear(); };
+    // catstats breakdown: ALU groups per section ("cv" texel/raster convert,
+    // per stage "m" 8-bit masks and "s" compare+steps, "o" output).
+    char bd[96]; int bdl = 0; bd[0] = 0;
+    auto groupsIn = [&](size_t from, size_t to) {
+        uint32_t n = 0;
+        for (size_t i = from; i < to; ++i) n += (program[i] & to_QWORD(to_LE(1ull << 31), 0)) ? 1u : 0u;
+        return n;
+    };
+    auto note = [&](const char* tag, size_t from) {
+        if (bdl < int(sizeof bd) - 12) bdl += std::snprintf(bd + bdl, sizeof bd - bdl, "%s%u ", tag, groupsIn(from, program.size()));
+    };
 
     // ---- indirect: lookup coordinates, lookups, offsets, indirect stage fetches ----
     size_t prepOffset = program.size(), prepCount = 0, tex1Offset = 0, tex2Offset = 0, indOffset = 0, indCount = 0;
@@ -3833,7 +4616,7 @@ static bool initTevPixel(TevShader& shader) {
             g.push_back(tevOp(kOpMul, ra.icoord[i], _y, tevG(ra.coord[coord], _y), tevC(sc, base + 1)));
             flush();
         }
-        if (anyInd) {
+        if (anyInd && !(s_tevPcSkip && !tevKeyUsesIndFb(key))) {
             g.push_back(tevOp1(kOpMov, ra.prevTc, _x, {ALU_SRC_0, _x}));
             g.push_back(tevOp1(kOpMov, ra.prevTc, _y, {ALU_SRC_0, _x}));
             flush();
@@ -3874,6 +4657,9 @@ static bool initTevPixel(TevShader& shader) {
         for (uint32_t stage = 0; stage < key.stages; ++stage)
             if (!s_plan.dead[stage] && indStage(stage)) tevEmitIndirectStage(program, key, stage);
         indCount = program.size() - indOffset;
+        if (bdl < int(sizeof bd) - 12)
+            bdl += std::snprintf(bd + bdl, sizeof bd - bdl, "pre%u ind%u ", groupsIn(prepOffset, prepOffset + prepCount),
+                                 groupsIn(indOffset, indOffset + indCount));
         tex2Offset = program.size();
         for (uint32_t stage = 0; stage < key.stages; ++stage) {
             if (s_plan.dead[stage]) continue;
@@ -3933,6 +4719,7 @@ static bool initTevPixel(TevShader& shader) {
         for (uint32_t ch = 0; ch < 4; ++ch) g.push_back(tevOp1(kOpRndne, r, ch, tevG(r, ch)));
         flush();
     }
+    note("cv", aluOffset);
     uint32_t lastColor = 0, lastAlpha = 0;
     int texStage = -1, bumpStage = -1;
     for (uint32_t stage = 0; stage < key.stages; ++stage) {
@@ -3945,6 +4732,7 @@ static bool initTevPixel(TevShader& shader) {
         const uint32_t ca = (ce >> 12) & 15, cb = (ce >> 8) & 15, cc = (ce >> 4) & 15, cd = ce & 15;
         const uint32_t aa = (ae >> 13) & 7, ab = (ae >> 10) & 7, ac = (ae >> 7) & 7, ad = (ae >> 4) & 7;
         tevSetViews(stage);
+        const size_t stageMaskFrom = program.size();
         // 8-bit copies of the registers read as A, B or C that may hold more.
         for (uint32_t r = 0; r < 4; ++r) {
             if (!s_plan.mask[stage][r]) continue;
@@ -3952,6 +4740,8 @@ static bool initTevPixel(TevShader& shader) {
             for (uint32_t ch = 0; ch < 4; ++ch) x[ch] = tevG(ra.reg[r], ch);
             tevEmitMask8(program, ra.mask[r], kAll, 4, x);
         }
+        note("m", stageMaskFrom);
+        const size_t stageStepFrom = program.size();
         const TevPart& pc = s_plan.part[stage][0];
         const TevPart& pa = s_plan.part[stage][1];
         TevChannel chs[4];
@@ -3984,13 +4774,16 @@ static bool initTevPixel(TevShader& shader) {
                 if (k < skip) continue;
                 const TevStep& st = steps[ch][k - skip];
                 const uint32_t to = st.dst == 3 ? ra.reg[ch < 3 ? colorDest : alphaDest] : ra.t[st.dst];
-                g.push_back(tevOp(st.inst, to, ch, st.s0, st.s1, st.omod));
+                g.push_back(st.has2 ? tevOp3(st.inst, to, ch, st.s0, st.s1, st.s2)
+                                    : tevOp(st.inst, to, ch, st.s0, st.s1, st.omod));
             }
             flush();
         }
+        note("s", stageStepFrom);
         lastColor = colorDest;
         lastAlpha = alphaDest;
     }
+    const size_t outFrom = program.size();
     // The output keeps the low 8 bits of the last stage's registers (genFS:
     // outc = ivec4(...) & 255).
     uint32_t outColor = ra.reg[lastColor], outAlpha = ra.reg[lastAlpha];
@@ -4002,6 +4795,7 @@ static bool initTevPixel(TevShader& shader) {
         outColor = outAlpha = ra.stage;
     }
     const size_t aluCount = program.size() - aluOffset;
+    note("o", outFrom);
     const size_t compareOffset = program.size();
     const bool killed = tevEmitAlphaCompare(program, key.alphaCompare, _R(outAlpha), _w);
     for (uint32_t ch = 0; ch < 4; ++ch)
@@ -4084,6 +4878,11 @@ static bool initTevPixel(TevShader& shader) {
     uint64_t exportOp = EXP_DONE(PIX0, _R(ra.stage), _x, _y, _z, _w);
     if (killed) exportOp |= to_QWORD(0, to_LE(1u << 22));
     program[cf++] = exportOp END_OF_PROGRAM;
+    shader.killed = killed ? 1u : 0u;
+    std::snprintf(shader.breakdown, sizeof shader.breakdown, "%sk%u", bd, groupsIn(compareOffset, compareOffset + compareCount));
+    shader.aluBundles = 0;
+    for (size_t i = kCfSlots; i < program.size(); ++i)
+        if (program[i] & (uint64_t(to_LE(1u << 31)) << 32)) ++shader.aluBundles;  // ALU_LAST (TEX words may alias a few)
     const size_t programSize = program.size() * sizeof(uint64_t);
     shader.psProgram = alignedZero(GX2_SHADER_PROGRAM_ALIGNMENT, programSize);
     if (!shader.psProgram) return false;
@@ -4167,6 +4966,10 @@ static bool tevSameFoldBase(const TevKey& a, const TevKey& b) {
 }
 
 static TevShader* tevShaderForKey(const TevKey& requested) {
+#if defined(PORT_GAME_SMG)
+    SmgWProfScope wprof(SmgWBucket_Shader);
+#endif
+    sms_wiiu_pipe5_wait_resource_fence();
     TevKey key = requested;
     const uint32_t hash = shaderKeyHash(key);
     if (TevShader* hit = s_tevShaderIndex.find(key, hash)) {
@@ -4214,7 +5017,43 @@ static TevShader* tevShaderForKey(const TevKey& requested) {
 }
 
 static void textureUvTransform(const TextureEntry* texture, float out[4]);
+#if defined(PORT_GAME_SMG)
+// Marker tinyps (with tinycat, diagnostic A/B, the picture is wrong): the listed
+// categories keep their scissor, textures and state but run a stub pixel shader
+// (export R0, the first interpolated input).  The stub copies the real shader's
+// SPI/export registers so the pipeline is configured the same; KILL is cleared
+// and Z-exporting shaders are left alone (an unannounced Z export hangs).
+// A gain like tinysc's means the cost is pixel-shader length.
+static bool s_tinyPs;
+static GX2PixelShader* tinyPsStub(GX2PixelShader* real) {
+    sms_wiiu_pipe5_wait_resource_fence();
+    static GX2PixelShader* keys[512];
+    static GX2PixelShader* stubs[512];
+    static uint32_t n;
+    static uint64_t* program;
+    if (!real || real->regs.sq_pgm_exports_ps != 2) return real;
+    for (uint32_t i = 0; i < n; ++i) if (keys[i] == real) return stubs[i];
+    if (n >= 512) return real;
+    if (!program) {
+        program = static_cast<uint64_t*>(alignedZero(GX2_SHADER_PROGRAM_ALIGNMENT, 64));
+        if (!program) return real;
+        program[0] = EXP_DONE(PIX0, _R(0), _x, _y, _z, _w) END_OF_PROGRAM;
+        GX2Invalidate(GX2_INVALIDATE_MODE_CPU_SHADER, program, 64);
+    }
+    GX2PixelShader* stub = static_cast<GX2PixelShader*>(alignedZero(64, sizeof(GX2PixelShader)));
+    if (!stub) return real;
+    *stub = *real;
+    stub->program = program;
+    stub->size = 64;
+    stub->regs.db_shader_control &= ~(1u << 6);
+    keys[n] = real; stubs[n] = stub; ++n;
+    return stub;
+}
+#endif
 static void bindShaders(GX2FetchShader* fetch, GX2VertexShader* vertex, GX2PixelShader* pixel) {
+#if defined(PORT_GAME_SMG)
+    if (s_tinyPs && s_tinyActive) pixel = tinyPsStub(pixel);
+#endif
     if (fetch != s_boundFetch) { GX2SetFetchShader(fetch); s_boundFetch = fetch; }
     if (vertex != s_boundVertex) { GX2SetVertexShader(vertex); s_boundVertex = vertex; }
     if (pixel != s_boundPixel) { GX2SetPixelShader(pixel); s_boundPixel = pixel; }
@@ -4314,6 +5153,26 @@ static void setTevShader(TevShader& shader, TextureEntry* const* textures, Verte
         row1[2] = float(tevSext11((r2 >> 11) & 0x7ff));
         row0[3] = sc >= 24 ? 0.0f : ldexpf(1.0f, sc);
         row1[3] = 0.0f;
+#if defined(PORT_GAME_SMG)
+        if (s_tevRowPack && s_tevMulAdd) {  // the generator's packed layout (tevrowpack)
+            const float m00 = row0[0], m01 = row0[1], m02 = row0[2], m10 = row1[0], m11 = row1[1], m12 = row1[2],
+                        scale = row0[3];
+            row0[0] = m00; row0[1] = m10; row0[2] = m01; row0[3] = m11;
+            row1[0] = m02; row1[1] = m12; row1[2] = scale; row1[3] = 0.0f;
+        }
+        {   // C48+2m / C49+2m: the same matrix in texels (tevindfast), always filled
+            const float k = (sc >= 24 ? 0.0f : ldexpf(1.0f, sc)) / 1024.0f;
+            float* f0 = &params[4 * (48 + 2 * m)];
+            float* f1 = &params[4 * (49 + 2 * m)];
+            f0[0] = float(tevSext11(r0 & 0x7ff)) * k;          // m00
+            f0[1] = float(tevSext11((r0 >> 11) & 0x7ff)) * k;  // m10
+            f0[2] = float(tevSext11(r1 & 0x7ff)) * k;          // m01
+            f0[3] = float(tevSext11((r1 >> 11) & 0x7ff)) * k;  // m11
+            f1[0] = float(tevSext11(r2 & 0x7ff)) * k;          // m02
+            f1[1] = float(tevSext11((r2 >> 11) & 0x7ff)) * k;  // m12
+            f1[2] = 0.0f; f1[3] = 0.0f;
+        }
+#endif
     }
     // C23-C30: per texture map, (ox, oy, w / kx, h / ky) and C31-C38
     // (kx / w, ky / h, 0, 0): the shader's coordinate is ox + kx * u for the
@@ -4454,22 +5313,56 @@ static void logCopyOwnerWindow() {
 static uint32_t s_fpsPeeks, s_fpsPeekCopies;
 static uint32_t s_fpsVsyncHist[4];
 static uint32_t s_fpsWaitPeekColour, s_fpsWaitPeekZ;
+#if defined(PORT_GAME_SMG)
+static uint32_t s_fpsPeekZRequests;
+static volatile uint32_t s_fpsPeekZPublished;
+static uint32_t s_fpsPeekZFar, s_fpsPeekZNear, s_fpsPeekZMiss;
+static uint64_t s_fpsPeekZSum;                    // sum of the answers (24-bit depth)
+static uint32_t s_fpsPeekZMin = ~0u, s_fpsPeekZMax;  // GXPeekZ answers: far plane / nearer / outside the copied rect
+static uint32_t s_fpsClearFastZ, s_fpsClearFastEfb, s_fpsClearFastReject, s_fpsClearFastLastReject;
+#endif
 static OSTime s_fpsWindowStart;
 
 static void logFpsWindow() {
     const OSTime now = OSGetTime();
     const uint64_t micros = s_fpsWindowStart ? OSTicksToMicroseconds(now - s_fpsWindowStart) : 0;
     const double fps = micros ? 120000000.0 / double(micros) : 0.0;
+#if defined(PORT_GAME_SMG)
+    WHBLogPrintf("SMS Wii U: [fps] frame=%u wallfps=%.2f vsync1=%u vsync2=%u vsync3=%u vsync4plus=%u peeks=%u peekcopies=%u waitPeekColour=%u waitPeekZ=%u peekZRequests=%u peekZPublished=%u",
+                 unsigned(g_displayFrames), fps, unsigned(s_fpsVsyncHist[0]),
+                 unsigned(s_fpsVsyncHist[1]), unsigned(s_fpsVsyncHist[2]),
+                 unsigned(s_fpsVsyncHist[3]), unsigned(s_fpsPeeks),
+                 unsigned(s_fpsPeekCopies), unsigned(s_fpsWaitPeekColour),
+                 unsigned(s_fpsWaitPeekZ), unsigned(s_fpsPeekZRequests),
+                 unsigned(__sync_fetch_and_add(&s_fpsPeekZPublished, 0)));
+    {
+        const uint32_t n = s_fpsPeekZFar + s_fpsPeekZNear;
+        WHBLogPrintf("SMS Wii U: [peekz] far=%u near=%u miss=%u mean=%u min=%u max=%u", unsigned(s_fpsPeekZFar),
+                     unsigned(s_fpsPeekZNear), unsigned(s_fpsPeekZMiss), n ? unsigned(s_fpsPeekZSum / n) : 0u,
+                     n ? unsigned(s_fpsPeekZMin) : 0u, unsigned(s_fpsPeekZMax));
+    }
+    WHBLogPrintf("SMS Wii U: [clearfast] z=%u efb=%u reject=%u lastReject=%u",
+                 unsigned(s_fpsClearFastZ), unsigned(s_fpsClearFastEfb),
+                 unsigned(s_fpsClearFastReject), unsigned(s_fpsClearFastLastReject));
+#else
     WHBLogPrintf("SMS Wii U: [fps] frame=%u wallfps=%.2f vsync1=%u vsync2=%u vsync3=%u vsync4plus=%u peeks=%u peekcopies=%u waitPeekColour=%u waitPeekZ=%u",
                  unsigned(g_displayFrames), fps, unsigned(s_fpsVsyncHist[0]),
                  unsigned(s_fpsVsyncHist[1]), unsigned(s_fpsVsyncHist[2]),
                  unsigned(s_fpsVsyncHist[3]), unsigned(s_fpsPeeks),
                  unsigned(s_fpsPeekCopies), unsigned(s_fpsWaitPeekColour),
                  unsigned(s_fpsWaitPeekZ));
+#endif
     s_fpsWindowStart = now;
     memset(s_fpsVsyncHist, 0, sizeof(s_fpsVsyncHist));
     s_fpsPeeks = s_fpsPeekCopies = 0;
     s_fpsWaitPeekColour = s_fpsWaitPeekZ = 0;
+#if defined(PORT_GAME_SMG)
+    s_fpsPeekZRequests = 0;
+    __sync_lock_test_and_set(&s_fpsPeekZPublished, 0);
+    s_fpsPeekZFar = s_fpsPeekZNear = s_fpsPeekZMiss = 0;
+    s_fpsPeekZSum = 0; s_fpsPeekZMin = ~0u; s_fpsPeekZMax = 0;
+    s_fpsClearFastZ = s_fpsClearFastEfb = s_fpsClearFastReject = s_fpsClearFastLastReject = 0;
+#endif
 }
 
 static unsigned char s_copyStorage[sizeof(std::vector<CopyEntry>)] __attribute__((aligned(8)));
@@ -4619,6 +5512,7 @@ static uint32_t s_mem1CopySurfaces, s_mem1CopyBytes, s_mem1CopyMisses;
 static void dropPendingMem1ProducerCopies();
 
 static void freeDeferred(const DeferredFree& entry) {
+    sms_wiiu_pipe5_wait_resource_fence();
     if (entry.mem1Heap) {
         MEMFreeToExpHeap(entry.mem1Heap, entry.p);
         if (s_mem1CopySurfaces) --s_mem1CopySurfaces;
@@ -4637,6 +5531,7 @@ static void refreshMem1CopyHeap() {
 }
 
 static void releaseCopyImage(CopyEntry& e) {
+    sms_wiiu_pipe5_wait_resource_fence();
     if (!e.tex.texture.surface.image) return;
     if (e.mem1Image) {
         if (e.mem1Heap) MEMFreeToExpHeap(e.mem1Heap, e.tex.texture.surface.image);
@@ -4653,6 +5548,7 @@ static void releaseCopyImage(CopyEntry& e) {
 }
 
 static void dropMem1CopyImages() {
+    sms_wiiu_pipe5_wait_resource_fence();
     if (!s_mem1CopyMarker) return;
     // WHBGfx destroys its foreground heap on release. Its outstanding copy
     // images must not be freed through a stale heap handle after reacquire.
@@ -4737,6 +5633,7 @@ static void copyToTexture(const void* dest, uint32_t x, uint32_t y, uint32_t w, 
     const uint32_t copyH = sizes.native ? logicalH : (cemu ? fullH : th);
     noteCopyOwner(g.copyOwner, logicalW, logicalH, copyW, copyH);
     if (e && (e->tex.texture.surface.width != copyW || e->tex.texture.surface.height != copyH || e->tex.fmt != fmt)) {
+        sms_wiiu_pipe5_wait_resource_fence();
         GX2DrawDone(); // earlier draws this frame may still sample it
 #if defined(PORT_GAME_SMG)
         releaseCopyImage(*e);
@@ -4904,6 +5801,7 @@ static bool retileTexture(GX2Texture& linear, GX2Texture& tiled, uint32_t level)
     return true;
 }
 static void retileTexture(GX2Texture& texture) {
+    sms_wiiu_pipe5_wait_resource_fence();
     // The producer worker records draw state; resource-copy work remains on
     // the service core so the worker never issues an unordered retile.
     if ((!s_retileTextures && !s_textiledMarker) ||
@@ -4948,6 +5846,7 @@ static void retileTexture(GX2Texture& texture) {
 // immediately, and the service callback retires the source behind the frame
 // timestamp just like the direct path above.
 static void textiledTextureService(void* opaque) {
+    sms_wiiu_pipe5_wait_resource_fence();
     TextureEntry& e = *static_cast<TextureEntry*>(opaque);
     if (!e.textiledPending) return;
     GX2Texture& linear = e.textiledLinear;
@@ -4962,6 +5861,7 @@ static void textiledTextureService(void* opaque) {
 }
 
 static bool textiledTexture(TextureEntry& e) {
+    sms_wiiu_pipe5_wait_resource_fence();
     if ((!s_retileTextures && !s_textiledMarker) ||
         (!s_textiledMarker && runningUnderCemu())) return false;
     if (s_gx2ProdEnabled && OSGetCoreId() != 1) {
@@ -5053,6 +5953,10 @@ static uint32_t nativeLevelPitchBytes(const GX2Surface& surface, uint32_t fmt) {
 }
 
 static TextureEntry* getTexture(int map) {
+#if defined(PORT_GAME_SMG)
+    SmgWProfScope wprof(SmgWBucket_Tex);
+#endif
+    sms_wiiu_pipe5_wait_resource_fence();
     const uint32_t mode0 = g.bp[bpTexReg(BP_TX_MODE0, map)];
     const uint32_t mode1 = g.bp[bpTexReg(BP_TX_MODE1, map)];
     const uint32_t image0 = g.bp[bpTexReg(BP_TX_IMAGE0, map)];
@@ -5072,6 +5976,15 @@ static TextureEntry* getTexture(int map) {
     uint32_t cacheSourceBytes = 0;
     for (uint32_t l = 0; l < levels; ++l)
         cacheSourceBytes += texLevelBytes(fmt, std::max(w >> l, 1u), std::max(h >> l, 1u));
+#if defined(PORT_GAME_SMG)
+    uint32_t streamSerial = 0;
+    uint32_t streamBytes = cacheSourceBytes, streamPitch = 0;
+    bool streamLinear = false;
+    const bool streamSource = textureStreamSerial(source, &streamBytes, &streamPitch, &streamLinear, &streamSerial);
+    // A stream refresh rebuilds its entry in place: appending a new entry per
+    // movie frame grew s_textures by three entries a frame for the whole movie.
+    uint32_t streamReuse = UINT32_MAX;
+#endif
     auto& index = textureIndex();
     const auto head = index.find(source);
     const uint32_t first = head == index.end() ? UINT32_MAX : head->second;
@@ -5088,6 +6001,32 @@ static TextureEntry* getTexture(int map) {
                 const bool mayHaveChanged = !trustWriteStamps() || e.sourceBytes != cacheSourceBytes ||
                     !unwrittenSince(source, cacheSourceBytes, e.checkedClock) ||
                     g_displayFrames - e.checkedFrame >= kRecheckFrames;
+#if defined(PORT_GAME_SMG)
+                if (streamSource) {
+                    ++s_textureStreamHashesSkipped;
+                    if (e.streamSerial != streamSerial) {
+                        ++s_textureStreamRefreshes;
+                        if (streamLinear && e.texture.surface.image == source && e.texture.surface.pitch == streamPitch) {
+                            GX2Invalidate(GX2_INVALIDATE_MODE_CPU_TEXTURE, const_cast<uint8_t*>(source), streamBytes);
+                            e.streamSerial = streamSerial;
+                            e.sourceBytes = streamBytes;
+                        } else {
+                            deferFree(e.texture.surface.image);
+                            deferFree(e.texture.surface.mipmaps);
+                            e.valid = false;
+                            rendererStateWritten();
+                            if (e.packState == 0) {
+                                streamReuse = i;
+                                break;
+                            }
+                            continue;
+                        }
+                    }
+                    e.dataHash = e.tlutHash = 0;
+                    e.checkedClock = writeClock();
+                    e.checkedFrame = g_displayFrames;
+                } else
+#endif
                 if (readable && mayHaveChanged) {
                     const uint8_t* tlutPtr = indexed ? g.tlutMem + (tlut << 9) : nullptr;
                     const uint64_t dataHash = xxh64(source, cacheSourceBytes, 0);
@@ -5120,10 +6059,25 @@ static TextureEntry* getTexture(int map) {
     if (s_dlMerge) gx2DlSplit(kDlSplitFrame);
     SMS_PORT_HEAP_SCOPE();  // a miss: the entry, the index and the decode allocate
     rendererStateWritten();
+#if defined(PORT_GAME_SMG)
+    if (streamReuse != UINT32_MAX) {
+        const uint32_t keepNext = s_textures[streamReuse].next;
+        s_textures[streamReuse] = TextureEntry();
+        s_textures[streamReuse].next = keepNext;
+    } else {
+        s_textures.push_back(TextureEntry());
+    }
+    TextureEntry& e = streamReuse != UINT32_MAX ? s_textures[streamReuse] : s_textures.back();
+    if (streamReuse == UINT32_MAX) {
+        e.next = first;
+        index[source] = uint32_t(s_textures.size() - 1);
+    }
+#else
     s_textures.push_back(TextureEntry());
     TextureEntry& e = s_textures.back();
     e.next = first;
     index[source] = uint32_t(s_textures.size() - 1);
+#endif
     e.source = source; e.fmt = fmt; e.width = w; e.height = h; e.tlut = tlut; e.tlutFmt = tlutFmt;
     e.levels = levels;
     e.texture.surface.use = GX2_SURFACE_USE_TEXTURE;
@@ -5132,9 +6086,11 @@ static TextureEntry* getTexture(int map) {
     e.texture.surface.height = h;
     e.texture.surface.depth = 1;
     e.texture.surface.mipLevels = levels;
-    const bool native = s_texNative && gx2NativeTextureFormat(fmt);
+    const bool linearStream = streamSource && streamLinear;
+    const bool native = linearStream || (s_texNative && gx2NativeTextureFormat(fmt));
     if (native) ++s_texNativeCounts[fmt & 15];
-    e.texture.surface.format = native ? nativeSurfaceFormat(fmt) : GX2_SURFACE_FORMAT_UNORM_R8_G8_B8_A8;
+    e.texture.surface.format = linearStream ? GX2_SURFACE_FORMAT_UNORM_R8 :
+                               native ? nativeSurfaceFormat(fmt) : GX2_SURFACE_FORMAT_UNORM_R8_G8_B8_A8;
     e.texture.surface.aa = GX2_AA_MODE1X;
     e.texture.surface.tileMode = GX2_TILE_MODE_LINEAR_ALIGNED;
     GX2CalcSurfaceSizeAndAlignment(&e.texture.surface);
@@ -5171,12 +6127,27 @@ static TextureEntry* getTexture(int map) {
     }
     e.texture.viewNumMips = surf.mipLevels;
     e.texture.viewNumSlices = 1;
-    e.texture.compMap = native ? nativeCompMap(fmt) : GX2_COMP_MAP(GX2_SQ_SEL_R, GX2_SQ_SEL_G,
+    e.texture.compMap = linearStream ? nativeCompMap(1) : native ? nativeCompMap(fmt) : GX2_COMP_MAP(GX2_SQ_SEL_R, GX2_SQ_SEL_G,
                                                                     GX2_SQ_SEL_B, GX2_SQ_SEL_A);
+#if defined(PORT_GAME_SMG)
+    if (linearStream) {
+        if (levels != 1 || surf.pitch != streamPitch || streamBytes < surf.imageSize) return nullptr;
+        surf.image = const_cast<uint8_t*>(source);
+    } else {
+        surf.image = streamSource ? alignedNoZero(surf.alignment, surf.imageSize)
+                                  : alignedZero(surf.alignment, surf.imageSize);
+    }
+#else
     surf.image = alignedZero(surf.alignment, surf.imageSize);
+#endif
     if (!surf.image) return nullptr;
     if (surf.mipLevels > 1) {
+#if defined(PORT_GAME_SMG)
+        surf.mipmaps = streamSource ? alignedNoZero(surf.alignment, surf.mipmapSize)
+                                    : alignedZero(surf.alignment, surf.mipmapSize);
+#else
         surf.mipmaps = alignedZero(surf.alignment, surf.mipmapSize);
+#endif
         if (!surf.mipmaps) {
             MEMFreeToDefaultHeap(surf.image);
             surf.image = nullptr;
@@ -5195,19 +6166,27 @@ static TextureEntry* getTexture(int map) {
     // (outside the main heap) must not be read: in Cemu that kills the title.
     // OSIsAddressValid rejects ordinary heap addresses under Cemu (every
     // texture came out white), so check the app's MEM2/MEM1 ranges directly.
+    if (linearStream) srcBytes = streamBytes;
     const uint32_t a0 = reinterpret_cast<uint32_t>(source), a1 = a0 + srcBytes;
     const bool readable = source && srcBytes && a1 > a0 &&
         ((a0 >= 0x10000000u && a1 <= 0x50000000u) || (a0 >= 0xF4000000u && a1 <= 0xF6000000u));
     e.sourceBytes = srcBytes;
+#if defined(PORT_GAME_SMG)
+    e.streamSerial = streamSource ? streamSerial : 0;
+#endif
     e.checkedGeneration = s_textureGeneration;
     e.checkedClock = writeClock();
     e.checkedFrame = g_displayFrames;
     uint8_t* rgba = readable && !native ? static_cast<uint8_t*>(MEMAllocFromDefaultHeapEx(w * h * 4, 64)) : nullptr;
-    uint8_t* nativeData = readable && native
+    uint8_t* nativeData = readable && native && !linearStream
         ? static_cast<uint8_t*>(MEMAllocFromDefaultHeapEx(gx2NativeTextureBytes(fmt, w, h), 64)) : nullptr;
     uint8_t* prev = (readable && !native && surf.mipLevels > 1)
         ? static_cast<uint8_t*>(MEMAllocFromDefaultHeapEx(w * h * 4, 64)) : nullptr;
-    if ((!native && !rgba) || (native && !nativeData) || (!native && surf.mipLevels > 1 && !prev)) {
+    if (linearStream) {
+        ++s_textureStreamHashesSkipped;
+        e.dataHash = e.tlutHash = 0;
+        e.arbitraryMips = false;
+    } else if ((!native && !rgba) || (native && !nativeData) || (!native && surf.mipLevels > 1 && !prev)) {
         if (s_whiteFillLogs < 40) {
             ++s_whiteFillLogs;
             WHBLogPrintf("SMS Wii U: white-fill source=%08x gxFormat=%u width=%u height=%u mipLevels=%u unreadable=%u allocationFailure=%u requestedBytes=%u",
@@ -5231,8 +6210,16 @@ static TextureEntry* getTexture(int map) {
         }
     } else {
         const uint8_t* tlutPtr = indexed ? g.tlutMem + (tlut << 9) : nullptr;
+#if defined(PORT_GAME_SMG)
+        if (streamSource) {
+            ++s_textureStreamHashesSkipped;
+            e.dataHash = e.tlutHash = 0;
+        } else
+#endif
+        {
         e.dataHash = xxh64(source, srcBytes, 0);
         e.tlutHash = tlutPtr ? xxh64(tlutPtr, 512, 0) : 0;
+        }
         const uint8_t* src = source;
         float mipDiff = 0.0f;
         uint32_t pw = w, ph = h;
@@ -5264,10 +6251,16 @@ static TextureEntry* getTexture(int map) {
     GX2Invalidate(GX2_INVALIDATE_MODE_CPU_TEXTURE, surf.image, surf.imageSize);
     sms_wiiu_d4_event(D4_UPLOAD);
     if (surf.mipmaps) GX2Invalidate(GX2_INVALIDATE_MODE_CPU_TEXTURE, surf.mipmaps, surf.mipmapSize);
+#if defined(PORT_GAME_SMG)
+    // Stream textures (THP planes) are replaced every movie frame and drawn
+    // once: retiling would allocate, zero and GPU-copy a second surface each time.
+    if (!streamSource) textiledTexture(e);
+#else
     textiledTexture(e);
+#endif
     initSampler(&e.sampler, mode0, mode1, surf.mipLevels, e.arbitraryMips);
     e.valid = true;
-    if (texturePackEnabled()) {
+    if (texturePackEnabled() && !linearStream) {
         TexturePackRequest request = {};
         request.source = source;
         request.tlut = indexed ? g.tlutMem + (tlut << 9) : nullptr;
@@ -5288,6 +6281,7 @@ static TextureEntry* packTextureForRequest(uint32_t requestId) {
 }
 
 static void packFreeLoading(TextureEntry& e) {
+    sms_wiiu_pipe5_wait_resource_fence();
     if (e.packLinear.surface.image) MEMFreeToDefaultHeap(e.packLinear.surface.image);
     if (e.packLinear.surface.mipmaps) MEMFreeToDefaultHeap(e.packLinear.surface.mipmaps);
     if (e.packTiled.surface.image) MEMFreeToDefaultHeap(e.packTiled.surface.image);
@@ -5310,6 +6304,7 @@ static void packEvict(TextureEntry& e) {
 }
 
 static bool packStart(TextureEntry& e, const TexturePackEntry* entry) {
+    sms_wiiu_pipe5_wait_resource_fence();
     if (!entry || entry->mipCount > 16) return false;
     std::memset(&e.packLinear, 0, sizeof e.packLinear);
     e.packLinear.surface.use = GX2_SURFACE_USE_TEXTURE;
@@ -5386,6 +6381,7 @@ static bool packCopyChunk(TextureEntry& e, const TexturePackUploadChunk& chunk) 
 }
 
 static void packInstall(TextureEntry& e) {
+    sms_wiiu_pipe5_wait_resource_fence();
     uint64_t bytes = uint64_t(e.packTiled.surface.imageSize) + e.packTiled.surface.mipmapSize;
     uint32_t evicted[kTexturePackMaxResidents];
     const uint32_t n = s_packLru.evict(s_packFrame, bytes, evicted, kTexturePackMaxResidents);
@@ -5574,40 +6570,719 @@ static GX2DepthBuffer* renderDepth() {
 }
 
 #if defined(PORT_GAME_SMG)
-/* Galaxy's wide EFB carries 456 picture lines in a 480-line render target.
- * The target is intentionally left at its normal size for rendering, EFB
- * copies, and peeks; describe only the final picture rectangle as the source
- * of the scan-buffer copy so GX2 scales those lines to the display height. */
-static bool s_presentScaleLogged[2];
+// GPU time per draw category (marker "gpucat", default off; independent of dynres).
+// Core 1 brackets each executeDraw(category) with a begin/end marker.  With gx2prod
+// the marker travels in order through the producer byte stream as a private host-state
+// record (kHostGpuCat, like the drawown push/pop); the worker, which owns the list
+// being recorded, flushes the pending batch and records GPU timestamps into that list,
+// so they replay in command order.  Begin = top + bottom stamp, end = bottom stamp.
+// EFB copies and the scan copy are stamped on core 1 where they run (service
+// callbacks).  A frame marker is sent at every frame start.  Stamps go to a ring of
+// 32-byte lines (one cache line each, so zeroing a read line never touches a line the
+// GPU may still write).  Core 1 reads a record once both its stamps are non-zero,
+// merges worker and core-1 records by GPU time, and splits frames at frame markers.
+// Time between two stamps goes to the innermost open owner (category, copy, or other);
+// a begin whose top stamp is later than every earlier bottom stamp is GPU idle.
+// Budget per frame: worker 360 (begin 2 + end 1, a category that no longer fits is
+// skipped whole; the game calls executeDraw for ~80 categories a frame, most of them
+// empty, so 150 ran out after ~50) + frame 1 + copies 40 = at most 401 stamps.  The GPU timer is 27 MHz.
+static bool gx2DlOpenForDraw();
+extern "C" void GX2SampleBottomGPUCycle(uint64_t* result);
+extern "C" void GX2SampleTopGPUCycle(uint64_t* result);
+enum GcKind : uint32_t { GC_BEGIN = 1, GC_END, GC_COPY_BEGIN, GC_COPY_END, GC_FRAME };
+static constexpr uint32_t kGcSlots = 8192, kGcPend = 4096, kGcWorkerBudget = 900, kGcCopyBudget = 40;
+static constexpr uint32_t kGcOwnerCopy = 256, kGcOwnerOther = 258, kGcOwners = 259;  // 0..255 categories, 256 EFB copy, 257 scan copy
+struct GcLine { uint64_t bottom, top, pad[2]; };
+struct GcRec { uint64_t t, top; uint32_t kind, id; };
+static int s_gcState = -1;                 // -1 unread, 0 off, 1 on
+static GcLine* s_gcLine;
+static uint32_t s_gcMeta[kGcSlots];        // kind << 16 | id; 0 = slot not yet filled
+static volatile uint32_t s_gcHead, s_gcTail;
+static GcRec s_gcPend[kGcPend];
+static uint32_t s_gcPendN, s_gcStall;
+static uint32_t s_gcCopyUsed;
+static bool s_gcCopyOpen;
+static uint64_t s_gcCursor, s_gcAcc[kGcOwners], s_gcIdle;
+static uint32_t s_gcStack[32], s_gcDepth, s_gcFrames, s_gcDrops, s_gcLost;
+static uint32_t s_gcDropRing, s_gcDropBudget, s_gcDropCan, s_gcDropCopy, s_gcDumped;
+static uint32_t s_gcRxBegin, s_gcRxEnd, s_gcRxFrame, s_gcStampedCat, s_gcDropOver, s_gcBeginPeak, s_gcBadStamp;
+static uint64_t s_gcCand;
+static uint32_t s_gcBadNeg[6], s_gcBadJump[6];  // bad stamps by kind: ~0 read in gcCollect, far jump in gcWalk
+static bool s_gcFix;                           // marker gpucatfix: flush the stamp line after sampling, ~0 = pending
+static OSTime s_gcLogAt;
+static char s_gcStage[48] = "?";
+
+static void gcInit() {
+    s_gcState = 0;
+    if (!sdMarkerPresent("gpucat")) return;
+    s_gcLine = static_cast<GcLine*>(MEMAllocFromDefaultHeapEx(kGcSlots * sizeof(GcLine), 64));
+    if (!s_gcLine) {
+        WHBLogPrintf("SMG Wii U: [gpucat] off (no memory for the GPU stamps)");
+        return;
+    }
+    memset(s_gcLine, 0, kGcSlots * sizeof(GcLine));
+    DCFlushRange(s_gcLine, kGcSlots * sizeof(GcLine));
+    s_gcLogAt = OSGetTime();
+    s_gcFix = !sdMarkerPresent("gpucatnofix");  // flush+pending is the measured fix (b173: bad 4100 -> 0)
+    s_gcState = 1;
+    WHBLogPrintf("SMG Wii U: [gpucat] on (%s)%s", s_gx2ProdEnabled ? "stamps recorded by the producer worker" : "stamps on core 1",
+                 s_gcFix ? " fix=flush+pending" : "");
+}
+
+static int gcAlloc() {
+    for (;;) {
+        const uint32_t h = s_gcHead;
+        if (h - s_gcTail >= kGcSlots) { ++s_gcDrops; ++s_gcDropRing; return -1; }
+        if (__sync_bool_compare_and_swap(&s_gcHead, h, h + 1)) return int(h & (kGcSlots - 1));
+    }
+}
+
+// Issues the stamps for kind/id into the current command stream (the open list on
+// the worker, the real stream on core 1).  The caller has checked the budget.
+static void gcStampNow(uint32_t kind, uint32_t id) {
+    const int i = gcAlloc();
+    if (i < 0) return;
+    s_gcMeta[i] = (kind << 16) | (id & 0xffff);
+    __sync_synchronize();
+    if (kind == GC_BEGIN) GX2SampleTopGPUCycle(&s_gcLine[i].top);
+    GX2SampleBottomGPUCycle(&s_gcLine[i].bottom);
+    // The sample calls may store a CPU-side placeholder into the line.  On the worker
+    // core that dirty line can be written back after the GPU's stamp lands and
+    // overwrite it; flushing now puts the placeholder in memory before the list runs.
+    if (s_gcFix) DCFlushRange(&s_gcLine[i], sizeof(GcLine));
+}
+
+// Worker (gx2prod) or core 1 (no producer): one marker from the stream.
+void rendererGpuCatMark(uint8_t kind, uint32_t id) {
+    if (s_tinyCatOn || s_catStatsOn) {
+        static uint8_t stack[32];
+        static uint32_t depth, frames;
+        const int before = s_curCat;
+        if (kind == GC_BEGIN) { if (depth < 32) stack[depth] = uint8_t(id); ++depth; }
+        else if (kind == GC_END) { if (depth) --depth; }
+        else if (kind == GC_FRAME) depth = 0;
+        const int cat = depth && depth <= 32 ? int(stack[depth - 1]) : -1;
+        const bool tiny = cat >= 0 && s_tinyCat[cat];
+        if (tiny != s_tinyActive || (s_catStatsOn && cat != before)) {
+            flushBatch();  // the pending batch belongs to the category it was recorded under
+            s_tinyActive = tiny;
+        }
+        if (s_catStatsOn && (cat != before || kind == GC_FRAME)) {
+            if (!s_cpData) {
+                s_cpData = static_cast<uint8_t*>(MEMAllocFromDefaultHeapEx(kCpSlots * kCpStride, 256));
+                if (s_cpData) { memset(s_cpData, 0, kCpSlots * kCpStride); DCFlushRange(s_cpData, kCpSlots * kCpStride); }
+                WHBLogPrintf("SMG Wii U: [catpix] query ring %s", s_cpData ? "on" : "allocation FAILED");
+            }
+            const bool can = s_cpData && s_ready && ProcUIInForeground() &&
+                             (!s_gx2ProdEnabled || gx2DlOpenForDraw());
+            if (can && s_cpOpenSlot != ~0u) {
+                void* q = s_cpData + (s_cpOpenSlot % kCpSlots) * kCpStride;
+                GX2QueryEnd(kCpQueryOcclusionCpu, q);
+                s_cpOpenSlot = ~0u;
+            }
+            if (can && s_cpOpenSlot == ~0u) {
+                if (s_cpHead - s_cpTail >= kCpSlots) ++s_cpDrops;
+                else {
+                    const uint32_t slot = s_cpHead++;
+                    s_cpCat[slot % kCpSlots] = uint8_t(cat >= 0 ? cat : 255);
+                    void* q = s_cpData + (slot % kCpSlots) * kCpStride;
+                    GX2QueryBegin(kCpQueryOcclusionCpu, q);
+                    DCFlushRange(q, kCpStride);  // the CPU-side init must reach memory before the GPU writes
+                    s_cpOpenSlot = slot;
+                }
+            }
+            if (kind == GC_FRAME) {
+                // Read finished queries in order; stop at the first not ready.
+                // The open one (s_cpOpenSlot) is never read.
+                while (s_cpTail != s_cpHead && s_cpTail != s_cpOpenSlot) {
+                    void* q = s_cpData + (s_cpTail % kCpSlots) * kCpStride;
+                    DCInvalidateRange(q, kCpStride);
+                    uint64_t r = 0;
+                    if (!GX2QueryGetOcclusionResult(q, &r)) { ++s_cpNotReady; break; }
+                    s_cpPix[s_cpCat[s_cpTail % kCpSlots]] += r;
+                    ++s_cpTail;
+                }
+            }
+        }
+        s_curCat = cat;
+        if (kind == GC_FRAME && s_catStatsOn && ++frames == 120) {
+            frames = 0;
+            for (int c = 0; c < 256; ++c) {
+                CatStats& st = s_catStats[c];
+                if (!s_catStat[c] || !st.draws) continue;
+                const uint32_t d = st.draws;
+                WHBLogPrintf("SMG Wii U: [catstats] cat=%d draws/f=%u idx/draw=%u stages=%u.%u ind=%u.%u gprs=%u tex=%u.%u texels/draw=%llu maxtex=%ux%u blend=%u%% ztest=%u%% zwrite=%u%% shaders=%u linear=%u.%u maxtile=%u maxfmt=0x%x",
+                             c, d / 120, st.indices / d, st.stages / d, (st.stages * 10 / d) % 10, st.indStages / d, (st.indStages * 10 / d) % 10,
+                             st.gprs / d, st.textures / d, (st.textures * 10 / d) % 10, (unsigned long long)(st.texels / d),
+                             st.maxTexW, st.maxTexH, st.blend * 100 / d, st.ztest * 100 / d, st.zwrite * 100 / d, st.shaders, st.linearTex / d, (st.linearTex * 10 / d) % 10, st.maxTexTile, st.maxTexFmt);
+                WHBLogPrintf("SMG Wii U: [catstats2] cat=%d tris/f=%u cullnone=%u%% mippedtex=%u/%u mipLevels/tex=%u.%u alu=%u maxalu=%u psbytes=%u killed=%u%%",
+                             c, st.indices / 3 / 120, st.cullNone * 100 / d, st.mipTex, st.textures,
+                             st.textures ? st.mipLevels / st.textures : 0, st.textures ? (st.mipLevels * 10 / st.textures) % 10 : 0,
+                             st.bundles / d, st.maxBundles, st.psBytes / d, st.killed * 100 / d);
+                if (st.maxShader) {
+                    const TevKey& k = st.maxShader->key;
+                    WHBLogPrintf("SMG Wii U: [catstats3] cat=%d maxshader stages=%u groups: %s | ce0=%06x ae0=%06x ce1=%06x ae1=%06x ind=%06x/%06x/%06x/%06x order=%03x/%03x/%03x/%03x",
+                                 c, unsigned(k.stages), st.maxShader->breakdown, unsigned(k.colorEnv[0]), unsigned(k.alphaEnv[0]),
+                                 unsigned(k.colorEnv[1]), unsigned(k.alphaEnv[1]), unsigned(k.ind[0]), unsigned(k.ind[1]),
+                                 unsigned(k.ind[2]), unsigned(k.ind[3]), unsigned(k.order[0]), unsigned(k.order[1]),
+                                 unsigned(k.order[2]), unsigned(k.order[3]));
+                }
+                memset(&st, 0, sizeof st);
+            }
+            // Samples per frame (depth-passing) per category; a 1280x720 screen is 921600.
+            char line[640];
+            uint64_t total = 0;
+            int len = 0;
+            for (int c = 0; c < 256; ++c) total += s_cpPix[c];
+            len = std::snprintf(line, sizeof line, "SMG Wii U: [catpix] total/f=%llu screens=%u.%u drops=%u notready=%u lag=%u",
+                                (unsigned long long)(total / 120), unsigned(total / 120 / 921600),
+                                unsigned(total / 120 * 10 / 921600 % 10), s_cpDrops, s_cpNotReady, s_cpHead - s_cpTail);
+            for (int pass = 0; pass < 24; ++pass) {  // top categories, largest first
+                int best = -1;
+                for (int c = 0; c < 256; ++c)
+                    if (s_cpPix[c] && (best < 0 || s_cpPix[c] > s_cpPix[best])) best = c;
+                if (best < 0 || len >= int(sizeof line) - 24) break;
+                len += std::snprintf(line + len, sizeof line - len, " %d:%llu", best == 255 ? -1 : best,
+                                     (unsigned long long)(s_cpPix[best] / 120));
+                s_cpPix[best] = 0;
+            }
+            WHBLogPrintf("%s", line);
+            memset(s_cpPix, 0, sizeof s_cpPix);
+            s_cpDrops = s_cpNotReady = 0;
+        }
+    }
+    if (!s_gcLine) return;
+    static uint32_t used, depth, over, skipBits, beginsThisFrame;
+    bool stamp = false;
+    if (kind == GC_BEGIN) { ++s_gcRxBegin; if (++beginsThisFrame > s_gcBeginPeak) s_gcBeginPeak = beginsThisFrame; }
+    else if (kind == GC_END) ++s_gcRxEnd;
+    else if (kind == GC_FRAME) ++s_gcRxFrame;
+    const bool can = s_ready && ProcUIInForeground();
+    switch (kind) {
+    case GC_FRAME:
+        used = depth = over = skipBits = beginsThisFrame = 0;
+        stamp = can;
+        break;
+    case GC_BEGIN:
+        stamp = can && used + 3 <= kGcWorkerBudget;
+        if (depth < 32) { skipBits = (skipBits << 1) | (stamp ? 0u : 1u); ++depth; }
+        else { ++over; stamp = false; ++s_gcDropOver; }
+        if (!stamp) { ++s_gcDrops; if (!can) ++s_gcDropCan; else ++s_gcDropBudget; }
+        break;
+    case GC_END:
+        if (over) { --over; break; }
+        if (depth) { stamp = !(skipBits & 1u); skipBits >>= 1; --depth; }
+        break;
+    default:
+        break;
+    }
+    if (!stamp) return;
+    flushBatch();
+    if (s_gx2ProdEnabled && !gx2DlOpenForDraw()) return;
+    used += kind == GC_BEGIN ? 2 : 1;
+    if (kind == GC_BEGIN) ++s_gcStampedCat;
+    gcStampNow(kind, id);
+}
+
+static void gcEmit(uint32_t kind, uint32_t id) {
+    if (s_gx2ProdEnabled) producerHostState(kHostGpuCat, uint8_t(kind), id);
+    else rendererGpuCatMark(uint8_t(kind), id);
+}
+
+// Core 1, from executeDraw.
+extern "C" void smg_wiiu_gpucat_mark(int begin, int category) {
+    if (OSGetCoreId() != 1) return;
+    if (s_gcState < 0) gcInit();
+    if (s_gcState != 1 && !s_tinyCatOn && !s_catStatsOn) return;
+    if (category < 0 || category > 255) return;
+    gcEmit(begin ? GC_BEGIN : GC_END, uint32_t(category));
+}
+
+// Core 1, from the copy macros: a copy executes here, in command order.
+extern "C" void smg_wiiu_gpucat_copy(int begin, int id) {
+    if (s_gcState != 1 || OSGetCoreId() != 1) return;
+    if (begin) {
+        s_gcCopyOpen = s_gcCopyUsed + 2 <= kGcCopyBudget;
+        if (!s_gcCopyOpen) { ++s_gcDrops; ++s_gcDropCopy; return; }
+        s_gcCopyUsed += 2;
+        gcStampNow(GC_COPY_BEGIN, uint32_t(id));
+    } else if (s_gcCopyOpen) {
+        s_gcCopyOpen = false;
+        gcStampNow(GC_COPY_END, uint32_t(id));
+    }
+}
+
+static constexpr uint64_t kGcMaxJump = 27000000ull;  // 1 s of GPU timer
+static void gcWalk(const GcRec* r, uint32_t n) {
+    for (uint32_t k = 0; k < n; ++k) {
+        const GcRec& e = r[k];
+        // A stamp far from the running cursor is garbage (or a real stall): skip its
+        // time, never let it move the cursor.  A far stamp that a second record
+        // confirms is a real jump and re-anchors the cursor.
+        bool timeOk = true;
+        if (s_gcCursor) {
+            const uint64_t d = e.t > s_gcCursor ? e.t - s_gcCursor : s_gcCursor - e.t;
+            if (d > kGcMaxJump) {
+                const uint64_t c = e.t > s_gcCand ? e.t - s_gcCand : s_gcCand - e.t;
+                if (s_gcCand && c <= kGcMaxJump) { s_gcCursor = e.t; s_gcCand = 0; }
+                else { s_gcCand = e.t; ++s_gcBadStamp; ++s_gcBadJump[e.kind < 6 ? e.kind : 0]; }
+                timeOk = false;
+            }
+        }
+        if (timeOk) {
+            if (e.kind == GC_BEGIN && s_gcCursor && e.top > s_gcCursor && e.top < e.t && e.top != ~0ull) {
+                s_gcIdle += e.top - s_gcCursor;
+                s_gcCursor = e.top;
+            }
+            if (s_gcCursor && e.t > s_gcCursor)
+                s_gcAcc[s_gcDepth ? s_gcStack[s_gcDepth - 1] : kGcOwnerOther] += e.t - s_gcCursor;
+            if (e.t > s_gcCursor || !s_gcCursor) s_gcCursor = e.t;
+        }
+        switch (e.kind) {
+        case GC_BEGIN: if (s_gcDepth < 32) s_gcStack[s_gcDepth++] = e.id & 255; break;
+        case GC_COPY_BEGIN: if (s_gcDepth < 32) s_gcStack[s_gcDepth++] = kGcOwnerCopy + (e.id & 1); break;
+        case GC_END:
+        case GC_COPY_END: {
+            const uint32_t owner = e.kind == GC_END ? (e.id & 255) : kGcOwnerCopy + (e.id & 1);
+            for (uint32_t d = s_gcDepth; d > 0; --d)
+                if (s_gcStack[d - 1] == owner) { s_gcDepth = d - 1; break; }
+            break;
+        }
+        case GC_FRAME: s_gcDepth = 0; ++s_gcFrames; break;
+        }
+    }
+}
+
+static void gcReport() {
+    if (s_gcFrames) {
+        const uint32_t f = s_gcFrames;
+        uint64_t total = 0;
+        for (uint32_t i = 0; i < kGcOwners; ++i) total += s_gcAcc[i];
+        char buf[900];
+        int len = std::snprintf(buf, sizeof buf, "SMG Wii U: [gpucat] stage=%s frames=%u total=%u idle=%u cat=", s_gcStage,
+                                (unsigned)f, (unsigned)(total / 27 / f), (unsigned)(s_gcIdle / 27 / f));
+        bool done[256] = {};
+        for (int rank = 0; rank < 15; ++rank) {
+            int best = -1;
+            for (int i = 0; i < 256; ++i)
+                if (!done[i] && s_gcAcc[i] / 27 / f && (best < 0 || s_gcAcc[i] > s_gcAcc[best])) best = i;
+            if (best < 0) break;
+            done[best] = true;
+            if (len > 0 && len < int(sizeof buf) - 24)
+                len += std::snprintf(buf + len, sizeof buf - len, "%s%d:%u", rank ? "," : "", best, (unsigned)(s_gcAcc[best] / 27 / f));
+        }
+        if (len > 0 && len < int(sizeof buf) - 200)
+            std::snprintf(buf + len, sizeof buf - len, " copies=%u present=%u other=%u drops=%u lost=%u ring=%u budget=%u over=%u can=%u copy=%u bad=%u cursor=%llu rx(b/e/f)=%u/%u/%u stamped=%u peakb=%u", (unsigned)(s_gcAcc[kGcOwnerCopy] / 27 / f),
+                          (unsigned)(s_gcAcc[kGcOwnerCopy + 1] / 27 / f), (unsigned)(s_gcAcc[kGcOwnerOther] / 27 / f), (unsigned)s_gcDrops,
+                          (unsigned)s_gcLost, (unsigned)s_gcDropRing, (unsigned)s_gcDropBudget, (unsigned)s_gcDropOver, (unsigned)s_gcDropCan, (unsigned)s_gcDropCopy, (unsigned)s_gcBadStamp, (unsigned long long)s_gcCursor,
+                          (unsigned)(s_gcRxBegin / f), (unsigned)(s_gcRxEnd / f), (unsigned)(s_gcRxFrame / f), (unsigned)(s_gcStampedCat / f), (unsigned)s_gcBeginPeak);
+        WHBLogPrintf("%s", buf);
+        WHBLogPrintf("SMG Wii U: [gpucat-bad] stage=%s frames=%u neg(k1..k5)=%u/%u/%u/%u/%u jump(k1..k5)=%u/%u/%u/%u/%u", s_gcStage, (unsigned)f,
+                     (unsigned)s_gcBadNeg[1], (unsigned)s_gcBadNeg[2], (unsigned)s_gcBadNeg[3], (unsigned)s_gcBadNeg[4], (unsigned)s_gcBadNeg[5],
+                     (unsigned)s_gcBadJump[1], (unsigned)s_gcBadJump[2], (unsigned)s_gcBadJump[3], (unsigned)s_gcBadJump[4], (unsigned)s_gcBadJump[5]);
+    }
+    memset(s_gcAcc, 0, sizeof s_gcAcc);
+    s_gcIdle = 0;
+    s_gcFrames = s_gcDrops = s_gcLost = 0;
+    s_gcDropRing = s_gcDropBudget = s_gcDropCan = s_gcDropCopy = 0;
+    s_gcRxBegin = s_gcRxEnd = s_gcRxFrame = s_gcStampedCat = s_gcDropOver = s_gcBeginPeak = s_gcBadStamp = 0;
+    memset(s_gcBadNeg, 0, sizeof s_gcBadNeg);
+    memset(s_gcBadJump, 0, sizeof s_gcBadJump);
+    s_gcLogAt = OSGetTime();
+}
+
+static void gcCollect() {
+    const uint32_t head = s_gcHead;
+    while (s_gcTail != head && s_gcPendN < kGcPend) {
+        const uint32_t i = s_gcTail & (kGcSlots - 1);
+        GcLine* line = &s_gcLine[i];
+        DCInvalidateRange(line, sizeof(GcLine));
+        const uint32_t meta = s_gcMeta[i], kind = meta >> 16;
+        const bool neg = kind && (line->bottom == ~0ull || line->top == ~0ull);
+        if (neg && !s_gcFix) {
+            ++s_gcBadStamp;  // garbage stamp: drop the record, keep the ring moving
+            ++s_gcBadNeg[kind < 6 ? kind : 0];
+            if (s_gcDumped < 40) { ++s_gcDumped; WHBLogPrintf("SMG Wii U: [gpucat-raw] %u BAD kind=%u id=%u top=%llx bottom=%llx", (unsigned)s_gcDumped, (unsigned)kind, (unsigned)(meta & 0xffff), (unsigned long long)line->top, (unsigned long long)line->bottom); }
+            s_gcStall = 0;
+        } else if (!kind || neg || !line->bottom || (kind == GC_BEGIN && !line->top)) {
+            // With gpucatfix a ~0 is a placeholder: the GPU has not written the stamp yet.
+            // A stamp that never arrives (list lost) must not stall the ring for good.
+            if (++s_gcStall > 90) {
+                s_gcStall = 0; ++s_gcLost;
+                if (neg) ++s_gcBadNeg[kind < 6 ? kind : 0];
+            }
+            else break;
+        } else {
+            s_gcStall = 0;
+            GcRec& r = s_gcPend[s_gcPendN++];
+            r.t = line->bottom; r.top = line->top; r.kind = kind; r.id = meta & 0xffff;
+            if (s_gcDumped < 40 && (kind == GC_BEGIN || kind == GC_END)) { ++s_gcDumped; WHBLogPrintf("SMG Wii U: [gpucat-raw] %u kind=%u id=%u top=%llu bottom=%llu", (unsigned)s_gcDumped, (unsigned)kind, (unsigned)r.id, (unsigned long long)r.top, (unsigned long long)r.t); }
+        }
+        s_gcMeta[i] = 0;
+        memset(line, 0, sizeof(GcLine));
+        DCFlushRange(line, sizeof(GcLine));
+        ++s_gcTail;
+    }
+    // Worker and core-1 records interleave: order by GPU time (insertion sort, nearly sorted).
+    for (uint32_t a = 1; a < s_gcPendN; ++a) {
+        const GcRec x = s_gcPend[a];
+        uint32_t b = a;
+        while (b > 0 && s_gcPend[b - 1].t > x.t) { s_gcPend[b] = s_gcPend[b - 1]; --b; }
+        s_gcPend[b] = x;
+    }
+    int lastFrame = -1;
+    for (uint32_t a = 0; a < s_gcPendN; ++a)
+        if (s_gcPend[a].kind == GC_FRAME) lastFrame = int(a);
+    if (lastFrame < 0 && s_gcPendN == kGcPend) lastFrame = int(kGcPend) - 1;  // never wedge on a full buffer
+    if (lastFrame < 0) return;
+    const uint32_t used = uint32_t(lastFrame) + 1;
+    gcWalk(s_gcPend, used);
+    memmove(s_gcPend, s_gcPend + used, (s_gcPendN - used) * sizeof(GcRec));
+    s_gcPendN -= used;
+    if (OSGetTime() - s_gcLogAt >= OSSecondsToTicks(2)) gcReport();
+}
+
+// Core 1, every frame start: the frame marker, then read what the GPU has finished.
+extern "C" void smg_wiiu_gpucat_frame(void) {
+    if (OSGetCoreId() != 1) return;
+    if (s_gcState < 0) gcInit();
+    if (s_gcState != 1 && !s_tinyCatOn && !s_catStatsOn) return;
+    s_gcCopyUsed = 0;
+    s_gcCopyOpen = false;
+    gcEmit(GC_FRAME, 0);
+    if (s_gcState == 1) gcCollect();
+}
+
+// Core 1, from the scene start: records for the old stage are reported under its name.
+static void gcSetStage(const char* name) {
+    if (s_gcState == 1) gcReport();
+    s_gcDumped = 0;  // dump the first worker records and bad stamps of every stage
+    std::snprintf(s_gcStage, sizeof s_gcStage, "%s", name);
+}
+#endif
+
+#if defined(PORT_GAME_SMG)
+// Dynamic resolution for Galaxy (wiiu-dynres, as on Sunshine's peek-ceiling
+// branch).  Opt-in: SD marker "dynres" (read once; absent = nothing below runs).
+// The render target (kRenderW x kRenderH: 1280x720 with tv720, else 854x480) is
+// the ceiling.  GPU busy time per frame comes from GPU timestamps (see the
+// gpuframe stamps below) and picks a smaller internal size per stage; the
+// present's scan copy (GX2CopyColorBufferToScanBuffer) scales it to the scan
+// buffer.  A size only changes at a frame start, after the producer is drained.
+static constexpr uint32_t kDynresSizes = 4;
+static dynres_ctx s_dynres;
+static dynres_store s_dynresStore;
+static int s_dynresState = -1;                 // -1 unread, 0 off, 1 on
+static uint16_t s_dynresLinesTab[kDynresSizes];
+static uint16_t s_dynresWidthTab[kDynresSizes];
+static char s_dynresPending[DYNRES_NAME_MAX];
+static volatile uint32_t s_dynresPendingSeq;
+static uint32_t s_dynresSeenSeq;
+static char s_dynresStage[DYNRES_NAME_MAX];
+static volatile uint32_t s_dynresLines;        // size dynres wants; 0 before the first stage
+static uint32_t s_dynresHiZCap;
+static uint32_t s_dynresReadBytes, s_dynresSinceRead = 1000;
+static uint64_t s_dynresLogSum, s_dynresLogMax;
+static uint32_t s_dynresLogFrames;
+static OSTime s_dynresLogAt;
+
+static void dynresPath(char* out, size_t n) { std::snprintf(out, n, "%sdynres.txt", sms_wiiu_app_root()); }
+
+// GPU frame stamps: core 1 stamps the top of pipe at frame start and before each
+// replayed list, and the bottom of pipe after each list or serviced callback and
+// before the swap.  A top stamp later than every earlier bottom stamp is time the
+// GPU sat drained, waiting for commands; busy = span - idle.  A frame is read four
+// frames later, when the GPU has long written it.  The GPU timer is 27 MHz.
+extern "C" void GX2SampleBottomGPUCycle(uint64_t* result);
+extern "C" void GX2SampleTopGPUCycle(uint64_t* result);
+static constexpr uint32_t kGfFrames = 4, kGfStamps = 512;
+static uint64_t* s_gfStamp;
+static uint8_t s_gfKind[kGfFrames][kGfStamps];   // 0 top of pipe, else a bottom stamp
+static uint32_t s_gfCount[kGfFrames], s_gfFrame;
+static uint64_t s_gfPrevEnd;
+
+static void dynresGpuFrame(uint32_t busyUs);
+
+static void gfStamp(uint32_t kind, bool end = false) {
+    const uint32_t f = s_gfFrame % kGfFrames;
+    uint32_t& n = s_gfCount[f];
+    if (n >= kGfStamps - (end ? 0 : 1)) return;
+    uint64_t* slot = s_gfStamp + f * kGfStamps + n;
+    s_gfKind[f][n++] = uint8_t(kind);
+    if (kind) GX2SampleBottomGPUCycle(slot);
+    else GX2SampleTopGPUCycle(slot);
+}
+
+static void gfCollect(uint32_t f) {
+    const uint32_t n = s_gfCount[f];
+    s_gfCount[f] = 0;
+    if (!n) return;
+    uint64_t* st = s_gfStamp + f * kGfStamps;
+    DCInvalidateRange(st, n * 8);
+    bool ready = true;
+    for (uint32_t i = 0; i < n; ++i)
+        if (!st[i]) ready = false;
+    if (ready && s_gfKind[f][n - 1]) {
+        const uint64_t end = st[n - 1];
+        uint64_t busyUntil = s_gfPrevEnd, idle = 0;
+        for (uint32_t i = 0; i < n; ++i) {
+            if (s_gfKind[f][i]) {
+                if (st[i] > busyUntil) busyUntil = st[i];
+            } else if (busyUntil && st[i] > busyUntil) {
+                idle += st[i] - busyUntil;
+                busyUntil = st[i];
+            }
+        }
+        if (s_gfPrevEnd && end > s_gfPrevEnd) {
+            const uint64_t span = end - s_gfPrevEnd;
+            dynresGpuFrame(uint32_t((span - (idle < span ? idle : span)) / 27));
+        }
+        s_gfPrevEnd = end;
+    } else {
+        s_gfPrevEnd = 0;
+    }
+    memset(st, 0, n * 8);
+    DCFlushRange(st, n * 8);
+}
+
+extern "C" void smg_wiiu_gpuframe_stamp(int kind) {
+    if (s_dynresState == 1 && s_gfStamp && OSGetCoreId() == 1) gfStamp(uint32_t(kind));
+}
+
+// Core 1, just before the swap: closes the frame's stamps and reads the oldest.
+extern "C" void smg_wiiu_gpuframe_end(void) {
+    if (s_dynresState != 1 || !s_gfStamp || OSGetCoreId() != 1) return;
+    gfStamp(6, true);
+    ++s_gfFrame;
+    gfCollect(s_gfFrame % kGfFrames);
+}
+
+static uint16_t dynresWidth(uint32_t lines) { return uint16_t((lines * 16u / 9u) & ~1u); }
+
+// Called at every frame start (sms_wiiu_gx2_target_begin), core 1.
+static bool dynresPrepare() {
+    if (s_dynresState >= 0) return s_dynresState == 1;
+    s_dynresState = 0;
+    if (!sdMarkerPresent("dynres")) {
+        WHBLogPrintf("SMG Wii U: [dynres] off (SD marker dynres)");
+        return false;
+    }
+    if (!s_renderOwn || !s_gx2ProdEnabled) {
+        WHBLogPrintf("SMG Wii U: [dynres] off (needs the native render target and gx2prod: own=%d prod=%d)",
+                     s_renderOwn ? 1 : 0, s_gx2ProdEnabled ? 1 : 0);
+        return false;
+    }
+    // The user finds 480 lines too blurry (2026-11-08): never go below 5/6 of the ceiling.
+    static const uint32_t kSteps24[kDynresSizes] = {24, 23, 22, 20};  // 720: 720/690/660/600
+    for (uint32_t i = 0; i < kDynresSizes; ++i) {
+        s_dynresLinesTab[i] = uint16_t(i == 0 ? kRenderH : (kRenderH * kSteps24[i] / 24u) & ~1u);
+        s_dynresWidthTab[i] = i == 0 ? uint16_t(kRenderW) : dynresWidth(s_dynresLinesTab[i]);
+    }
+    dynres_config cfg;
+    dynres_default_config(&cfg, s_dynresLinesTab, kDynresSizes, 16667);  // 60 fps
+    if (dynres_init(&s_dynres, &cfg) != 0) {
+        WHBLogPrintf("SMG Wii U: [dynres] off (dynres_init rejected the size table)");
+        return false;
+    }
+    s_gfStamp = static_cast<uint64_t*>(MEMAllocFromDefaultHeapEx(kGfFrames * kGfStamps * 8, 64));
+    if (!s_gfStamp) {
+        WHBLogPrintf("SMG Wii U: [dynres] off (no memory for the GPU frame stamps)");
+        return false;
+    }
+    memset(s_gfStamp, 0, kGfFrames * kGfStamps * 8);
+    DCFlushRange(s_gfStamp, kGfFrames * kGfStamps * 8);
+    s_dynresHiZCap = s_renderDepth.hiZPtr ? s_renderDepth.hiZSize : 0;
+    char path[256];
+    dynresPath(path, sizeof(path));
+    const int loaded = dynres_store_load(&s_dynresStore, path);
+    s_dynresState = 1;
+    s_dynresLogAt = OSGetTime();
+    WHBLogPrintf("SMG Wii U: [dynres] on, ceiling %ux%u, sizes %u/%u/%u/%u, %d remembered stage(s)",
+                 (unsigned)kRenderW, (unsigned)kRenderH, (unsigned)s_dynresLinesTab[0], (unsigned)s_dynresLinesTab[1],
+                 (unsigned)s_dynresLinesTab[2], (unsigned)s_dynresLinesTab[3], loaded);
+    return true;
+}
+
+static void dynresEndVisit() {
+    if (!s_dynres.active || !s_dynresStage[0]) return;
+    const unsigned heaviest = s_dynres.heaviest_us, measured = s_dynres.measured;
+    const int keep = dynres_end_stage(&s_dynres);
+    const int changed = keep > 0 ? dynres_store_set(&s_dynresStore, s_dynresStage, keep) : 0;
+    bool saved = false;
+    if (changed == 1) {
+        char path[256];
+        dynresPath(path, sizeof(path));
+        saved = dynres_store_save(&s_dynresStore, path) == 0;
+    }
+    WHBLogPrintf("SMG Wii U: [dynres] %s end %u heaviest=%u.%ums measured=%u -> remember %d%s", s_dynresStage,
+                 (unsigned)dynres_lines(&s_dynres), heaviest / 1000, heaviest % 1000 / 100, measured, keep,
+                 changed == 1 ? (saved ? " (saved)" : " (SAVE FAILED)") : " (unchanged)");
+}
+
+// Core 1, from the game's scene start: the stage this visit renders.
+extern "C" void smg_wiiu_dynres_stage(const char* stage, const char* scene) {
+    const char* name = stage && *stage ? stage : scene;
+    if (!name || !*name) return;
+    size_t k = 0;
+    for (; name[k] && k + 1 < sizeof(s_dynresPending); ++k) s_dynresPending[k] = name[k] <= ' ' ? '_' : name[k];
+    s_dynresPending[k] = 0;
+    gcSetStage(s_dynresPending);
+    __asm__ volatile("sync" ::: "memory");
+    ++s_dynresPendingSeq;
+}
+
+// Core 1, from the exit path: close the open visit so its size is remembered.
+extern "C" void smg_wiiu_dynres_shutdown(void) {
+    if (s_dynresState == 1) dynresEndVisit();
+}
+
+// Core 1, at present: one frame's GPU busy time, read four frames late.  While HD
+// pack textures stream in (a stage's first seconds) the window is held, not judged;
+// the 8-frame tail covers the frames read late.
+static void dynresGpuFrame(uint32_t busyUs) {
+    if (s_dynresState != 1 || !s_dynres.active) return;
+    TexturePackStats tp = {};
+    texturePackGetStats(&tp);
+    if (tp.archiveReadBytes != s_dynresReadBytes) {
+        s_dynresReadBytes = tp.archiveReadBytes;
+        s_dynresSinceRead = 0;
+    } else if (s_dynresSinceRead < 1000) {
+        ++s_dynresSinceRead;
+    }
+    if (s_dynresSinceRead < 8) dynres_hold(&s_dynres);
+    const uint16_t before = dynres_lines(&s_dynres);
+    dynres_frame(&s_dynres, busyUs);
+    const uint16_t after = dynres_lines(&s_dynres);
+    s_dynresLogSum += busyUs;
+    if (busyUs > s_dynresLogMax) s_dynresLogMax = busyUs;
+    ++s_dynresLogFrames;
+    if (after != before) {
+        s_dynresLines = after;
+        WHBLogPrintf("SMG Wii U: [dynres] %s down %u->%u avg=%u.%ums", s_dynresStage, (unsigned)before, (unsigned)after,
+                     (unsigned)(s_dynres.last_avg_us / 1000), (unsigned)(s_dynres.last_avg_us % 1000 / 100));
+    }
+    const OSTime now = OSGetTime();
+    if (now - s_dynresLogAt >= OSSecondsToTicks(2) && s_dynresLogFrames) {
+        const uint32_t avg = uint32_t(s_dynresLogSum / s_dynresLogFrames), mx = uint32_t(s_dynresLogMax);
+        WHBLogPrintf("SMG Wii U: [dynres] %s size=%ux%u gpu busy avg=%u.%ums max=%u.%ums frames=%u",
+                     s_dynresStage, (unsigned)s_renderColour.surface.width, (unsigned)s_renderColour.surface.height,
+                     avg / 1000, avg % 1000 / 100, mx / 1000, mx % 1000 / 100, (unsigned)s_dynresLogFrames);
+        s_dynresLogAt = now;
+        s_dynresLogSum = s_dynresLogMax = 0;
+        s_dynresLogFrames = 0;
+    }
+}
+
+// Lay the render target out again at lines (width from the size table).  The
+// colour and depth surfaces keep their memory (the WHB TV buffers); a size that
+// does not fit, or is not aligned, is refused and the old layout kept.
+static bool dynresResize(uint32_t lines, uint32_t width) {
+    GX2ColorBuffer* tv = WHBGfxGetTVColourBuffer();
+    GX2DepthBuffer* td = WHBGfxGetTVDepthBuffer();
+    if (!tv || !td) return false;
+    const GX2ColorBuffer oldColour = s_renderColour;
+    const GX2DepthBuffer oldDepth = s_renderDepth;
+    void* ci = s_renderColour.surface.image;
+    void* di = s_renderDepth.surface.image;
+    GX2Surface& c = s_renderColour.surface;
+    GX2Surface& d = s_renderDepth.surface;
+    c.width = width; c.height = lines; c.image = nullptr; c.mipmaps = nullptr; c.swizzle = 0;
+    GX2CalcSurfaceSizeAndAlignment(&c);
+    d.width = width; d.height = lines; d.image = nullptr; d.mipmaps = nullptr; d.swizzle = 0;
+    GX2CalcSurfaceSizeAndAlignment(&d);
+    uint32_t hiZSize = 0, hiZAlignment = 0;
+    bool fits = c.imageSize <= tv->surface.imageSize && d.imageSize <= td->surface.imageSize &&
+                (reinterpret_cast<uintptr_t>(ci) % c.alignment) == 0 &&
+                (reinterpret_cast<uintptr_t>(di) % d.alignment) == 0;
+    c.image = ci;
+    d.image = di;
+    if (fits && s_renderDepth.hiZPtr) {
+        GX2CalcDepthBufferHiZInfo(&s_renderDepth, &hiZSize, &hiZAlignment);
+        fits = hiZSize <= s_dynresHiZCap && (reinterpret_cast<uintptr_t>(s_renderDepth.hiZPtr) % hiZAlignment) == 0;
+    }
+    if (!fits) {
+        s_renderColour = oldColour;
+        s_renderDepth = oldDepth;
+        WHBLogPrintf("SMG Wii U: [dynres] %ux%u does not fit the target memory; keeping %ux%u", (unsigned)width,
+                     (unsigned)lines, (unsigned)oldColour.surface.width, (unsigned)oldColour.surface.height);
+        return false;
+    }
+    if (s_renderDepth.hiZPtr) {
+        s_renderDepth.hiZSize = hiZSize;
+        memset(s_renderDepth.hiZPtr, 0, hiZSize);
+        DCFlushRange(s_renderDepth.hiZPtr, hiZSize);
+        GX2InitDepthBufferHiZEnable(&s_renderDepth, TRUE);
+    }
+    GX2InitColorBufferRegs(&s_renderColour);
+    GX2InitDepthBufferRegs(&s_renderDepth);
+    return true;
+}
+
+// Frame start, core 1, before anything of the frame is recorded.
+static void dynresFrameStart() {
+    if (!dynresPrepare()) return;
+    if (s_dynresPendingSeq != s_dynresSeenSeq) {
+        s_dynresSeenSeq = s_dynresPendingSeq;
+        __asm__ volatile("sync" ::: "memory");
+        dynresEndVisit();
+        memcpy(s_dynresStage, s_dynresPending, sizeof(s_dynresStage));
+        const int remembered = dynres_store_get(&s_dynresStore, s_dynresStage);
+        dynres_begin_stage(&s_dynres, remembered, 0);
+        s_dynresLines = dynres_lines(&s_dynres);
+        WHBLogPrintf("SMG Wii U: [dynres] %s begin %u (%s)", s_dynresStage, (unsigned)s_dynresLines,
+                     remembered ? "remembered" : "full");
+    }
+    const uint32_t want = s_dynresLines;
+    if (want && want != s_renderColour.surface.height) {
+        uint32_t width = 0;
+        for (uint32_t i = 0; i < kDynresSizes; ++i)
+            if (s_dynresLinesTab[i] == want) width = s_dynresWidthTab[i];
+        if (width) {
+            sms_wiiu_pipe5_wait_resource_fence();
+            // The worker and the scan copy read the target's size: let them finish the
+            // last frame first, then the GPU, before the memory is laid out again.
+            if (sms_wiiu_pipe2_enabled()) gx2prod::waitPending(gx2prod::kWaitEndFrame);
+            gx2prod::wait(gx2prod::kWaitPresent);
+            gx2prod::service();
+            GX2DrawDone();
+            const uint32_t oldW = s_renderColour.surface.width, oldH = s_renderColour.surface.height;
+            if (dynresResize(want, width)) {
+                invalidateVertexUniforms();
+                WHBLogPrintf("SMG Wii U: [dynres] %s render target %ux%u -> %ux%u (scan copy scales to the TV/DRC)",
+                             s_dynresStage, (unsigned)oldW, (unsigned)oldH, (unsigned)width, (unsigned)want);
+            } else {
+                s_dynresLines = s_renderColour.surface.height;  // do not retry every frame
+            }
+            s_gfPrevEnd = 0;  // the wait above is not GPU time
+        }
+    }
+    gfStamp(0);
+}
+#endif
+
+#if defined(PORT_GAME_SMG)
+/* Galaxy's wide EFB carries 456 picture lines in a 480-line EFB. The game is
+ * drawn with a vertical scale of target height / 456 (updateTarget), so the
+ * picture already fills the render target and the scan copies are plain.
+ * Scaling in the scan copy instead (8fb05b5, 3c644dd: a 680/684-line source
+ * view) made the GamePad picture jump; a plain copy was steady (testE).
+ * SD marker "norenderstretch" = old 480 scale (black bar at the bottom). */
+static bool s_renderStretch = true;
 
 static void copyGameToScanBuffer(GX2ScanTarget target) {
     GX2ColorBuffer* colour = renderColour();
     if (!colour) return;
-    // Tiled surfaces need a height in whole 8-line micro tiles, and the copy
-    // reads the colour buffer through its precomputed registers: a bare
-    // height edit (684 lines, stale regs) made the TV picture jump/smear.
-    const uint32_t imageHeight = ((colour->surface.height * 456u) / 480u) & ~7u;
-    const uint32_t slot = target == GX2_SCAN_TARGET_DRC ? 1u : 0u;
-    if (imageHeight && imageHeight < colour->surface.height) {
-        GX2ColorBuffer source = *colour;
-        source.surface.height = imageHeight;
-        GX2InitColorBufferRegs(&source);
-        if (!s_presentScaleLogged[slot]) {
-            s_presentScaleLogged[slot] = true;
-            WHBLogPrintf("SMG Wii U: [present-scale] %s source=%ux%u -> scan height=%u",
-                         slot ? "DRC" : "TV", unsigned(source.surface.width), unsigned(imageHeight),
-                         unsigned(colour->surface.height));
-        }
-        GX2CopyColorBufferToScanBuffer(&source, target);
-    } else {
-        GX2CopyColorBufferToScanBuffer(colour, target);
-    }
+    GX2CopyColorBufferToScanBuffer(colour, target);
 }
 #endif
 
 // Frame start (instead of WHBGfxBeginRenderTV + clear) and present.
 extern "C" void sms_wiiu_gx2_target_begin(void) {
     initRenderTarget();
+#if defined(PORT_GAME_SMG)
+    if (s_renderOwn) dynresFrameStart();
+    smg_wiiu_gpucat_frame();
+#endif
     if (!s_renderOwn) {
         WHBGfxBeginRenderTV();
         WHBGfxClearColor(0.02f, 0.18f, 0.03f, 1.0f);
@@ -5650,21 +7325,31 @@ static void updateTarget() {
     }
     s_gameScaleY = s_tvH / 480.0f;
     s_gameScaleX = s_aspect43 ? s_gameScaleY : s_tvW / 640.0f;
+#if defined(PORT_GAME_SMG)
+    // nextafter: 456 * scale must not round down to one line short.
+    if (s_renderStretch && !s_aspect43) s_gameScaleY = std::nextafter(s_tvH / 456.0f, 2.0f * s_tvH / 456.0f);
+#endif
     s_lodScale = s_gameScaleY;
     s_gameOffsetX = s_aspect43 ? (s_tvW - 640.0f * s_gameScaleX) * 0.5f : 0.0f;
 }
 
 static void applyState() {
     // Same inputs as the last draw: GX2 already holds this state.
-    struct StateInputs { uint32_t zmode, xf5, cm0, cm1, pe, genmode, lpsize, scissor[4]; float scaleX, scaleY, offsetX, w, h; };
+    struct StateInputs { uint32_t zmode, xf5, cm0, cm1, pe, genmode, lpsize, scissor[4]; float scaleX, scaleY, offsetX, w, h; uint32_t tiny; float clearDepth; };
     StateInputs in;
     memset(&in, 0, sizeof(in));
     in.zmode = g.bp[BP_ZMODE]; in.xf5 = g.xfReg[0x05];
+#if defined(PORT_GAME_SMG)
+    in.clearDepth = s_clearDrawActive ? s_clearDrawDepth : -1.0f;
+#endif
     in.cm0 = g.bp[BP_CMODE0]; in.cm1 = g.bp[BP_CMODE1];
     in.pe = g.bp[BP_PE_CONTROL]; in.genmode = g.bp[BP_GENMODE]; in.lpsize = g.bp[BP_LPSIZE];
     memcpy(in.scissor, g.scissor, sizeof(in.scissor));
     in.scaleX = s_gameScaleX; in.scaleY = s_gameScaleY; in.offsetX = s_gameOffsetX;
     in.w = s_tvW; in.h = s_tvH;
+#if defined(PORT_GAME_SMG)
+    in.tiny = s_tinyActive ? 1u : 0u;
+#endif
     static StateInputs s_last;
     if (s_stateValid && !memcmp(&in, &s_last, sizeof(in))) return;
     s_last = in;
@@ -5735,11 +7420,27 @@ static void applyState() {
     // transform() already applies the GX viewport (into the TV target),
     // so GX2's own viewport must be the identity mapping.
     (void)vx; (void)vy; (void)vw; (void)vh;
+#if defined(PORT_GAME_SMG)
+    // clearfast v2: a Z-texture REPLACE clear quad draws at one depth through the depth range (no PS depth export).
+    if (s_clearDrawActive) GX2SetViewport(0.0f, 0.0f, s_tvW, s_tvH, s_clearDrawDepth, s_clearDrawDepth);
+    else
+#endif
     GX2SetViewport(0.0f, 0.0f, s_tvW, s_tvH, 0.0f, 1.0f);
     const int sx = int(s_gameOffsetX + g.scissor[0] * scaleX);
     const int sy = int(g.scissor[1] * scaleY);
+#if defined(PORT_GAME_SMG)
+    int sw = int(g.scissor[2] * scaleX);
+    int sh = int(g.scissor[3] * scaleY);
+    if (sy + sh > int(s_tvH)) sh = sy < int(s_tvH) ? int(s_tvH) - sy : 0;  // 480-line scissor at the 456 scale
+    // Marker tinyscissor (diagnostic A/B, the picture is unusable): every draw
+    // rasterizes into at most 64x64 pixels, so pixel fill and shading cost
+    // vanish while vertex work, state, copies and clears stay.  If frame time
+    // collapses, the frame is GPU-fill bound.
+    if (s_tinyScissor || (s_tinyActive && !s_tinyTex && !s_tinyDup && !s_tinyHalf)) { sw = 64; sh = sh < 64 ? sh : 64; }
+#else
     const int sw = int(g.scissor[2] * scaleX);
     const int sh = int(g.scissor[3] * scaleY);
+#endif
     GX2SetScissor(sx, sy, sw, sh);
     GX2SetLineWidth(float(g.bp[BP_LPSIZE] & 0xffu) / 6.0f * scaleX);
     const float pointSize = float((g.bp[BP_LPSIZE] >> 8) & 0xffu) / 6.0f;
@@ -5945,13 +7646,12 @@ static bool evalTev(const HostVertex& in, float* rgba, bool* usesTex) {
     return true;
 }
 
-static void transformPosition(const HostVertex& in, float* out) {
-    const uint32_t matrix = in.mtx[0] & 63;
+static void transformPositionRaw(const float pos[3], uint32_t matrix, float* out) {
     const uint32_t addr = matrix * 4;
     const float* m = reinterpret_cast<const float*>(&g.xfMem[addr]);
-    const float x = m[0] * in.pos[0] + m[1] * in.pos[1] + m[2] * in.pos[2] + m[3];
-    const float y = m[4] * in.pos[0] + m[5] * in.pos[1] + m[6] * in.pos[2] + m[7];
-    const float z = m[8] * in.pos[0] + m[9] * in.pos[1] + m[10] * in.pos[2] + m[11];
+    const float x = m[0] * pos[0] + m[1] * pos[1] + m[2] * pos[2] + m[3];
+    const float y = m[4] * pos[0] + m[5] * pos[1] + m[6] * pos[2] + m[7];
+    const float z = m[8] * pos[0] + m[9] * pos[1] + m[10] * pos[2] + m[11];
     // The game can update projection through display-list XF writes rather
     // than GXSetProjection(), so g.projection may lag the live registers.
     // The PC shader reads XF_PROJ directly for this reason.
@@ -5989,6 +7689,121 @@ static void transformPosition(const HostVertex& in, float* out) {
     out[2] = (vp[5] * cw + vp[2] * cz) / 16777215.0f;
     out[3] = cw;
 }
+
+static void transformPosition(const HostVertex& in, float* out) {
+    transformPositionRaw(in.pos, in.mtx[0] & 63, out);
+}
+
+#if defined(PORT_GAME_SMG)
+static uint32_t s_jpaCullRuns;
+static uint32_t s_jpaCullOff;
+static uint32_t s_jpaCullPartial;
+static uint32_t s_jpaCullTiny;
+static uint32_t s_jpaCullSmall;
+static uint32_t s_jpaCullP1;
+static uint32_t s_jpaCullP2;
+static uint32_t s_jpaCullP3Plus;
+static uint32_t s_jpaCullOffParticles;
+static OSTime s_jpaCullLastReport;
+static bool s_jpaCullHaveReport;
+static bool jpaCullClassify(const SmsWiiuJpaFinalVxDesc* desc, JpaCullClass* result) {
+    if (!desc || !desc->vertices || !desc->vertexCount || !desc->vertexStride || !desc->particleCount)
+        return false;
+
+    // Core 1 submits ahead of the worker: use the producer's GX shadow (gProducer), not g.
+    const State& st = gProducer;
+    const uint32_t matrix = st.xfReg[XFR_MATIDX_A] & 63;
+    const float* m = reinterpret_cast<const float*>(&st.xfMem[matrix * 4]);
+    const float* pr = reinterpret_cast<const float*>(&st.xfReg[XFR_PROJ]);
+    const bool ortho = (st.xfReg[XFR_PROJ + 6] & 1) != 0;
+    // A run is off-screen only when EVERY vertex is outside the SAME plane (x/y planes, or behind the eye).
+    bool allOutside[5] = {true, true, true, true, true};
+    bool allInside = true;
+    float minX = 1280.0f, minY = 720.0f, maxX = 0.0f, maxY = 0.0f;
+    bool hasScreenVertex = false;
+    for (uint32_t i = 0; i < desc->vertexCount; ++i) {
+        float pos[3];
+        memcpy(pos, desc->vertices + size_t(i) * desc->vertexStride, sizeof(pos));
+        const float vx = m[0] * pos[0] + m[1] * pos[1] + m[2] * pos[2] + m[3];
+        const float vy = m[4] * pos[0] + m[5] * pos[1] + m[6] * pos[2] + m[7];
+        const float vz = m[8] * pos[0] + m[9] * pos[1] + m[10] * pos[2] + m[11];
+        float x, y, w;
+        if (ortho) { x = pr[0] * vx + pr[1]; y = pr[2] * vy + pr[3]; w = 1.0f; }
+        else { x = pr[0] * vx + pr[1] * vz; y = pr[2] * vy + pr[3] * vz; w = -vz; }
+        const bool outside[5] = {x < -w, x > w, y < -w, y > w, w <= 0.0f};
+        for (unsigned plane = 0; plane < 5; ++plane) {
+            allOutside[plane] = allOutside[plane] && outside[plane];
+            allInside = allInside && !outside[plane];
+        }
+        if (w > 0.00001f) {
+            const float px = std::max(0.0f, std::min(1280.0f, (x / w * 0.5f + 0.5f) * 1280.0f));
+            const float py = std::max(0.0f, std::min(720.0f, (0.5f - y / w * 0.5f) * 720.0f));
+            minX = std::min(minX, px); minY = std::min(minY, py);
+            maxX = std::max(maxX, px); maxY = std::max(maxY, py);
+            hasScreenVertex = true;
+        }
+    }
+
+    bool off = false;
+    for (unsigned plane = 0; plane < 5; ++plane) off = off || allOutside[plane];
+    result->off = off;
+    result->partial = !off && !allInside;
+    result->ortho = ortho;
+    result->area = hasScreenVertex && maxX > minX && maxY > minY
+        ? static_cast<uint32_t>((maxX - minX) * (maxY - minY)) : 0;
+    return true;
+}
+
+static void jpaCullStatsSubmit(const SmsWiiuJpaFinalVxDesc* desc, const JpaCullClass& cls) {
+    const uint32_t particles = desc->particleCount;
+    ++s_jpaCullRuns;
+    if (cls.off) {
+        ++s_jpaCullOff;
+        s_jpaCullOffParticles += particles;
+    } else {
+        if (cls.partial) ++s_jpaCullPartial;
+        if (cls.area < 64) ++s_jpaCullTiny;
+        if (cls.area < 1024) ++s_jpaCullSmall;
+    }
+    if (particles == 1) ++s_jpaCullP1;
+    else if (particles == 2) ++s_jpaCullP2;
+    else ++s_jpaCullP3Plus;
+
+    const OSTime now = OSGetTime();
+    if (!s_jpaCullHaveReport) {
+        s_jpaCullHaveReport = true;
+        s_jpaCullLastReport = now;
+    } else if (now - s_jpaCullLastReport >= OSSecondsToTicks(2)) {
+        port_log("[jpacull] runs=%u off=%u partial=%u tiny=%u (area<64px) small=%u (area<1024px) p1=%u p2=%u p3plus=%u offParticles=%u\n",
+                 s_jpaCullRuns, s_jpaCullOff, s_jpaCullPartial, s_jpaCullTiny,
+                 s_jpaCullSmall, s_jpaCullP1, s_jpaCullP2, s_jpaCullP3Plus,
+                 s_jpaCullOffParticles);
+        s_jpaCullRuns = s_jpaCullOff = s_jpaCullPartial = 0;
+        s_jpaCullTiny = s_jpaCullSmall = s_jpaCullP1 = s_jpaCullP2 = 0;
+        s_jpaCullP3Plus = s_jpaCullOffParticles = 0;
+        s_jpaCullLastReport = now;
+    }
+}
+
+static void jpaThinFrame() {
+    if ((!s_jpaThinOffMarker && !s_jpaThinMarker) || OSGetCoreId() != 1) return;
+    ++s_jpaThinFrames;
+    if (s_jpaThinLoaded) ++s_jpaThinLoadFrames;
+    const uint32_t workerBusy = gx2prod::counters().workerBusyMicros;
+    s_jpaThinLoaded = workerBusy - s_jpaThinLastWorkerBusy > 14000;
+    s_jpaThinLastWorkerBusy = workerBusy;
+    const OSTime now = OSGetTime();
+    if (!s_jpaThinLastReport) s_jpaThinLastReport = now;
+    else if (now - s_jpaThinLastReport >= OSSecondsToTicks(2)) {
+        port_log("[jpathin] runs=%u offSkip=%u smallSkip=%u loadFrames=%u frames=%u\n",
+                 s_jpaThinRuns, s_jpaThinOffSkip, s_jpaThinSmallSkip,
+                 s_jpaThinLoadFrames, s_jpaThinFrames);
+        s_jpaThinRuns = s_jpaThinOffSkip = s_jpaThinSmallSkip = 0;
+        s_jpaThinLoadFrames = s_jpaThinFrames = 0;
+        s_jpaThinLastReport = now;
+    }
+}
+#endif
 
 static void transform(const HostVertex& in, float* out, int texCoord, bool textured, TextureEntry* texture) {
     transformPosition(in, out);
@@ -6060,9 +7875,19 @@ static void buildVertexLiveUniforms(const TevKey& key, TextureEntry* const* text
     colour(g.xfReg[XFR_MAT0 + 1], &live[28]);
     colour(g.xfReg[XFR_AMB0 + 1], &live[32]);
     // C193..C196: manual scale followed by the copy rectangle transform.
+    // The generated vertex program reads these only for coord < numTexGens
+    // (it writes 0/1 for the rest), so later coords keep the defaults and skip
+    // the texture/copy lookups (8 lookups per draw were ~1/3 of this function).
+    const int numTexGens = int(std::min<uint32_t>(g.xfReg[XFR_NUMTEXGENS] & 15, 8));
     for (int coord = 0; coord < 8; ++coord) {
         float* scale = &live[36 + coord * 2];
         scale[0] = scale[1] = 1.0f;
+        if (coord >= numTexGens) {
+            float* copy = &live[52 + coord * 4];
+            copy[0] = copy[1] = 1.0f;
+            copy[2] = copy[3] = 0.0f;
+            continue;
+        }
         TextureEntry* texture = textureForCoord(key, textures, coord);
         if (g.tcManual[coord] && texture && texture->width && texture->height) {
             scale[0] = float((g.bp[BP_SU_SSIZE + coord * 2] & 0xffff) + 1) / float(texture->width);
@@ -6341,8 +8166,72 @@ void rendererInit(float) {
     SMS_PORT_HEAP_SCOPE();
     if (s_ready) return;
     s_tv720Marker = sdGameDefaultMarker("tv720");
+#if defined(PORT_GAME_SMG)
+    s_vsDense = sdMarkerPresent("vsdense");
+    WHBLogPrintf("SMG Wii U: [vsdense] marker=%s", s_vsDense ? "on" : "off");
+    s_tinyScissor = sdMarkerPresent("tinyscissor");
+    if (s_tinyScissor) WHBLogPrintf("SMG Wii U: tinyscissor on (diagnostic)");
+    s_tinyTex = sdMarkerPresent("tinytex");
+    s_tinyPs = sdMarkerPresent("tinyps");
+    if (s_tinyPs) { s_tinyTex = true; WHBLogPrintf("SMG Wii U: tinyps on (diagnostic): tinycat categories run a stub pixel shader, full scissor"); }
+    if (s_tinyTex) WHBLogPrintf("SMG Wii U: tinytex on (diagnostic): tinycat categories sample a 4x4 dummy, full scissor");
+    // vsgpr128: VS 128 / PS 120 (2 vertex wavefronts); vsgpr192: VS 192 / PS 56 (3). TEV PS need <= 44.
+    if (sdMarkerPresent("vsgpr192")) { s_vsGprPool = 192; s_psGprPool = 56; }
+    else if (sdDefaultOnMarker("vsgpr128")) { s_vsGprPool = 128; s_psGprPool = 120; }  // b216: Ice GPU -0.9 ms, Beach -0.5, Planet -27..34%
+    WHBLogPrintf("SMG Wii U: [vsgpr] VS pool %u, PS pool %u", unsigned(s_vsGprPool), unsigned(s_psGprPool));
+    s_tinyDup = sdMarkerPresent("tinydup");
+    s_tinyHalf = sdMarkerPresent("tinyhalf");
+    if (s_tinyDup || s_tinyHalf)
+        WHBLogPrintf("SMG Wii U: tinydup=%d tinyhalf=%d (diagnostic): tinycat categories draw twice / half their triangles, full scissor",
+                     s_tinyDup ? 1 : 0, s_tinyHalf ? 1 : 0);
+    for (int which = 0; which < 2; ++which) {
+        char path[256];
+        std::snprintf(path, sizeof path, "%s%s", sms_wiiu_app_root(), which ? "catstats" : "tinycat");
+        bool* set = which ? s_catStat : s_tinyCat;
+        bool& on = which ? s_catStatsOn : s_tinyCatOn;
+        if (FILE* f = std::fopen(path, "rb")) {
+            char buf[512] = {};
+            const size_t n = std::fread(buf, 1, sizeof buf - 1, f);
+            std::fclose(f);
+            buf[n] = 0;
+            char list[512] = {};
+            int len = 0;
+            for (char* p = buf; *p;) {
+                char* end = nullptr;
+                const long v = std::strtol(p, &end, 10);
+                if (end == p) { ++p; continue; }
+                if (v >= 0 && v < 256) {
+                    set[v] = true;
+                    on = true;
+                    len += std::snprintf(list + len, sizeof list - len, " %ld", v);
+                }
+                p = end;
+            }
+            WHBLogPrintf("SMG Wii U: %s on (diagnostic):%s", which ? "catstats" : "tinycat", list);
+        }
+    }
+#endif
+#if defined(PORT_GAME_SMG)
+    s_textureStreamEnabled = sdGameDefaultMarker("texstream");
+    WHBLogPrintf("SMS Wii U: [texstream] marker=%s", s_textureStreamEnabled ? "on" : "off");
+    s_renderStretch = !sdMarkerPresent("norenderstretch");
+    WHBLogPrintf("SMG Wii U: [render-stretch] %s", s_renderStretch ? "on (456 EFB lines -> full target)" : "off");
+#endif
     s_imgfxNative = sdMarkerPresent("imgfxnative");
     s_nativeQuads = sdMarkerPresent("quads");
+#if defined(PORT_GAME_SMG)
+    s_jpaFinalVxMarker = sdGameDefaultMarker("jpafinalvx");  // b247: FS 80->96, Beach 77->84, overall 79->86 (2 runs); nojpafinalvx opts out
+    s_jpaFinalVxCheckMarker = sdMarkerPresent("jpafinalvxcheck");
+    s_jpaFinalVxCopyMarker = sdMarkerPresent("jpafinalvxcopy");
+    s_jpaFinalVxViaBatchMarker = sdMarkerPresent("jpafinalvxviabatch");
+    s_jpaFinalVxNoBillboardMarker = sdMarkerPresent("jpafinalvxnobb");
+    s_jpaCullStatsMarker = sdMarkerPresent("jpacullstats", false);
+    s_jpaThinOffMarker = sdMarkerPresent("jpathinoff");
+    s_jpaThinMarker = sdMarkerPresent("jpathin");
+    WHBLogPrintf("SMS Wii U: [jpafinalvx] copy=%d viabatch=%d nobb=%d", s_jpaFinalVxCopyMarker ? 1 : 0,
+                 s_jpaFinalVxViaBatchMarker ? 1 : 0, s_jpaFinalVxNoBillboardMarker ? 1 : 0);
+    initJpaFinalVxArena();
+#endif
     WHBLogPrintf("SMS Wii U: [tv720] marker=%s", s_tv720Marker ? "on" : "off");
     WHBLogPrintf("SMS Wii U: [imgfxnative] marker=%s", s_imgfxNative ? "on" : "off");
     WHBLogPrintf("SMS Wii U: [quads] marker=%s", s_nativeQuads ? "on" : "off");
@@ -6405,10 +8294,22 @@ void rendererInit(float) {
 #if defined(PORT_GAME_SMG)
     // d49 switches are read once here so shader generation, depth setup, and
     // peek scheduling cannot observe a changing SD card during a run.
+    j3dStateDeltaSetEnabled(sdMarkerPresent("j3dstatedelta"));
+    s_j3dStateDeltaCheck = sdMarkerPresent("j3dstatedeltacheck");
+    j3dStateDeltaSetCheckEnabled(s_j3dStateDeltaCheck);
     s_earlyZMarker = sdDefaultOnMarker("earlyz");
     s_hizMarker = sdDefaultOnMarker("hiz");
     s_peek2Marker = sdDefaultOnMarker("peek2");
     s_peekColFrameMarker = sdDefaultOnMarker("peekcolframe");
+    // Opt-in: testV hung (worker never reached a frame-end wait) after ~7400 frames in the garden.
+    s_peekZProdMarker = sdMarkerPresent("peekzprod");
+    s_peekZLinMarker = sdDefaultOnMarker("peekzlin");  // b206/b207: copies -0.7 ms/frame, same answers, shots clean; nopeekzlin opts out
+    s_peekZRectMarker = sdMarkerPresent("peekzrect");
+    WHBLogPrintf("SMS Wii U: [peekzlin] %s [peekzrect] %s", s_peekZLinMarker ? "on" : "off", s_peekZRectMarker ? "on" : "off");
+    s_clearZFastMarker = sdDefaultOnMarker("clearzfast");
+    s_clearEfbFastMarker = sdDefaultOnMarker("clearefbfast");
+    WHBLogPrintf("SMG Wii U: [clearzfast] %s [clearefbfast] %s",
+                 s_clearZFastMarker ? "on" : "off", s_clearEfbFastMarker ? "on" : "off");
     s_peekAsyncMarker = sdDefaultOnMarker("peekasync");
     s_mem1CopyMarker = sdDefaultOnMarker("mem1copy");
     s_drawown = sdMarkerPresent("drawown", false);
@@ -6420,6 +8321,7 @@ void rendererInit(float) {
     WHBLogPrintf("SMS Wii U: [hiz] marker=%s", s_hizMarker ? "on" : "off");
     WHBLogPrintf("SMS Wii U: [peek2] marker=%s", s_peek2Marker ? "on" : "off");
     WHBLogPrintf("SMS Wii U: [peekcolframe] marker=%s", s_peekColFrameMarker ? "on" : "off");
+    WHBLogPrintf("SMS Wii U: [peekzprod] marker=%s", s_peekZProdMarker ? "on" : "off");
     WHBLogPrintf("SMS Wii U: [peekasync] marker=%s", s_peekAsyncMarker ? "on" : "off");
     refreshMem1CopyHeap();
     WHBLogPrintf("SMS Wii U: [mem1copy] marker=%s budget=%u", s_mem1CopyMarker ? "on" : "off",
@@ -6450,6 +8352,23 @@ void rendererInit(float) {
                  s_fastState ? "on" : "off", s_fastLive ? "on" : "off",
                  s_fastStateCheck ? "on" : "off");
     s_tevFold = sdMarkerPresent("tevfold");
+#if defined(PORT_GAME_SMG)
+    s_tevMulAdd = sdDefaultOnMarker("tevmuladd");  // b199: Ice +2.2 fps, Beach +1.0 with the set below, visually clean
+    s_tevCport = sdDefaultOnMarker("tevcport");
+    s_tevRowPack = sdDefaultOnMarker("tevrowpack");
+    s_tevPcSkip = sdDefaultOnMarker("tevpcskip");
+    s_tevIndFast = sdDefaultOnMarker("tevindfast");
+    s_vxDot4 = sdMarkerPresent("vxdot4");
+    WHBLogPrintf("SMG Wii U: [vxdot4] %s", s_vxDot4 ? "on" : "off");  // b200: Ice 53.8 -> 56.4/55.5 fps, Beach 51.9 -> 52.4, shots clean
+    WHBLogPrintf("SMG Wii U: [tevindfast] %s", s_tevIndFast ? "on" : "off");
+    s_tevBiasMerge = sdMarkerPresent("tevbiasmerge");
+    WHBLogPrintf("SMG Wii U: [tevpcskip] %s [tevbiasmerge] %s", s_tevPcSkip ? "on" : "off", s_tevBiasMerge ? "on" : "off");
+    WHBLogPrintf("SMG Wii U: [tevrowpack] %s", s_tevRowPack ? "on" : "off");
+    s_arenaDcbz = sdGameDefaultMarker("arenadcbz");  // b250 (with zcparse): Beach 82->87 / 77->84, overall 85->89 / 81->87 (2 matched pairs); noarenadcbz opts out
+    WHBLogPrintf("SMG Wii U: [arenadcbz] %s", s_arenaDcbz ? "on" : "off");
+    WHBLogPrintf("SMG Wii U: [tevcport] %s", s_tevCport ? "on" : "off");
+    WHBLogPrintf("SMG Wii U: [tevmuladd] %s", s_tevMulAdd ? "on" : "off");
+#endif
     WHBLogPrintf("SMS Wii U: [tevfold] marker=%s cap=%u", s_tevFold ? "on" : "off",
                  unsigned(kTevFoldVariantCap));
     WHBLogPrintf("SMS Wii U: [uniblock] marker=%s", s_uniblock ? "on" : "off");
@@ -6465,12 +8384,15 @@ void rendererInit(float) {
     s_d6Force = sdMarkerPresent("forcepres");
     s_pipe1Marker = sdMarkerPresent("pipe1");
     s_pipe2Marker = sdMarkerPresent("pipe2");
+    s_pipe5Marker = sdMarkerPresent("pipe5");
     s_d8NoDraw = sdMarkerPresent("nodraw");
     s_d8NoTex = sdMarkerPresent("notex");
     WHBLogPrintf("[d8m] nodraw=%d notex=%d", int(s_d8NoDraw), int(s_d8NoTex));
     WHBLogPrintf("[d7m] noswap=%d fencepoll=%d forcepres=%d", int(s_d7NoSwap), int(s_d7FencePoll), int(s_d6Force));
     WHBLogPrintf("[pipe1] marker=%s", s_pipe1Marker ? "on" : "off");
     WHBLogPrintf("[pipe2] marker=%s", s_pipe2Marker ? "on" : "off");
+    WHBLogPrintf("[pipe5] marker=%s%s", s_pipe5Marker ? "on" : "off",
+                 s_pipe5Marker && s_pipe2Marker ? " (disabled with pipe2)" : "");
     WHBLogPrintf("[d3m] noscantv=%u noscandrc=%u", s_noScanTv ? 1u : 0u, s_noScanDrc ? 1u : 0u);
     if (sdMarkerPresent("nodcbz")) sms_wiiu_memset_dcbz = 0;
     g_perfStages = s_gpuDiag;
@@ -6512,16 +8434,31 @@ void rendererInit(float) {
             WHBLogPrintf("SMS Wii U: [gx2prod] worker start failed; marker path disabled");
         }
     }
+#if defined(PORT_GAME_SMG)
+    if (s_jpaThinOffMarker || s_jpaThinMarker)
+        s_jpaThinLastWorkerBusy = gx2prod::counters().workerBusyMicros;
+#endif
+    WHBLogPrintf("SMS Wii U: [jpafinalvx] marker=%d check=%d enabled=%d warmed=%d producer=%d compact=%d gpu=%d ready=%d pipe5=%d pipe2=%d",
+                 s_jpaFinalVxMarker ? 1 : 0, s_jpaFinalVxCheckMarker ? 1 : 0,
+                 jpaFinalVxGate() ? 1 : 0, s_jpaFinalVxCompactWarmed ? 1 : 0,
+                 s_gx2ProdEnabled ? 1 : 0, s_compactVx ? 1 : 0, s_gpuXfEnabled ? 1 : 0,
+                 s_ready ? 1 : 0, s_pipe5Marker ? 1 : 0, s_pipe2Marker ? 1 : 0);
 }
 
 float efbScale() { return 1.0f; }
 bool rendererReady() { return s_ready; }
 void releaseGlThread() {}
 
-void onStateChange(bool rendererStateRelevant) {
+void onStateChange(bool rendererStateRelevant, uint8_t writerDomain) {
+    j3dStateDeltaNoteStateChange();
     if (!s_batch.indices.empty()) flushBatch();  // flushBatch scopes itself
     // The flush may cache the old state: invalidate after it, before mutation.
-    if (rendererStateRelevant) rendererStateWritten();
+    if (rendererStateRelevant) {
+#if defined(PORT_GAME_SMG)
+        if (g_smg_wprof_on) s_jpaMergeStateDomain = writerDomain;
+#endif
+        rendererStateWritten();
+    }
 }
 
 PrimClass primClass(uint8_t op) {
@@ -6792,17 +8729,68 @@ static bool s_gx2DlRecording;
 static void gx2ProdCallList(void* list, uint32_t bytes) {
     if (OSGetCoreId() != 1)
         WHBLogPrintf("SMS Wii U: [gx2prod] list service on unexpected core=%u", (unsigned)OSGetCoreId());
+#if defined(PORT_GAME_SMG)
+    smg_wiiu_gpuframe_stamp(0);
+#endif
     GX2DirectCallDisplayList(list, bytes);
+#if defined(PORT_GAME_SMG)
+    smg_wiiu_gpuframe_stamp(1);
+#endif
+    sms_wiiu_pipe5_trace(P5T_SERVICE_LIST, bytes);
+    // Category-boundary service pumps are replay-only.  The Nov 8 boot hang
+    // had this path issuing GX2Flush while the frame-boundary path changed
+    // copy/presentation state; only the explicit end-frame service may flush.
     if (s_gpuDiag) { CmdCounters& cmd = cmdCounters(); ++cmd.dlCalls; cmd.dlBytes += bytes; }
     ++s_perfDlCalled;
     s_perfDlCoreCall = OSGetCoreId();
 }
 
+#if defined(PORT_GAME_SMG)
+// Marker reorderpump (with reorder): core 1 replays the worker's finished lists
+// at movement/calcAnim category boundaries and submits them, so the GPU and the
+// worker keep going while the game runs update/calcAnim before endRender.
+// Marker drawwake (with reorder): after draw(), commit the producer's partial
+// chunk and wake the worker, so the frame's last commands are parsed during
+// update/calcAnim instead of in endRender's drain wait.
+extern "C" void sms_wiiu_reorder_drawwake(void) {
+    static int state = -1;
+    if (state < 0) state = sdMarkerPresent("drawwake") ? 1 : 0;
+    if (state && s_gx2ProdEnabled) gx2prod::wake();
+}
+
+extern "C" void sms_wiiu_reorder_pump(void) {
+    if (!s_gx2ProdEnabled) return;
+    const uint32_t before = s_perfDlCalled;
+    gx2prod::service();
+    if (s_perfDlCalled != before)
+        GX2Flush();
+}
+#endif
+
+// Set by sms_wiiu_gx2_renderer_exit_quiesce just before SYSLaunchMenu: the
+// game keeps running frames until ProcUI releases the foreground, and the
+// worker executing them hit GX2EndDisplayList after GX2 was released (DSI on
+// core 0, then a wedged console; ab-ice runs 2026-11-0x, h-movie 2026-11-07).
+#if defined(PORT_GAME_SMG)
+static volatile bool s_gx2ExitQuiesced;
+#define GX2_EXIT_QUIESCED_RETURN() do { if (s_gx2ExitQuiesced) return; } while (0)
+#else
+#define GX2_EXIT_QUIESCED_RETURN() do { } while (0)
+#endif
+
 static void gx2ProdConsume(const uint8_t* bytes, uint32_t size) {
+#if defined(PORT_GAME_SMG)
+    SmgWProfScope wprof_hook(SmgWBucket_Hook);
+#endif
+    GX2_EXIT_QUIESCED_RETURN();
     SMS_PORT_HEAP_SCOPE();
     producerConsume(bytes, size);
 }
 static void gx2ProdBoundary(uint32_t kind) {
+#if defined(PORT_GAME_SMG)
+    SmgWProfScope wprof_hook(SmgWBucket_Hook);
+#endif
+    GX2_EXIT_QUIESCED_RETURN();
     SMS_PORT_HEAP_SCOPE();
     producerBoundary(kind);
     // GXBeginDisplayList only needs the parser state synchronized before the
@@ -6894,6 +8882,9 @@ static void gx2DlNoteDraw() {
 }
 
 static void gx2DlClose() {
+#if defined(PORT_GAME_SMG)
+    SmgWProfScope wprof(SmgWBucket_DlRec);
+#endif
     // Core 1 services are ordered between worker-produced lists.  They must
     // not close the list currently being assembled on the producer core.
     if (s_gx2ProdEnabled && OSGetCoreId() == 1) return;
@@ -6921,6 +8912,9 @@ static void gx2DlSplit(int reason) {
 
 // Returns the open list, opening one when none is (or the open one is full).
 static bool gx2DlOpenForDraw() {
+#if defined(PORT_GAME_SMG)
+    SmgWProfScope wprof(SmgWBucket_DlRec);
+#endif
     if (s_gx2DlOpen && s_gx2DlOpenDraws >= kGx2DlMaxDraws) gx2DlClose();
     if (!s_gx2DlOpen) {
         void* list = nullptr;
@@ -7015,8 +9009,56 @@ static void prepareDrawState(const TevKey& tevKey, TevShader* tevShader, FixedSh
         packVertexLiveUniforms(tevKey, tevTextures);
     }
     stageLap(s_stXfu, t);
+#if defined(PORT_GAME_SMG)
+    if (s_catStatsOn && s_curCat >= 0 && s_catStat[s_curCat]) {
+        CatStats& st = s_catStats[s_curCat];
+        ++st.draws;
+        st.indices += s_catIdxHint;
+        if (((g.bp[BP_GENMODE] >> 14) & 3) == 0) ++st.cullNone;
+        st.stages += tevKey.stages;
+        uint32_t ind = 0;
+        for (uint32_t i = 0; i < 16 && i < tevKey.stages; ++i) ind += tevKey.ind[i] ? 1u : 0u;
+        st.indStages += ind;
+        if (tevShader) {
+            st.gprs += tevShader->pixel.regs.sq_pgm_resources_ps & 0xffu;
+            st.bundles += tevShader->aluBundles;
+            st.psBytes += tevShader->pixel.size;
+            st.killed += tevShader->killed;
+            if (tevShader->aluBundles > st.maxBundles) { st.maxBundles = tevShader->aluBundles; st.maxShader = tevShader; }
+            uint32_t found = 0;
+            for (uint32_t i = 0; i < st.shaders && i < 16; ++i) found |= st.shaderSeen[i] == tevShader;
+            if (!found && st.shaders < 16) st.shaderSeen[st.shaders++] = tevShader;
+            for (uint32_t m = 0; m < 8; ++m) {
+                if (!(tevShader->textureMask & (1u << m)) || !tevTextures || !tevTextures[m]) continue;
+                const TextureEntry* te = tevTextures[m];
+                ++st.textures;
+                st.texels += uint64_t(te->width) * te->height;
+                st.mipLevels += te->texture.surface.mipLevels;
+                if (te->texture.surface.mipLevels > 1) ++st.mipTex;
+                if (te->texture.surface.tileMode == GX2_TILE_MODE_LINEAR_ALIGNED ||
+                    te->texture.surface.tileMode == GX2_TILE_MODE_LINEAR_SPECIAL) ++st.linearTex;
+                if (te->width * te->height > st.maxTexW * st.maxTexH) {
+                    st.maxTexW = te->width; st.maxTexH = te->height;
+                    st.maxTexTile = uint32_t(te->texture.surface.tileMode);
+                    st.maxTexFmt = uint32_t(te->texture.surface.format);
+                }
+            }
+        }
+        const uint32_t cm0 = g.bp[BP_CMODE0], zm = g.bp[BP_ZMODE];
+        st.blend += (cm0 & 1) ? 1u : 0u;
+        st.ztest += (zm & 1) ? 1u : 0u;
+        st.zwrite += (zm & 16) ? 1u : 0u;
+    }
+#endif
 }
 
+static GX2PrimitiveMode primitiveMode(PrimClass cls);
+// tinyhalf: half the triangles of a list (a multiple of the primitive size).
+static uint32_t tinyHalfCount(PrimClass cls, uint32_t n) {
+    const uint32_t unit = primitiveMode(cls) == GX2_PRIMITIVE_MODE_TRIANGLES ? 3 : primitiveMode(cls) == GX2_PRIMITIVE_MODE_LINES ? 2 : 1;
+    const uint32_t half = (n / 2) / unit * unit;
+    return half ? half : n;
+}
 static GX2PrimitiveMode primitiveMode(PrimClass cls) {
     switch (cls) {
     case PRIM_QUADS: return GX2_PRIMITIVE_MODE_QUADS;
@@ -7027,9 +9069,168 @@ static GX2PrimitiveMode primitiveMode(PrimClass cls) {
     }
 }
 
+#if defined(PORT_GAME_SMG)
+// The fast clear is deliberately checked before shader/materialisation work.
+// flushBatch is reached by the FIFO decoder, in the same ordered thread that
+// handles executeCopy; with gx2prod, executeCopy queues its service after the
+// producer list, while this path records the clear in that list.
+static bool queueProducerClear(bool colour, uint32_t r8, uint32_t g8, uint32_t b8, uint32_t a8, uint32_t z);
+static bool tryClearFast(bool colourUpdate) {
+    const uint32_t ztex2 = g.bp[BP_ZTEX2];
+    if (((ztex2 >> 2) & 3) != 2 || (ztex2 & 3) != 2) return false;  // not GX_ZT_REPLACE with a Z24X8 texture
+    if (s_dlPending.ref) return false;  // the clear quads are immediate-mode; arena runs carry no format here
+
+    const TevKey key = currentTevKey();
+    const int zstage = tevZTextureStage(key);
+    if (zstage < 0) return false;
+    const uint32_t order = key.order[zstage];
+    const int map = int(order & 7);
+    // Read the 4x4 Z24X8 texture straight from guest memory: getTexture() would materialise/upload it here,
+    // BEFORE flushBatch opens the worker's list, and those packets stalled the GPU under perfdiag/workerprof
+    // timing (b218/b219: Logo at 2.9 fps).
+    const uint32_t image0 = g.bp[bpTexReg(BP_TX_IMAGE0, map)];
+    const uint8_t* zsrc = g.texImage[map];
+    if ((image0 & 0x3ff) != 3 || ((image0 >> 10) & 0x3ff) != 3 || ((image0 >> 20) & 15) != 6 || !zsrc) return false;
+    const uint32_t sourceAddress = reinterpret_cast<uint32_t>(zsrc);
+    const bool readable = (sourceAddress >= 0x10000000u && sourceAddress + 64 <= 0x50000000u) ||
+                          (sourceAddress >= 0xF4000000u && sourceAddress + 64 <= 0xF6000000u);
+    if (!readable) return false;
+    // GX RGBA8 tile: 16 (A, R) pairs, then 16 (G, B) pairs; Z24X8 z = R << 16 | G << 8 | B.
+    for (unsigned i = 1; i < 16; ++i)
+        if (zsrc[2 * i + 1] != zsrc[1] || zsrc[32 + 2 * i] != zsrc[32] || zsrc[33 + 2 * i] != zsrc[33]) return false;
+    const uint32_t texelZ = uint32_t(zsrc[1]) << 16 | uint32_t(zsrc[32]) << 8 | zsrc[33];
+    const uint32_t z = (texelZ + (g.bp[BP_ZTEX_BIAS] & 0x00ffffffu)) & 0x00ffffffu;
+
+    auto reject = [](uint32_t check) {
+        ++s_fpsClearFastReject;
+        s_fpsClearFastLastReject = check;
+        return false;
+    };
+
+    const uint32_t zmode = g.bp[BP_ZMODE];
+    const uint32_t alphaCompare = g.bp[BP_ALPHACOMPARE];
+    const uint32_t cmode0 = g.bp[BP_CMODE0];
+    if ((zmode & 0x1fu) != 0x1fu || ((alphaCompare >> 16) & 7) != 7 ||
+        ((alphaCompare >> 19) & 7) != 7 || (cmode0 & 3)) return reject(3);
+    // A clear writes colour and alpha together: alpha update must match colour update when the
+    // target keeps alpha, and fog would have tinted the quad's colour.
+    const bool alphaUpdate = ((cmode0 >> 4) & 1) != 0;
+    if ((g.bp[BP_PE_CONTROL] & 7) == 1 && alphaUpdate != colourUpdate) return reject(7);
+    if (colourUpdate && ((g.bp[BP_FOG3] >> 21) & 7) != 0) return reject(8);
+
+    if (key.stages != 1 || tevNumInd(key) != 0) return reject(41);
+    const uint32_t ce = key.colorEnv[0], ae = key.alphaEnv[0];
+    if (((ce >> 12) & 15) != 15 || ((ce >> 8) & 15) != 15 ||
+        ((ce >> 4) & 15) != 15 || (ce & 15) != 2 ||  // d = GX_CC_C0
+        ((ae >> 13) & 7) != 7 || ((ae >> 10) & 7) != 7 ||
+        ((ae >> 7) & 7) != 7 || ((ae >> 4) & 7) != 1 ||  // d = GX_CA_A0
+        ((ce >> 16) & 3) != 0 || ((ae >> 16) & 3) != 0 ||
+        ((ce >> 18) & 1) != 0 || ((ae >> 18) & 1) != 0 ||
+        ((ce >> 19) & 1) == 0 || ((ae >> 19) & 1) == 0 ||
+        ((ce >> 20) & 3) != 0 || ((ae >> 20) & 3) != 0 ||
+        ((ce >> 22) & 3) != 0 || ((ae >> 22) & 3) != 0) return reject(42);
+
+    const bool pending = s_dlPending.ref != nullptr;
+    const uint32_t vertexCount = pending ? s_dlPending.n :
+                                  (s_batch.stride ? uint32_t(s_batch.vertices.size() / s_batch.stride) : 0);
+    const uint32_t indexCount = pending ? s_dlPending.nidx : uint32_t(s_batch.indices.size());
+    const uint32_t* indices = pending ? reinterpret_cast<const uint32_t*>(dlArena() + s_dlPending.ref->iOff)
+                                      : s_batch.indices.data();
+    if (vertexCount != 4 || indexCount != 6 || !indices) return reject(5);
+    uint32_t used = 0;
+    for (uint32_t i = 0; i < indexCount; ++i) {
+        if (indices[i] >= 4) return reject(5);
+        used |= 1u << indices[i];
+    }
+    if (used != 0xfu) return reject(5);
+
+    GX2ColorBuffer* colour = renderColour();
+    GX2DepthBuffer* depth = renderDepth();
+    const int targetW = colour ? int(colour->surface.width) : 0;
+    const int targetH = colour ? int(colour->surface.height) : 0;
+    const int vx = int(s_gameOffsetX + g.viewport[0] * s_gameScaleX);
+    const int vy = int(g.viewport[1] * s_gameScaleY);
+    const int vw = int(g.viewport[2] * s_gameScaleX);
+    const int vh = int(g.viewport[3] * s_gameScaleY);
+    const int sx = int(s_gameOffsetX + g.scissor[0] * s_gameScaleX);
+    const int sy = int(g.scissor[1] * s_gameScaleY);
+    int sw = int(g.scissor[2] * s_gameScaleX);
+    int sh = int(g.scissor[3] * s_gameScaleY);
+    if (sy + sh > targetH) sh = sy < targetH ? targetH - sy : 0;
+    if (s_tinyScissor || (s_tinyActive && !s_tinyTex && !s_tinyDup && !s_tinyHalf)) { sw = 64; sh = sh < 64 ? sh : 64; }
+    const bool fullViewport = targetW > 0 && targetH > 0 && vx <= 0 && vy <= 0 &&
+        vx + vw >= targetW && vy + vh >= targetH;
+    const bool fullScissor = sx <= 0 && sy <= 0 && sw > 0 && sh > 0 &&
+        sx + sw >= targetW && sy + sh >= targetH;
+
+    const uint8_t* vertices = pending ? s_dlPending.verts : s_batch.vertices.data();
+    const uint32_t stride = s_batch.stride;
+    float minX = 1.0e30f, minY = 1.0e30f, maxX = -1.0e30f, maxY = -1.0e30f;
+    uint8_t defaults[9];
+    matrixDefaults(defaults);
+    if (!vertices || !stride) return reject(6);
+    for (uint32_t i = 0; i < 4; ++i) {
+        HostVertex vertex;
+        unpackVertex(s_batch.fmt, vertices + size_t(i) * stride, defaults, vertex);
+        float clip[4];
+        transformPosition(vertex, clip);
+        if (!std::isfinite(clip[3]) || clip[3] <= 0.0f) return reject(6);
+        const float x = clip[0] / clip[3], y = clip[1] / clip[3];
+        if (!std::isfinite(x) || !std::isfinite(y)) return reject(6);
+        minX = std::min(minX, x); minY = std::min(minY, y);
+        maxX = std::max(maxX, x); maxY = std::max(maxY, y);
+    }
+    if (!fullViewport || !fullScissor || minX > -1.0f + 1.0e-4f || minY > -1.0f + 1.0e-4f ||
+        maxX < 1.0f - 1.0e-4f || maxY < 1.0f - 1.0e-4f || !depth) return reject(6);
+
+    const uint32_t c0ra = g.bp[BP_TEV_REG + 2], c0bg = g.bp[BP_TEV_REG + 3];  // GX_TEVREG0 = 1 (0 is PREV)
+    auto unit = [](int v) { return v <= 0 ? 0.0f : v >= 255 ? 1.0f : float(v) / 255.0f; };  // TEV clamps
+    const float r = unit(tevSext11(c0ra & 0x7ff));
+    const float gch = unit(tevSext11((c0bg >> 12) & 0x7ff));
+    const float b = unit(tevSext11(c0bg & 0x7ff));
+    const bool hasAlpha = (g.bp[BP_PE_CONTROL] & 7) == 1;
+    const bool dstAlphaConst = ((g.bp[BP_CMODE1] >> 8) & 1) != 0;
+    const float alpha = !hasAlpha ? 1.0f :
+        dstAlphaConst ? float(g.bp[BP_CMODE1] & 0xff) / 255.0f :
+        unit(tevSext11((c0ra >> 12) & 0x7ff));
+
+    // v3: GX2 hardware clears (v1, ~-1.8 ms; the v2 depth-range draw only saved ~0.5) now that the clear texel
+    // is read from guest memory (the b218 stall was getTexture() before the worker list opened, not the clears).
+#ifdef __WIIU__
+    if (s_gx2ProdEnabled) {
+        auto u8v = [](float v) { return uint32_t(v * 255.0f + 0.5f); };
+        if (!queueProducerClear(colourUpdate, u8v(r), u8v(gch), u8v(b), u8v(alpha), z)) return reject(9);
+    } else
+#endif
+    {
+        if (colourUpdate) {
+            GX2ClearColor(colour, r, gch, b, alpha);
+            if (s_gpuDiag) gpuStampSurface(GPU_CLEAR, colour->surface, colour->surface);
+        }
+        GX2ClearDepthStencilEx(depth, float(z & 0xffffffu) / 16777215.0f, 0, renderDepthClearFlags());
+        if (s_gpuDiag) gpuStampSurface(GPU_CLEAR, depth->surface, depth->surface);
+        rebindTvTarget();
+        invalidateVertexUniforms();
+        ++s_perfClears;
+    }
+    if (colourUpdate) ++s_fpsClearFastEfb; else ++s_fpsClearFastZ;
+    s_batch.vertices.clear(); s_batch.indices.clear(); s_batch.count = 0;
+    s_dlPending = {};
+    return true;
+}
+#endif
+
+// The map was usually resolved into tevTextures[] a few lines earlier; looking
+// it up again cost a second getTexture per draw.
+static TextureEntry* reuseOrGetTexture(TextureEntry* const* tevTextures, int map) {
+    return tevTextures[map] ? tevTextures[map] : getTexture(map);
+}
+
 void flushBatch() {
     SMS_PORT_HEAP_SCOPE();
     if (s_batch.indices.empty() && !s_dlPending.ref) return;
+    if (s_jpaCheckInProgress && !s_jpaCheckBoundaryFlush)
+        s_jpaCheckSplit = true;
     if (!s_ready || !s_frameActive || !ProcUIInForeground()) {
         s_batch.vertices.clear(); s_batch.indices.clear(); s_batch.count = 0;
         s_dlPending = {};
@@ -7040,6 +9241,16 @@ void flushBatch() {
         FrameSplitBatchScope() { sms_wiiu_frame_split_gx_begin(); }
         ~FrameSplitBatchScope() { sms_wiiu_frame_split_gx_end(); }
     } frameSplitBatchScope;
+    const bool colourUpdate = ((g.bp[BP_CMODE0] >> 3) & 1) != 0;
+    struct ClearDrawRestore {
+        ~ClearDrawRestore() {
+            if (!s_clearDrawActive) return;
+            g.bp[BP_ZTEX2] = s_clearDrawSavedZtex2;
+            s_clearDrawActive = false;
+            rendererStateWritten();
+        }
+    } clearDrawRestore;
+    if ((colourUpdate ? s_clearEfbFastMarker : s_clearZFastMarker) && tryClearFast(colourUpdate)) return;
 #endif
     // Open the worker's GX2 list before texture materialisation, arena uploads,
     // or shader/state setup. Those operations all emit packets that must stay
@@ -7052,6 +9263,11 @@ void flushBatch() {
         s_dlPending = {};
         return;
     }
+#if defined(PORT_GAME_SMG)
+    SmgWProfScope wprofFlush(SmgWBucket_Flush);
+    j3dStateDeltaNoteDraw();
+    smg_wprof_note_draw(s_batch.count + (s_dlPending.ref ? s_dlPending.n : 0));
+#endif
     PerfScope perfFlush(s_perfFlush);
     if (s_noDiff) invalidateVertexUniforms();
     disablePerDrawCaches();
@@ -7061,7 +9277,8 @@ void flushBatch() {
     OSTime perfTex0 = OSGetTime();
 #endif
     const bool vertexEligible = s_gpuXfEnabled && g_displayFrames >= SMS_GX2_GPU_XF_DELAY;
-    const bool reuseKey = s_fastState && s_fastDraw.valid &&
+    const bool deltaClean = j3dStateDeltaPendingDirtyDomains() == 0;
+    const bool reuseKey = s_fastState && deltaClean && s_fastDraw.valid &&
                       s_fastDraw.generation == s_rendererGeneration &&
                       s_fastDraw.copyGeneration == s_copyGeneration &&
                       s_fastDraw.textureGeneration == s_textureGeneration &&
@@ -7093,7 +9310,7 @@ void flushBatch() {
     TextureEntry* texture = nullptr;
     FastTextureDescriptor descriptors[9];
     if (s_fastState) {
-        texture = textured ? getTexture(usedTexture(&coord, &map) ? map : 0) : nullptr;
+        texture = textured ? reuseOrGetTexture(tevTextures, usedTexture(&coord, &map) ? map : 0) : nullptr;
         for (int i = 0; i < 8; ++i) descriptors[i] = fastTextureDescriptor(tevTextures[i]);
         descriptors[8] = fastTextureDescriptor(texture);
         reuseState = reuseState && s_fastDraw.generation == s_rendererGeneration &&
@@ -7112,7 +9329,7 @@ void flushBatch() {
             if (mask & (1u << debugMap)) tevTextures[debugMap] = getTexture(debugMap);
     }
     if (!s_fastState)
-        texture = textured ? getTexture(usedTexture(&coord, &map) ? map : 0) : nullptr;
+        texture = textured ? reuseOrGetTexture(tevTextures, usedTexture(&coord, &map) ? map : 0) : nullptr;
     // The vertex layout must follow the shader actually bound: a material that
     // samples a texture we could not load still draws through the stage-1
     // fallback (8 or 10 floats), while the TEV path uses 28 floats.
@@ -7174,6 +9391,9 @@ void flushBatch() {
     // Keep the control build's direct ordering.  The opt-in command-list path
     // defers these GX2 packets until after resource materialisation so no
     // arena-wrap fence can occur while a list is open.
+#if defined(PORT_GAME_SMG)
+    s_catIdxHint = s_dlPending.ref ? s_dlPending.nidx : uint32_t(s_batch.indices.size());
+#endif
     if (!s_gx2DlEnabled || !gpuPath)
         prepareDrawState(tevKey, tevShader, shader, tevTextures, texture, vertex, gpuPath);
     if (s_dlPending.ref) {
@@ -7204,8 +9424,12 @@ void flushBatch() {
                 if (!s_d8NoDraw) {
                     drawownRecord(pend.nidx);
                     drawownWorkerDraw();
-                    GX2DrawIndexedEx(primitiveMode(pend.cls), pend.nidx, GX2_INDEX_TYPE_U32,
+                    const uint32_t tinyN = (s_tinyHalf && s_tinyActive) ? tinyHalfCount(pend.cls, pend.nidx) : pend.nidx;
+                    GX2DrawIndexedEx(primitiveMode(pend.cls), tinyN, GX2_INDEX_TYPE_U32,
                                      const_cast<uint32_t*>(storedIdx), 0, 1);
+                    if (s_tinyDup && s_tinyActive)
+                        GX2DrawIndexedEx(primitiveMode(pend.cls), tinyN, GX2_INDEX_TYPE_U32,
+                                         const_cast<uint32_t*>(storedIdx), 0, 1);
                 }
                 gx2DlNoteDraw();
             } else {
@@ -7214,8 +9438,12 @@ void flushBatch() {
                 if (!s_d8NoDraw) {
                     drawownRecord(pend.nidx);
                     drawownWorkerDraw();
-                    GX2DrawIndexedEx(primitiveMode(pend.cls), pend.nidx, GX2_INDEX_TYPE_U32,
+                    const uint32_t tinyN = (s_tinyHalf && s_tinyActive) ? tinyHalfCount(pend.cls, pend.nidx) : pend.nidx;
+                    GX2DrawIndexedEx(primitiveMode(pend.cls), tinyN, GX2_INDEX_TYPE_U32,
                                      const_cast<uint32_t*>(storedIdx), 0, 1);
+                    if (s_tinyDup && s_tinyActive)
+                        GX2DrawIndexedEx(primitiveMode(pend.cls), tinyN, GX2_INDEX_TYPE_U32,
+                                         const_cast<uint32_t*>(storedIdx), 0, 1);
                 }
             }
             if (s_padUniforms == 5 && !s_gx2ProdEnabled) GX2DrawDone();
@@ -7270,12 +9498,25 @@ void flushBatch() {
     uint32_t* ibo = reinterpret_cast<uint32_t*>(block + iboOffset);
     if (compact) {
         // Written whole below.
+#if defined(PORT_GAME_SMG)
+        // Marker arenadcbz: claim the block's lines without reading MEM2
+        // (the memcpy below was 17% of worker time in FileSelect).  Only lines
+        // wholly inside the block; everything in them is written below.
+        if (s_arenaDcbz)
+            for (uint32_t off = 0; off + 32 <= blockBytes; off += 32)
+                __asm__ volatile("dcbz 0,%0" : : "r"(block + off) : "memory");
+#endif
     } else if (gpuPath) {
         // Zero the vertex lines in cache without reading MEM2: the decoder
         // writes every vertex here, and cold write-allocate fills were the
         // top CPU cost.  Covers the sentinel slot too.  block is 256-aligned.
         for (uint32_t off = 0; off < vboBytes; off += 32)
             __asm__ volatile("dcbz 0,%0" : : "r"(block + off) : "memory");
+#if defined(PORT_GAME_SMG)
+        if (s_arenaDcbz)  // and the index list
+            for (uint32_t off = iboOffset; off + 32 <= blockBytes; off += 32)
+                __asm__ volatile("dcbz 0,%0" : : "r"(block + off) : "memory");
+#endif
     } else {
         memset(block + vertexCount * vertexStride, 0, vertexStride);
     }
@@ -7430,16 +9671,27 @@ void flushBatch() {
         if (!s_d8NoDraw) {
             drawownRecord(indexCount);
             drawownWorkerDraw();
-            GX2DrawIndexedEx(mode, indexCount, GX2_INDEX_TYPE_U32, ibo, 0, 1);
+            {
+                const uint32_t tinyN = (s_tinyHalf && s_tinyActive) ? tinyHalfCount(s_batch.cls, indexCount) : indexCount;
+                GX2DrawIndexedEx(mode, tinyN, GX2_INDEX_TYPE_U32, ibo, 0, 1);
+                if (s_tinyDup && s_tinyActive) GX2DrawIndexedEx(mode, tinyN, GX2_INDEX_TYPE_U32, ibo, 0, 1);
+            }
         }
         gx2DlNoteDraw();
     } else {
         if (!s_d8NoDraw) {
             drawownRecord(indexCount);
             drawownWorkerDraw();
-            GX2DrawIndexedEx(mode, indexCount, GX2_INDEX_TYPE_U32, ibo, 0, 1);
+            {
+                const uint32_t tinyN = (s_tinyHalf && s_tinyActive) ? tinyHalfCount(s_batch.cls, indexCount) : indexCount;
+                GX2DrawIndexedEx(mode, tinyN, GX2_INDEX_TYPE_U32, ibo, 0, 1);
+                if (s_tinyDup && s_tinyActive) GX2DrawIndexedEx(mode, tinyN, GX2_INDEX_TYPE_U32, ibo, 0, 1);
+            }
         }
     }
+    if (gpuPath && !s_d8NoDraw) jpaMergeOtherDraw();
+    if (compact && gpuPath && !s_d8NoDraw)
+        s_jpaFinalVxCompactWarmed = true;
     if (s_padUniforms == 5 && !s_gx2ProdEnabled) GX2DrawDone();  // diagnostic fence stays outside a list
     if (bracket) {
         if (!s_gx2ProdEnabled) GX2DrawDone();
@@ -7483,6 +9735,160 @@ void flushBatch() {
     debugPixelTrace(debugDrawNo);
 #endif
     s_batch.vertices.clear(); s_batch.indices.clear(); s_batch.count = 0;
+    j3dStateDeltaConsumeDirtyDomains();
+}
+
+static void drawJpaFinalVx(const SmsWiiuJpaFinalVxDesc* desc) {
+    if (!desc || !desc->vertices || !desc->indices || !desc->vertexCount || !desc->indexCount ||
+        !desc->vertexBytes || !desc->indexBytes || desc->vertexStride != sms_wiiu_jpa_finalvx_stride(desc->packedFmt) ||
+        desc->slot >= kJpaFinalVxSlots ||
+        (desc->primitiveClass != SMS_WIIU_JPA_FINALVX_PRIM_TRIS &&
+         desc->primitiveClass != SMS_WIIU_JPA_FINALVX_PRIM_QUADS)) {
+        sms_wiiu_jpa_finalvx_fallback(SMS_WIIU_JPA_FINALVX_FALLBACK_WORKER_BADDESC);
+        return;
+    }
+
+    const auto normalFallback = [&](unsigned reason) {
+        sms_wiiu_jpa_finalvx_fallback(reason);
+        s_batch.fmt = desc->packedFmt;
+        s_batch.stride = desc->vertexStride;
+        s_batch.cls = static_cast<PrimClass>(desc->primitiveClass);
+        s_batch.vertices.assign(desc->vertices, desc->vertices + desc->vertexBytes);
+        s_batch.indices.assign(desc->indices, desc->indices + desc->indexCount);
+        s_batch.count = desc->vertexCount;
+        flushBatch();
+    };
+    if (s_dlPending.ref) {
+        sms_wiiu_jpa_finalvx_fallback(SMS_WIIU_JPA_FINALVX_FALLBACK_WORKER_DLPENDING);
+        flushBatch();
+    }
+    if (!s_ready || !s_frameActive || !ProcUIInForeground()) {
+        sms_wiiu_jpa_finalvx_fallback(SMS_WIIU_JPA_FINALVX_FALLBACK_WORKER_INACTIVE);
+        return;
+    }
+    if (s_jpaFinalVxViaBatchMarker) {  // diagnostic bisect: same payload, normal draw path (counted as cold)
+        normalFallback(SMS_WIIU_JPA_FINALVX_FALLBACK_WORKER_COLD);
+        return;
+    }
+    // Match flushBatch exactly: in producer mode the worker list is opened
+    // BEFORE texture/TEV/vertex/fetch materialisation (which can emit shader
+    // invalidates), and ensured again just before the state packets below.
+    if (s_gx2ProdEnabled && !gx2DlOpenForDraw()) {
+        normalFallback(SMS_WIIU_JPA_FINALVX_FALLBACK_WORKER_DLOPEN);
+        return;
+    }
+
+    if (s_noDiff) invalidateVertexUniforms();
+    disablePerDrawCaches();
+    const bool vertexEligible = s_gpuXfEnabled && g_displayFrames >= SMS_GX2_GPU_XF_DELAY;
+    TevKey tevKey = currentTevKey();
+    const bool textured = tevTextureMask(tevKey) != 0;
+    TextureEntry* tevTextures[8] = {};
+    bool allTextures = true;
+    if (tevSupported(tevKey)) {
+        const uint32_t mask = tevTextureMask(tevKey);
+        for (int i = 0; i < 8; ++i) {
+            if (!(mask & (1u << i))) continue;
+            tevTextures[i] = getTexture(i);
+            if (!tevTextures[i]) allTextures = false;
+        }
+    }
+    int coord = 0, map = 0;
+    TextureEntry* texture = textured ? reuseOrGetTexture(tevTextures, usedTexture(&coord, &map) ? map : 0) : nullptr;
+    const bool wantTev = tevSupported(tevKey) && allTextures &&
+        (tevTextureMask(tevKey) || SMS_GX2_TEV_UNTEXTURED);
+    TevShader* tevShader = wantTev ? tevShaderForKey(tevKey) : nullptr;
+    const bool tevPath = tevShader != nullptr;
+    const bool useTex = !tevPath && textured && texture;
+    FixedShader& shader = useTex ? s_modulate : s_untextured;
+    const VertexKey vertexKey = currentVertexKey(tevPath, coord, useTex);
+    VertexProgram* vertex = vertexEligible && tevPath ? vertexShaderForKey(vertexKey) : nullptr;
+    const bool gpuPath = vertex != nullptr && vertex->warmed;
+    GX2FetchShader* compact = s_compactVx && gpuPath && !s_vertexSelfCheck &&
+                              !SMS_GX2_VX_ORACLE ? compactFetchFor(desc->packedFmt) : nullptr;
+    if (!compact) {
+        normalFallback(SMS_WIIU_JPA_FINALVX_FALLBACK_WORKER_COLD);
+        return;
+    }
+
+    uint8_t* drawVertices = const_cast<uint8_t*>(desc->vertices);
+    uint32_t* drawIndices = const_cast<uint32_t*>(desc->indices);
+    uint32_t drawVertexBytes = desc->vertexBytes;
+    uint32_t drawIndexBytes = desc->indexBytes;
+    uint32_t drawVertexStride = desc->vertexStride;
+    uint32_t drawDefaultsBytes = sizeof(desc->compactDefaults);
+    uint8_t* defaults = const_cast<uint8_t*>(desc->compactDefaults);
+    matrixDefaults(defaults);
+    uint32_t copyBlockBytes = 0;
+    if (s_jpaFinalVxCopyMarker) {
+        const uint32_t defaultsOffset = (desc->vertexCount * desc->vertexStride + 31) & ~31u;
+        const uint32_t indexOffset = (defaultsOffset + 32 + 255) & ~255u;
+        copyBlockBytes = indexOffset + desc->indexBytes;
+        uint8_t* block = reinterpret_cast<uint8_t*>(allocVertices(copyBlockBytes));
+        if (!block) {
+            normalFallback(SMS_WIIU_JPA_FINALVX_FALLBACK_WORKER_COLD);
+            return;
+        }
+        memcpy(block, desc->vertices, desc->vertexBytes);
+        memset(block + desc->vertexBytes, 0, defaultsOffset + 32 - desc->vertexBytes);
+        memcpy(block + defaultsOffset, defaults, sizeof(desc->compactDefaults));
+        memcpy(block + indexOffset, desc->indices, desc->indexBytes);
+        drawVertices = block;
+        drawIndices = reinterpret_cast<uint32_t*>(block + indexOffset);
+        drawVertexBytes = defaultsOffset + 32;
+        drawIndexBytes = desc->indexBytes;
+        drawDefaultsBytes = 32;
+    }
+    s_catIdxHint = desc->indexCount;
+    DCFlushRange(drawVertices, drawVertexBytes);
+    DCFlushRange(drawIndices, drawIndexBytes);
+    DCFlushRange(defaults, sizeof(desc->compactDefaults));
+    // Match flushBatch: ensure the list again after materialisation (it may
+    // have split or closed it), then emit every state packet inside it.
+    const bool listReady = s_gx2DlEnabled && gx2DlOpenForDraw();
+    if (s_gx2DlEnabled && !listReady) {
+        normalFallback(SMS_WIIU_JPA_FINALVX_FALLBACK_WORKER_DLOPEN);
+        return;
+    }
+    if (s_jpaFinalVxInvalidatedArena != s_vertexArenaIndex) {
+        s_jpaFinalVxInvalidatedArena = s_vertexArenaIndex;
+        s_jpaFinalVxInvalidatedSlots = 0;
+    }
+    if (desc->slot < kJpaFinalVxSlots && !(s_jpaFinalVxInvalidatedSlots & (1u << desc->slot))) {
+        uint8_t* slotBase = s_jpaFinalVxArena + size_t(desc->slot) * kJpaFinalVxSlotBytes;
+        GX2Invalidate(GX2_INVALIDATE_MODE_ATTRIBUTE_BUFFER, slotBase, kJpaFinalVxSlotBytes);
+        s_jpaFinalVxInvalidatedSlots |= 1u << desc->slot;
+    }
+    prepareDrawState(tevKey, tevShader, shader, tevTextures, texture, vertex, true);
+    GX2SetFetchShader(compact);
+    s_boundFetch = compact;
+    GX2SetAttribBuffer(1, drawDefaultsBytes, 0, s_jpaFinalVxCopyMarker ? drawVertices + ((desc->vertexCount * desc->vertexStride + 31) & ~31u) : defaults);
+    GX2SetAttribBuffer(0, drawVertexBytes, drawVertexStride, drawVertices);
+    const uint32_t debugDrawNo = s_debugDrawNo++;
+    ++s_perfDraws; ++s_perfGpuDraws; ++s_perfCompact;
+    s_perfVerts += desc->indexCount; s_perfGpuVerts += desc->indexCount;
+    sms_wiiu_d4_draw(desc->indexCount, tevKey.stages, g.bp[BP_CMODE0], tevTextureMask(tevKey));
+    if (!s_d8NoDraw) {
+        drawownRecord(desc->indexCount);
+        drawownWorkerDraw();
+        GX2DrawIndexedEx(primitiveMode(static_cast<PrimClass>(desc->primitiveClass)), desc->indexCount,
+                         GX2_INDEX_TYPE_U32, drawIndices, 0, 1);
+    }
+    if (listReady) gx2DlNoteDraw();
+    sms_wiiu_d1_note_draw_core();
+    ++producerDrawCounter();
+    if (s_gpuDiag) {
+        GpuDrawInfo info = {};
+        info.kind = GPU_DRAW; info.rtW = uint32_t(s_tvW); info.rtH = uint32_t(s_tvH);
+        info.verts = desc->indexCount; info.stages = tevKey.stages;
+        info.texMask = tevTextureMask(tevKey); info.blend = g.bp[BP_CMODE0];
+        info.zmode = g.bp[BP_ZMODE] & 0xff; info.drawNo = debugDrawNo;
+        for (int i = 0; i < 8; ++i) if (tevTextures[i]) {
+            info.texW = tevTextures[i]->width; info.texH = tevTextures[i]->height; break;
+        }
+        gpuStamp(s_vertexArenaIndex, &info);
+    }
+    jpaMergeRun(desc->indexCount);
 }
 
 // GX clears the EFB as part of a copy. Without it the depth of earlier passes
@@ -7630,8 +10036,9 @@ struct ProducerFrameState {
     uint32_t copyWrite;
     uint32_t slot;
     uint32_t draws;
+    bool present;
 };
-static ProducerFrameState s_producerFrames[2] = {{{}, 0, 0, 0}, {{}, 0, 1, 0}};
+static ProducerFrameState s_producerFrames[2] = {{{}, 0, 0, 0, false}, {{}, 0, 1, 0, false}};
 #if defined(PORT_GAME_SMG)
 static void dropPendingMem1ProducerCopies() {
     for (ProducerFrameState& frame : s_producerFrames)
@@ -7648,6 +10055,7 @@ static uint32_t s_producerRecordFrame;
 static uint32_t s_producerWorkerFrame;
 static bool s_pipe2PresentQueued;
 static bool s_pipe2FrameStarted;
+static ProducerFrameState* s_pipe5DrainFrame;
 
 static ProducerFrameState& producerFrameForWorker() {
     return s_producerFrames[s_producerWorkerFrame];
@@ -7661,9 +10069,48 @@ static uint32_t& producerDrawCounter() {
     return sms_wiiu_pipe2_enabled() ? producerFrameForWorker().draws : s_drawsThisFrame;
 }
 
+static void retireProducerFrame(ProducerFrameState& frame, uint64_t completedFence) {
+    for (uint32_t i = 0; i < frame.copyWrite; ++i) {
+        deferFree(frame.copies[i].copy.retiredImage, frame.copies[i].copy.retiredMem1Heap,
+                  frame.copies[i].copy.retiredImageBytes);
+        frame.copies[i].copy.retiredImage = nullptr;
+    }
+    frame.copyWrite = 0;
+    sms_wiiu_gx2prod_reset_draw_sync_jobs();
+    // Fence the completed producer segment captured before scan-buffer copies
+    // and swap.  A flip-gated present timestamp is not an arena lifetime fence.
+    if (sms_wiiu_pipe5_enabled())
+        sms_wiiu_pipe5_trace(P5T_FENCE_ARM, uint32_t(completedFence));
+    endVertexArena(completedFence);
+    if (s_pipe1Marker) {
+        const uint32_t next = (s_pipe1DlArenaSlot + 1) & 1;
+        if (s_pipe1DlArenaFence[next])
+            GX2WaitTimeStamp(s_pipe1DlArenaFence[next]);
+        s_pipe1DlArenaSlot = next;
+        s_pipe1DlArenaUsed[next] = 0;
+        if (++s_dlArenaGen == 0) s_dlArenaGen = 1;
+    }
+    beginVertexArena();
+    s_producerWorkerFrame = (frame.slot + 1) & 1;
+    frame.present = false;
+    if (sms_wiiu_pipe5_enabled() && s_pipe5FrameStarted) {
+        ++s_pipe5DrainRuns;
+        s_pipe5DrainFrame = &frame;
+    }
+    s_pipe2PresentQueued = false;
+}
+
 static void producerPresentService(void* opaque) {
     ProducerFrameState& frame = *static_cast<ProducerFrameState*>(opaque);
-    if (!s_d7NoSwap) {
+    if (OSGetCoreId() != 1) {
+        WHBLogPrintf("SMS Wii U: [pipe5] present service on unexpected core=%u",
+                     (unsigned)OSGetCoreId());
+        sms_wiiu_pipe5_trace(P5T_HAZARD, OSGetCoreId());
+        return;
+    }
+    const bool present = frame.present;
+    const uint64_t completedFence = GX2GetLastSubmittedTimeStamp();
+    if (present && !s_d7NoSwap) {
         if (!s_noScanTv) {
 #if defined(PORT_GAME_SMG)
             copyGameToScanBuffer(GX2_SCAN_TARGET_TV); invalidateVertexUniforms();
@@ -7681,7 +10128,12 @@ static void producerPresentService(void* opaque) {
             if (s_gpuDiag) gpuStampSurface(GPU_PRESENT, renderColour()->surface, renderColour()->surface);
         }
     }
-    sms_wiiu_present_finish_pipelined_service();
+    if (present)
+        sms_wiiu_present_finish_pipelined_service();
+#if defined(PORT_GAME_SMG)
+    if (present && sms_wiiu_pipe5_enabled())
+        sms_wiiu_pipe5_service_present_complete();
+#endif
     if (s_frameClearPending) {
         GX2ClearColor(renderColour(), s_frameClear[0], s_frameClear[1], s_frameClear[2], s_frameClear[3]); invalidateVertexUniforms();
         if (s_gpuDiag) gpuStampSurface(GPU_CLEAR, renderColour()->surface, renderColour()->surface);
@@ -7690,25 +10142,11 @@ static void producerPresentService(void* opaque) {
         GX2SetColorBuffer(renderColour(), GX2_RENDER_TARGET_0);
         GX2SetDepthBuffer(renderDepth());
     }
-    for (uint32_t i = 0; i < frame.copyWrite; ++i) {
-        deferFree(frame.copies[i].copy.retiredImage, frame.copies[i].copy.retiredMem1Heap,
-                  frame.copies[i].copy.retiredImageBytes);
-        frame.copies[i].copy.retiredImage = nullptr;
+    retireProducerFrame(frame, completedFence);
+    if (present && sms_wiiu_pipe5_enabled()) {
+        s_pipe5ResourceFence = GX2GetLastSubmittedTimeStamp();
+        s_pipe5ResourceFencePending = s_pipe5ResourceFence != 0;
     }
-    frame.copyWrite = 0;
-    sms_wiiu_gx2prod_reset_draw_sync_jobs();
-    endVertexArena();
-    if (s_pipe1Marker) {
-        const uint32_t next = (s_pipe1DlArenaSlot + 1) & 1;
-        if (s_pipe1DlArenaFence[next])
-            GX2WaitTimeStamp(s_pipe1DlArenaFence[next]);
-        s_pipe1DlArenaSlot = next;
-        s_pipe1DlArenaUsed[next] = 0;
-        if (++s_dlArenaGen == 0) s_dlArenaGen = 1;
-    }
-    beginVertexArena();
-    s_producerWorkerFrame = (frame.slot + 1) & 1;
-    s_pipe2PresentQueued = false;
 }
 
 static bool queueProducerPresent() {
@@ -7716,6 +10154,7 @@ static bool queueProducerPresent() {
     if (s_pipe2PresentQueued) return true;
     gx2prod::waitPending(gx2prod::kWaitEndFrame);
         ProducerFrameState& frame = producerFrameForRecord();
+    frame.present = true;
     if (!gx2prod::queueBoundary(gx2prod::kWaitEndFrame, producerPresentService, &frame)) {
         WHBLogPrintf("SMS Wii U: [pipe2] end-of-frame boundary rejected");
         return false;
@@ -7724,9 +10163,93 @@ static bool queueProducerPresent() {
     return true;
 }
 
+extern "C" int sms_wiiu_gx2_renderer_pipe5_end_frame(int rendered, int bufferMode) {
+    if (!sms_wiiu_pipe5_enabled()) return SmsWiiuPipe5Inactive;
+    const bool ownershipEligible = !rendered || bufferMode == 2 || bufferMode == 3;
+    if (!ownershipEligible) {
+        WHBLogPrintf("SMS Wii U: [pipe5] unsupported buffer mode=%d; using legacy end frame", bufferMode);
+        smg_gphase_note_pipe5_bad_frame();
+    }
+    if (!s_pipe5FrameStarted) {
+        WHBLogPrintf("SMS Wii U: [pipe5] end frame without renderer begin");
+        smg_gphase_note_pipe5_bad_frame();
+        sms_wiiu_pipe5_trace(P5T_HAZARD, 1);
+        return SmsWiiuPipe5Fallback;
+    }
+    if (s_pipe5DrainRuns) {
+        WHBLogPrintf("SMS Wii U: [pipe5] deferred drain would run twice");
+        smg_gphase_note_pipe5_bad_frame();
+        sms_wiiu_pipe5_trace(P5T_HAZARD, s_pipe5DrainRuns);
+        s_pipe5FrameStarted = false;
+        s_pipe5DrainRuns = 0;
+        s_pipe5DrainFrame = nullptr;
+        return SmsWiiuPipe5Fallback;
+    }
+    if (s_frameActive)
+        sms_wiiu_gx2_renderer_end();
+    ProducerFrameState& frame = producerFrameForWorker();
+    frame.present = rendered != 0;
+    sms_wiiu_pipe5_trace(P5T_DRAIN_IN, 0);
+    const OSTime waitStart = OSGetTime();
+    if (!gx2prod::queueBoundary(gx2prod::kWaitPresent, producerPresentService, &frame)) {
+        frame.present = false;
+        WHBLogPrintf("SMS Wii U: [pipe5] end-frame boundary rejected; using legacy end frame");
+        smg_gphase_note_pipe5_bad_frame();
+        sms_wiiu_pipe5_trace(P5T_HAZARD, 2);
+        gx2prod::wait(gx2prod::kWaitPresent);
+        gx2prod::service();
+        if (s_pipe5DrainFrame != &frame)
+            retireProducerFrame(frame, GX2GetLastSubmittedTimeStamp());
+        s_pipe5FrameStarted = false;
+        s_pipe5DrainFrame = nullptr;
+        return SmsWiiuPipe5Fallback;
+    }
+    gx2prod::wait(gx2prod::kWaitPresent);
+    const uint32_t waitUs = static_cast<uint32_t>(OSTicksToMicroseconds(OSGetTime() - waitStart));
+    smg_gphase_note_pipe5_drain(waitUs);
+    if (s_pipe5DrainRuns != 1) {
+        WHBLogPrintf("SMS Wii U: [pipe5] producer present service did not retire frame");
+        smg_gphase_note_pipe5_bad_frame();
+        sms_wiiu_pipe5_trace(P5T_HAZARD, s_pipe5DrainRuns);
+        frame.present = false;
+        gx2prod::service();
+        if (s_pipe5DrainFrame != &frame)
+            retireProducerFrame(frame, GX2GetLastSubmittedTimeStamp());
+        s_pipe5FrameStarted = false;
+        s_pipe5DrainFrame = nullptr;
+        return SmsWiiuPipe5Fallback;
+    }
+    sms_wiiu_pipe5_trace(P5T_DRAIN_OUT, 0);
+    if (!ownershipEligible)
+        sms_wiiu_pipe5_trace(P5T_FALLBACK, uint32_t(bufferMode));
+    if (!ownershipEligible)
+    {
+        s_pipe5FrameStarted = false;
+        s_pipe5DrainFrame = nullptr;
+        return SmsWiiuPipe5Fallback;
+    }
+    sms_wiiu_pipe5_trace(P5T_OWNED, 1);
+    s_pipe5FrameStarted = false;
+    s_pipe5DrainFrame = nullptr;
+    return rendered ? SmsWiiuPipe5OverlapOwned : SmsWiiuPipe5Inactive;
+}
+
 extern "C" int sms_wiiu_pipe2_present_queued(void) {
     return s_pipe2PresentQueued ? 1 : 0;
 }
+
+#if defined(PORT_GAME_SMG)
+extern "C" void sms_wiiu_gx2_renderer_exit_quiesce(void) {
+    if (!s_gx2ProdEnabled || s_gx2ExitQuiesced) return;
+    if (sms_wiiu_pipe2_enabled())
+        gx2prod::waitPending(gx2prod::kWaitEndFrame);
+    gx2prod::wait(gx2prod::kWaitPresent);
+    gx2prod::service();
+    s_gx2ExitQuiesced = true;
+    __asm__ volatile("sync" ::: "memory");
+    WHBLogPrintf("SMS Wii U: [gx2prod] exit: the worker drops GX work from here on");
+}
+#endif
 
 extern "C" void sms_wiiu_gx2_renderer_exit_drain(void) {
     if (!s_gx2ProdEnabled || !sms_wiiu_pipe2_enabled() || !s_pipe2PresentQueued)
@@ -7779,6 +10302,36 @@ static void producerCopyService(void* opaque) {
     rebindTvTarget();
 }
 
+#if defined(PORT_GAME_SMG)
+// clearzfast/clearefbfast under gx2prod: a clear-only service record (clear bit, no display copy, no
+// resolved copy), so producerCopyService performs the clears between the worker's lists.
+static bool queueProducerClear(bool colour, uint32_t r8, uint32_t g8, uint32_t b8, uint32_t a8, uint32_t z) {
+#ifdef __WIIU__
+    gx2DlSplit(kDlSplitCopy);
+    ProducerFrameState& frame = producerFrameForWorker();
+    if (frame.copyWrite >= sizeof(frame.copies) / sizeof(frame.copies[0])) return false;
+    ProducerCopyRequest& r = frame.copies[frame.copyWrite++];
+    r = ProducerCopyRequest{};
+    r.ctrl = 1u << 11;  // clear, not a display copy
+    r.clearAr = (a8 & 255) << 8 | (r8 & 255);
+    r.clearGb = (g8 & 255) << 8 | (b8 & 255);
+    r.clearZ = z & 0xffffff;
+    r.cmode = colour ? (1u << 3) : 0u;
+    r.pe = g.bp[BP_PE_CONTROL];
+    r.zmode = 1u << 4;
+    invalidateVertexUniforms();
+    if (!gx2prod::enqueueService(producerCopyService, &r)) {
+        --frame.copyWrite;
+        return false;
+    }
+    return true;
+#else
+    (void)colour; (void)r8; (void)g8; (void)b8; (void)a8; (void)z;
+    return false;
+#endif
+}
+#endif
+
 void executeCopy(uint32_t ctrl) {
     SMS_PORT_HEAP_SCOPE();
     flushBatch();
@@ -7810,7 +10363,10 @@ void executeCopy(uint32_t ctrl) {
             // the next recorded list restores it before drawing.
             invalidateVertexUniforms();
         }
-        if (!gx2prod::enqueueService(producerCopyService, &r))
+        OSTime gphase_copy_start = smg_gphase_begin_timer(SmgGPhaseTimer_MarioShadowCopyService);
+        const bool queued = gx2prod::enqueueService(producerCopyService, &r);
+        smg_gphase_end_timer(SmgGPhaseTimer_MarioShadowCopyService, gphase_copy_start);
+        if (!queued)
             WHBLogPrintf("SMS Wii U: [gx2prod] service queue rejected copy");
         return;
     }
@@ -7850,6 +10406,9 @@ void executeCopy(uint32_t ctrl) {
     }
     if (!s_frameActive || !ProcUIInForeground()) return;
     {
+#if defined(PORT_GAME_SMG)
+        SmgWProfScope wprofEfb(SmgWBucket_Efb);
+#endif
         copyToTexture(g.copyDest, x, y, w, h, (ctrl >> 9) & 1,
                       ((ctrl >> 3) & 1) << 3 | ((ctrl >> 4) & 7));
         rebindTvTarget();  // GX2CopySurface may leave its destination bound
@@ -7890,6 +10449,8 @@ void markXfMemDirty() {
 // every peek, so it is not used there.
 static GX2Surface s_peekSurface, s_peekSpecial;
 static bool s_peekSurfaceReady;
+extern "C" void GX2ConvertDepthBufferToTextureSurface(GX2DepthBuffer* src, GX2Surface* dst, uint32_t dstMip,
+                                                      uint32_t dstSlice);
 #if defined(PORT_GAME_SMG)
 static uint32_t s_peekColorFrame = ~0u;
 static GX2Surface s_peekColorLinear, s_peekColorSnapshot;
@@ -7958,6 +10519,7 @@ static bool producerColourPeekAnyInFlight() {
 }
 
 static bool initProducerColourPeekSlots(GX2ColorBuffer* cb) {
+    sms_wiiu_pipe5_wait_resource_fence();
     const uint32_t width = cb->surface.width, height = cb->surface.height;
     publishRetiredProducerColourPeeks();
     if (s_producerColourPeekReady &&
@@ -8042,6 +10604,187 @@ static bool queueProducerColourPeek(GX2ColorBuffer* cb) {
     return true;
 }
 
+struct ProducerDepthPeekSlot {
+    GX2Surface tiled;
+    GX2Surface surface;
+    uint64_t stamp;
+    uint32_t sequence;
+    bool inFlight;
+};
+struct ProducerDepthPeekRequest {
+    GX2DepthBuffer* source;
+    uint32_t frame;
+    uint32_t submitSequence;
+};
+static ProducerDepthPeekSlot s_producerDepthPeekSlots[3];
+static ProducerDepthPeekRequest s_producerDepthPeekRequest;
+static bool s_producerDepthPeekReady;
+static uint32_t s_producerDepthPeekWidth, s_producerDepthPeekHeight;
+static uint32_t s_producerDepthPeekSequence;
+static volatile uint32_t s_producerDepthPeekPublishedSequence;
+static volatile int32_t s_producerDepthPeekPublishedSlot = -1;
+static uint32_t s_producerDepthPeekFrame = ~0u;
+
+static bool producerDepthPeekEnabled() {
+    return s_gx2ProdEnabled && s_peekZProdMarker && s_peekAsyncMarker &&
+           !runningUnderCemu() && SMS_GX2_ASYNC_PEEK;
+}
+
+static void publishRetiredProducerDepthPeeks() {
+    const uint64_t retired = ::GX2GetRetiredTimeStamp();
+    int newest = -1;
+    uint32_t newestSequence = s_producerDepthPeekPublishedSequence;
+    for (uint32_t i = 0; i < 3; ++i) {
+        ProducerDepthPeekSlot& slot = s_producerDepthPeekSlots[i];
+        if (!slot.inFlight || retired < slot.stamp) continue;
+        slot.inFlight = false;
+        if (slot.sequence > newestSequence) {
+            newest = int(i);
+            newestSequence = slot.sequence;
+        }
+    }
+    if (newest >= 0) {
+        __sync_synchronize();
+        s_producerDepthPeekPublishedSlot = newest;
+        s_producerDepthPeekPublishedSequence = newestSequence;
+        __sync_fetch_and_add(&s_fpsPeekZPublished, 1);
+    }
+}
+
+static bool producerDepthPeekAnyInFlight() {
+    for (uint32_t i = 0; i < 3; ++i)
+        if (s_producerDepthPeekSlots[i].inFlight) return true;
+    return false;
+}
+
+static bool initProducerDepthPeekSlots(GX2DepthBuffer* db) {
+    sms_wiiu_pipe5_wait_resource_fence();
+    const uint32_t width = db->surface.width, height = db->surface.height;
+    publishRetiredProducerDepthPeeks();
+    if (s_producerDepthPeekReady &&
+        (s_producerDepthPeekWidth != width || s_producerDepthPeekHeight != height)) {
+        if (producerDepthPeekAnyInFlight()) return false;
+        for (uint32_t i = 0; i < 3; ++i) {
+            MEMFreeToDefaultHeap(s_producerDepthPeekSlots[i].tiled.image);
+            MEMFreeToDefaultHeap(s_producerDepthPeekSlots[i].surface.image);
+            s_producerDepthPeekSlots[i].tiled.image = nullptr;
+            s_producerDepthPeekSlots[i].surface.image = nullptr;
+        }
+        s_producerDepthPeekReady = false;
+        s_producerDepthPeekPublishedSequence = 0;
+        s_producerDepthPeekPublishedSlot = -1;
+    }
+    if (s_producerDepthPeekReady) return true;
+    memset(s_producerDepthPeekSlots, 0, sizeof(s_producerDepthPeekSlots));
+    for (uint32_t i = 0; i < 3; ++i) {
+        GX2Surface& tiled = s_producerDepthPeekSlots[i].tiled;
+        tiled.use = GX2SurfaceUse(GX2_SURFACE_USE_TEXTURE | GX2_SURFACE_USE_COLOR_BUFFER);
+        tiled.dim = GX2_SURFACE_DIM_TEXTURE_2D;
+        tiled.width = width;
+        tiled.height = height;
+        tiled.depth = 1;
+        tiled.mipLevels = 1;
+        tiled.format = GX2_SURFACE_FORMAT_FLOAT_R32;
+        tiled.aa = GX2_AA_MODE1X;
+        tiled.tileMode = GX2_TILE_MODE_DEFAULT;
+        GX2CalcSurfaceSizeAndAlignment(&tiled);
+        tiled.image = alignedZero(tiled.alignment, tiled.imageSize);
+
+        GX2Surface& surface = s_producerDepthPeekSlots[i].surface;
+        surface = tiled;
+        surface.tileMode = GX2_TILE_MODE_LINEAR_ALIGNED;
+        GX2CalcSurfaceSizeAndAlignment(&surface);
+        surface.image = tiled.image ? alignedZero(surface.alignment, surface.imageSize) : nullptr;
+        if (!tiled.image || !surface.image) {
+            if (tiled.image) MEMFreeToDefaultHeap(tiled.image);
+            if (surface.image) MEMFreeToDefaultHeap(surface.image);
+            for (uint32_t j = 0; j < i; ++j) {
+                MEMFreeToDefaultHeap(s_producerDepthPeekSlots[j].tiled.image);
+                MEMFreeToDefaultHeap(s_producerDepthPeekSlots[j].surface.image);
+            }
+            memset(s_producerDepthPeekSlots, 0, sizeof(s_producerDepthPeekSlots));
+            return false;
+        }
+        DCFlushRange(tiled.image, tiled.imageSize);
+        DCFlushRange(surface.image, surface.imageSize);
+    }
+    s_producerDepthPeekWidth = width;
+    s_producerDepthPeekHeight = height;
+    s_producerDepthPeekSequence = 0;
+    s_producerDepthPeekPublishedSequence = 0;
+    s_producerDepthPeekPublishedSlot = -1;
+    s_producerDepthPeekReady = true;
+    return true;
+}
+
+static void producerDepthPeekService(void* opaque) {
+    ProducerDepthPeekRequest& request = *static_cast<ProducerDepthPeekRequest*>(opaque);
+    publishRetiredProducerDepthPeeks();
+    if (!request.source || !initProducerDepthPeekSlots(request.source)) return;
+    int selected = -1;
+    uint32_t oldest = ~0u;
+    for (uint32_t i = 0; i < 3; ++i) {
+        const ProducerDepthPeekSlot& slot = s_producerDepthPeekSlots[i];
+        if (slot.inFlight || int32_t(i) == s_producerDepthPeekPublishedSlot ||
+            (slot.sequence >= oldest && selected >= 0)) continue;
+        selected = int(i);
+        oldest = slot.sequence;
+    }
+    if (selected < 0) return;
+    ProducerDepthPeekSlot& slot = s_producerDepthPeekSlots[selected];
+    GX2Invalidate(GX2_INVALIDATE_MODE_DEPTH_BUFFER, request.source->surface.image,
+                  request.source->surface.imageSize);
+    sms_wiiu_d4_event(D4_DEPTH_COPY);
+    GX2ConvertDepthBufferToTextureSurface(request.source, &slot.tiled, 0, 0);
+    invalidateVertexUniforms();
+    gpuStampSurface(GPU_EFBCOPY, request.source->surface, slot.tiled);
+    sms_wiiu_d4_event(D4_DEPTH_COPY);
+    GX2CopySurface(&slot.tiled, 0, 0, &slot.surface, 0, 0);
+    invalidateVertexUniforms();
+    gpuStampSurface(GPU_EFBCOPY, slot.tiled, slot.surface);
+    rebindTvTarget();
+    GX2Flush();
+    slot.stamp = GX2GetLastSubmittedTimeStamp();
+    slot.sequence = request.submitSequence;
+    slot.inFlight = true;
+}
+
+static bool queueProducerDepthPeek(GX2DepthBuffer* db) {
+    if (s_producerDepthPeekFrame == g_displayFrames) return true;
+    if (s_peek2Marker && (g_displayFrames & 1)) {
+        s_producerDepthPeekFrame = g_displayFrames;
+        return true;
+    }
+    s_producerDepthPeekRequest = {db, g_displayFrames, ++s_producerDepthPeekSequence};
+    if (!gx2prod::enqueueService(producerDepthPeekService, &s_producerDepthPeekRequest))
+        return false;
+    s_producerDepthPeekFrame = g_displayFrames;
+    ++s_fpsPeekZRequests;
+    return true;
+}
+
+static uint32_t readProducerDepthPeek(GX2DepthBuffer* db, int x, int y) {
+    queueProducerDepthPeek(db);
+    const uint32_t published = s_producerDepthPeekPublishedSequence;
+    const int32_t publishedSlot = s_producerDepthPeekPublishedSlot;
+    if (!published || publishedSlot < 0 || publishedSlot >= 3 ||
+        s_producerDepthPeekSlots[publishedSlot].sequence != published)
+        return 0xffffff;
+    GX2Surface& surface = s_producerDepthPeekSlots[publishedSlot].surface;
+    uint32_t px = uint32_t(s_gameOffsetX + (float(x) + 0.5f) * s_gameScaleX);
+    uint32_t py = uint32_t((float(y) + 0.5f) * s_gameScaleY);
+    if (px >= surface.width) px = surface.width - 1;
+    if (py >= surface.height) py = surface.height - 1;
+    uint8_t* texel = static_cast<uint8_t*>(surface.image) +
+                     (size_t(py) * surface.pitch + px) * 4;
+    sms_wiiu_d4_event(D4_READBACK);
+    DCInvalidateRange(texel, 4);
+    float d;
+    memcpy(&d, texel, 4);
+    if (!(d >= 0.0f)) d = 0.0f;
+    return d >= 1.0f ? 0xffffff : uint32_t(d * 16777215.0f);
+}
+
 static bool readProducerFrameColourPixels(GX2ColorBuffer* cb, const int (*points)[2],
                                           uint32_t count, uint32_t* out) {
     queueProducerColourPeek(cb);
@@ -8082,6 +10825,7 @@ bool colourPeekNeedsSync() {
 }
 
 static bool readFrameColourPixels(GX2ColorBuffer* cb, const int (*points)[2], uint32_t count, uint32_t* out) {
+    sms_wiiu_pipe5_wait_resource_fence();
     if (s_peekColorReady && (s_peekColorLinear.width != cb->surface.width ||
                              s_peekColorLinear.height != cb->surface.height)) {
         if (s_peekColorQueued) GX2WaitTimeStamp(s_peekColorStamp);
@@ -8161,6 +10905,7 @@ extern "C" void sms_wiiu_gx2_wait_peek(int colour) {
 bool colourPeekNeedsSync() { return true; }
 #endif
 static bool readTvPixels(const int (*points)[2], uint32_t count, uint32_t* out) {
+    sms_wiiu_pipe5_wait_resource_fence();
     dlCacheExternalStateChanged();
     ++s_perfPeeks;
     ++s_fpsPeeks;
@@ -8308,18 +11053,18 @@ static void debugPixelTrace(uint32_t draw) {
 // and skipped frames reuse the last completed snapshot. Under Cemu
 // (whose copies never reach guest memory) and with the SD marker "nopeekz" it
 // stays the old far-plane answer.
-extern "C" void GX2ConvertDepthBufferToTextureSurface(GX2DepthBuffer* src, GX2Surface* dst, uint32_t dstMip,
-                                                      uint32_t dstSlice);
 static uint32_t s_peekZFrame = ~0u;  // the frame whose depth snapshot is queued/reused
 // d45: only the first GXPeekZ of a frame issues GPU work (the snapshot copy); the others read CPU memory, so in
 // producer mode they need not drain the worker (17 lens-flare peeks a frame each waited for it).
 bool peekZNeedsSync() {
 #if defined(PORT_GAME_SMG)
+    if (producerDepthPeekEnabled()) return false;
     if (s_peek2Marker && (g_displayFrames & 1)) return false;
 #endif
     return s_peekZFrame != g_displayFrames;
 }
 uint32_t peekZ(int x, int y) {
+    sms_wiiu_pipe5_wait_resource_fence();
     SMS_PORT_HEAP_SCOPE();
     dlCacheExternalStateChanged();
     static int s_enabled = -1;
@@ -8334,6 +11079,9 @@ uint32_t peekZ(int x, int y) {
     if (!s_ready || !s_frameActive || !ProcUIInForeground() || !db ||
         db->surface.format != GX2_SURFACE_FORMAT_FLOAT_R32 || db->surface.aa != GX2_AA_MODE1X)
         return 0xffffff;
+#if defined(PORT_GAME_SMG)
+    if (producerDepthPeekEnabled()) return readProducerDepthPeek(db, x, y);
+#endif
     // Two linear targets used in turn: the GPU copies into one while peeks
     // read the last completed one, so no CPU copy and no read of a target
     // the GPU is still writing.
@@ -8342,6 +11090,11 @@ uint32_t peekZ(int x, int y) {
     static GX2Surface* s_read = &s_snapshot;
     static bool s_ready2, s_queued, s_completed;
     static uint64_t s_stamp;
+#if defined(PORT_GAME_SMG)
+    static GX2Rect s_writeRect, s_readRect;  // the part of each linear target the last copy wrote
+    static int32_t s_boxMinX, s_boxMinY, s_boxMaxX, s_boxMaxY;  // peeks since the last queued copy
+    static bool s_boxValid, s_boxMissed;
+#endif
     uint32_t& s_frame = s_peekZFrame;
     if (s_ready2 && (s_linear.width != db->surface.width || s_linear.height != db->surface.height)) {
         MEMFreeToDefaultHeap(s_tiled.image);
@@ -8403,14 +11156,54 @@ uint32_t peekZ(int x, int y) {
                 s_write = s_read;
                 s_read = done;
                 s_completed = true;
+#if defined(PORT_GAME_SMG)
+                const GX2Rect r = s_writeRect;
+                s_writeRect = s_readRect;
+                s_readRect = r;
+#endif
             }
             GX2Invalidate(GX2_INVALIDATE_MODE_DEPTH_BUFFER, db->surface.image, db->surface.imageSize);
             sms_wiiu_d4_event(D4_DEPTH_COPY);
+#if defined(PORT_GAME_SMG)
+            if (s_peekZLinMarker) {
+                // peekzlin: the conversion renders straight into the linear target (no second full copy).
+                GX2ConvertDepthBufferToTextureSurface(db, s_write, 0, 0); invalidateVertexUniforms();
+                gpuStampSurface(GPU_EFBCOPY, db->surface, *s_write);
+                s_writeRect = {0, 0, int32_t(s_linear.width), int32_t(s_linear.height)};
+            } else
+#endif
+            {
             GX2ConvertDepthBufferToTextureSurface(db, &s_tiled, 0, 0); invalidateVertexUniforms();
             gpuStampSurface(GPU_EFBCOPY, db->surface, s_tiled);
             sms_wiiu_d4_event(D4_DEPTH_COPY);
+#if defined(PORT_GAME_SMG)
+            // peekzrect: copy only the box around the previous period's peeks (+48 px, 8-aligned);
+            // without one, or after a peek fell outside the copied box, copy everything.
+            if (s_peekZRectMarker && s_boxValid && !s_boxMissed) {
+                const int32_t W = int32_t(s_linear.width), H = int32_t(s_linear.height);
+                int32_t l = (s_boxMinX - 48) & ~7, t = (s_boxMinY - 48) & ~7;
+                int32_t r = (s_boxMaxX + 48 + 8) & ~7, b = (s_boxMaxY + 48 + 8) & ~7;
+                if (l < 0) l = 0;
+                if (t < 0) t = 0;
+                if (r > W) r = W;
+                if (b > H) b = H;
+                GX2Rect rect = {l, t, r, b};
+                GX2Point point = {l, t};
+                GX2CopySurfaceEx(&s_tiled, 0, 0, s_write, 0, 0, 1, &rect, &point); invalidateVertexUniforms();
+                s_writeRect = rect;
+            } else
+#endif
+            {
             GX2CopySurface(&s_tiled, 0, 0, s_write, 0, 0); invalidateVertexUniforms();
+#if defined(PORT_GAME_SMG)
+            s_writeRect = {0, 0, int32_t(s_linear.width), int32_t(s_linear.height)};
+#endif
+            }
             gpuStampSurface(GPU_EFBCOPY, s_tiled, *s_write);
+            }
+#if defined(PORT_GAME_SMG)
+            s_boxValid = s_boxMissed = false;
+#endif
             rebindTvTarget();
             GX2Flush();
             s_stamp = GX2GetLastSubmittedTimeStamp();
@@ -8422,12 +11215,35 @@ uint32_t peekZ(int x, int y) {
     uint32_t py = uint32_t((float(y) + 0.5f) * s_gameScaleY);
     if (px >= s_linear.width) px = s_linear.width - 1;
     if (py >= s_linear.height) py = s_linear.height - 1;
+#if defined(PORT_GAME_SMG)
+    {
+        const int32_t ix = int32_t(px), iy = int32_t(py);
+        if (!s_boxValid) { s_boxMinX = s_boxMaxX = ix; s_boxMinY = s_boxMaxY = iy; s_boxValid = true; }
+        if (ix < s_boxMinX) s_boxMinX = ix;
+        if (ix > s_boxMaxX) s_boxMaxX = ix;
+        if (iy < s_boxMinY) s_boxMinY = iy;
+        if (iy > s_boxMaxY) s_boxMaxY = iy;
+        if (ix < s_readRect.left || ix >= s_readRect.right || iy < s_readRect.top || iy >= s_readRect.bottom) {
+            s_boxMissed = true;
+            ++s_fpsPeekZMiss;
+        }
+    }
+#endif
     uint8_t* texel = static_cast<uint8_t*>(s_read->image) + (size_t(py) * s_read->pitch + px) * 4;
     sms_wiiu_d4_event(D4_READBACK);
     DCInvalidateRange(texel, 4);  // only the line read: the GPU rewrote it since
     float d;
     memcpy(&d, texel, 4);
     if (!(d >= 0.0f)) d = 0.0f;  // NaN
+#if defined(PORT_GAME_SMG)
+    if (d >= 1.0f) ++s_fpsPeekZFar; else ++s_fpsPeekZNear;
+    {
+        const uint32_t z = d >= 1.0f ? 0xffffffu : uint32_t(d * 16777215.0f);
+        s_fpsPeekZSum += z;
+        if (z < s_fpsPeekZMin) s_fpsPeekZMin = z;
+        if (z > s_fpsPeekZMax) s_fpsPeekZMax = z;
+    }
+#endif
     return d >= 1.0f ? 0xffffff : uint32_t(d * 16777215.0f);
 }
 void pixMetricClear() {}
@@ -8480,17 +11296,37 @@ extern "C" void sms_wiiu_gx2_force_nodiff(int mode) {
 
 extern "C" void sms_wiiu_gx2_renderer_begin(void) {
     SMS_PORT_HEAP_SCOPE();
-    if (!s_ready || !ProcUIInForeground()) return;
+    if (!s_ready || !ProcUIInForeground()) {
+        /* The game loop still reaches endFrame while a renderer begin can be
+         * skipped (foreground loss or an incomplete init).  Do not let the
+         * previous producer retirement masquerade as this frame's drain. */
+        s_pipe5FrameStarted = false;
+        s_pipe5DrainRuns = 0;
+        s_pipe5DrainFrame = nullptr;
+        return;
+    }
+    if (sms_wiiu_pipe5_enabled()) {
+        if (s_pipe5FrameStarted && s_pipe5DrainRuns != 1) {
+            WHBLogPrintf("SMS Wii U: [pipe5] deferred drain count=%u for frame",
+                         unsigned(s_pipe5DrainRuns));
+            smg_gphase_note_pipe5_bad_frame();
+        }
+        s_pipe5FrameStarted = true;
+        s_pipe5DrainRuns = 0;
+        s_pipe5DrainFrame = nullptr;
+    }
     if (sms_wiiu_pipe2_enabled()) {
         if (!s_pipe2FrameStarted) {
             beginVertexArena();
             s_pipe2FrameStarted = true;
             producerFrameForRecord().copyWrite = 0;
             producerFrameForRecord().draws = 0;
+            producerFrameForRecord().present = false;
         } else {
             s_producerRecordFrame = (s_producerRecordFrame + 1) & 1;
             s_producerFrames[s_producerRecordFrame].copyWrite = 0;
             s_producerFrames[s_producerRecordFrame].draws = 0;
+            s_producerFrames[s_producerRecordFrame].present = false;
         }
     } else {
         beginVertexArena();
@@ -8500,7 +11336,7 @@ extern "C" void sms_wiiu_gx2_renderer_begin(void) {
     // vertex shaders 48 GPRs and asking for more hangs the GPU on hardware
     // (Cemu does not enforce it).  64 + 184 keeps the default 248 total; the
     // TEV pixel shaders need 44.  Set inside the TV context so it is shadowed.
-    GX2SetShaderModeEx(GX2_SHADER_MODE_UNIFORM_REGISTER, 64, 64, 0, 0, 184, 192);
+    GX2SetShaderModeEx(GX2_SHADER_MODE_UNIFORM_REGISTER, s_vsGprPool, 64, 0, 0, s_psGprPool, 192);
     s_shaderModeBlock = false;
     GX2SetColorBuffer(renderColour(), GX2_RENDER_TARGET_0);
     GX2SetDepthBuffer(renderDepth());
@@ -8545,27 +11381,33 @@ extern "C" int sms_wiiu_gx2_renderer_has_draws(void) {
 }
 extern "C" void sms_wiiu_gx2_renderer_end(void) {
     SMS_PORT_HEAP_SCOPE();
-    if (!s_frameActive) return;
+    sms_wiiu_pipe5_trace(P5T_END_IN, 0);
+    if (!s_frameActive) { sms_wiiu_pipe5_trace(P5T_END_OUT, 0); return; }
 #ifdef __WIIU__
     if (s_gx2ProdEnabled) {
         if (!sms_wiiu_pipe2_enabled()) {
-            gx2prod::wait(gx2prod::kWaitPresent);
-            gx2prod::service();
-            ProducerFrameState& frame = producerFrameForWorker();
-            for (uint32_t i = 0; i < frame.copyWrite; ++i) {
-                deferFree(frame.copies[i].copy.retiredImage, frame.copies[i].copy.retiredMem1Heap,
-                          frame.copies[i].copy.retiredImageBytes);
-                frame.copies[i].copy.retiredImage = nullptr;
+            if (sms_wiiu_pipe5_enabled())
+                gx2prod::wake();
+            else {
+                gx2prod::wait(gx2prod::kWaitPresent);
+                gx2prod::service();
+                ProducerFrameState& frame = producerFrameForWorker();
+                for (uint32_t i = 0; i < frame.copyWrite; ++i) {
+                    deferFree(frame.copies[i].copy.retiredImage, frame.copies[i].copy.retiredMem1Heap,
+                              frame.copies[i].copy.retiredImageBytes);
+                    frame.copies[i].copy.retiredImage = nullptr;
+                }
+                frame.copyWrite = 0;
+                sms_wiiu_gx2prod_reset_draw_sync_jobs();
             }
-            frame.copyWrite = 0;
-            sms_wiiu_gx2prod_reset_draw_sync_jobs();
         }
     } else
 #endif
     flushBatch();
     if (!sms_wiiu_pipe2_enabled()) {
         GX2Flush();
-        endVertexArena();
+        if (!sms_wiiu_pipe5_enabled())
+            endVertexArena();
     }
     static uint32_t s_arenaPeak;
     s_arenaPeak = std::max(s_arenaPeak, s_vertexArenaUsed);
@@ -8718,6 +11560,7 @@ extern "C" void sms_wiiu_gx2_renderer_end(void) {
         s_frameActive = false;
     if (!sms_wiiu_pipe2_enabled())
         s_drawsThisFrame = 0;
+    sms_wiiu_pipe5_trace(P5T_END_OUT, 0);
     ++g_displayFrames;
     if (!s_fpsWindowStart) s_fpsWindowStart = OSGetTime();
     if ((g_displayFrames % 120) == 0) {
@@ -8728,6 +11571,9 @@ extern "C" void sms_wiiu_gx2_renderer_end(void) {
         logFpsWindow();
     }
     gx2prod::note_frame(g_displayFrames);
+#if defined(PORT_GAME_SMG)
+    jpaThinFrame();
+#endif
 }
 
 } // namespace gx

@@ -22,6 +22,9 @@
 #include "Game/Util/MemoryUtil.hpp"
 #include "Game/Util/ModelUtil.hpp"
 #include "Game/Util/SoundUtil.hpp"
+#if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
+#include "Game/System/J3DMT.hpp"
+#endif
 #include <JSystem/J3DGraphAnimator/J3DModel.hpp>
 
 void LiveActor_FORCE_MATCH_SDATA2() {
@@ -165,6 +168,12 @@ void LiveActor::calcAnim() {
     if (mFlag.mIsNoCalcAnim) {
         return;
     }
+
+#if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
+    if (smg_j3dmt_try_queue_actor(this)) {
+        return;
+    }
+#endif
 
     calcAnmMtx();
 

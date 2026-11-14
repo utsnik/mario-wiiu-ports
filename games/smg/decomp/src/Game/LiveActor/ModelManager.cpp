@@ -15,6 +15,9 @@
 #include "Game/Util/ObjUtil.hpp"
 #include <JSystem/J3DGraphAnimator/J3DModel.hpp>
 #include <cstdio>
+#if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
+#include "Game/System/J3DMT.hpp"
+#endif
 
 ModelManager::ModelManager()
     : mBtkPlayer(), mBrkPlayer(), mBtpPlayer(), mBpkPlayer(), mBvaPlayer(), mXanimeResourceTable(), mXanimePlayer(), mModel(), mModelResourceHolder(),
@@ -51,9 +54,36 @@ void ModelManager::update() {
 }
 
 void ModelManager::calcAnim() {
+#if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
+    if (smg_j3dmt_try_queue_model(this))
+        return;
+#endif
+    int serialCalcTimed = smg_j3dmt_serial_calc_begin();
     calc();
+    if (serialCalcTimed)
+        smg_j3dmt_serial_calc_end();
     updateDL(true);
 }
+
+#if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
+void ModelManager::calcBeforeAnmMtx() {
+    if (mXanimePlayer != nullptr) {
+        mXanimePlayer->calcAnm(0);
+    }
+
+    if (mBvaPlayer != nullptr) {
+        mBvaPlayer->calc();
+    }
+
+    OSLockMutex(&MR::MutexHolder< 0 >::sMutex);
+    getJ3DModel()->calcBeforeAnmMtx();
+    OSUnlockMutex(&MR::MutexHolder< 0 >::sMutex);
+
+    if (mXanimePlayer != nullptr) {
+        mXanimePlayer->clearAnm(0);
+    }
+}
+#endif
 
 void ModelManager::calcView() {
     getJ3DModel()->viewCalc();

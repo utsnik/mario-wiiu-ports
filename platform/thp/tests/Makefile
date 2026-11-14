@@ -1,11 +1,11 @@
-# Host test for the THP decoders (decomp THPDec.c/THPAudio.c + thp-0*.patch).
+# Host test for the THP decoders (decomp THPDec.c/THPAudio.c + Galaxy THP patches).
 #   make run DISC=/path/to/GMSE01/files [MOVIE=data/openingA.thp] [FRAMES=...]
 PORT   := $(abspath ../../..)
 DECOMP := $(PORT)/decomp
 ARCH   ?= -m32
 CC     ?= gcc
 CXX    ?= g++
-CFLAGS := $(ARCH) -O2 -g -std=gnu99 -w -fno-strict-aliasing -DTARGET_PC -DGEKKO \
+CFLAGS := $(ARCH) -O2 -g -std=gnu99 -w -fno-strict-aliasing -DTARGET_PC -DPORT_GAME_SMG -DGEKKO \
           -I$(PORT)/src/port_include -I$(DECOMP)/include -I$(DECOMP)/libs/dolphin/include -include $(PORT)/src/port_compat.h
 # Patched copies and objects live outside platform/ (the port globs platform/**/*.c).
 WORK   ?= $(PORT)/build-thp-test
@@ -13,10 +13,10 @@ OUT    ?= $(WORK)/out
 
 .DEFAULT_GOAL := run
 
-$(WORK)/patched/.stamp: $(wildcard $(PORT)/decomp-patches/thp-0[1235]-*.patch) $(DECOMP)/libs/dolphin/src/thp/THPDec.c $(DECOMP)/libs/dolphin/src/thp/THPAudio.c
+$(WORK)/patched/.stamp: $(wildcard $(PORT)/decomp-patches/thp-0[1235789]-*.patch) $(DECOMP)/libs/dolphin/src/thp/THPDec.c $(DECOMP)/libs/dolphin/src/thp/THPAudio.c
 	rm -rf $(WORK)/patched && mkdir -p $(WORK)/patched/libs/dolphin/src/thp
 	cp $(DECOMP)/libs/dolphin/src/thp/THPDec.c $(DECOMP)/libs/dolphin/src/thp/THPAudio.c $(WORK)/patched/libs/dolphin/src/thp/
-	for p in $(PORT)/decomp-patches/thp-0[1235]-*.patch; do patch -p1 --quiet -d $(WORK)/patched -i $$p || exit 1; done
+	for p in $(PORT)/decomp-patches/thp-0[1235789]-*.patch; do patch -p1 --quiet -d $(WORK)/patched -i $$p || exit 1; done
 	touch $@
 
 $(WORK)/thp_test: thp_test.cc $(WORK)/patched/.stamp

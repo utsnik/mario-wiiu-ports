@@ -1,6 +1,9 @@
 #pragma once
 
 #include <revolution.h>
+#if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
+#include "JSystem/J3DGraphAnimator/J3DMTContext.hpp"
+#endif
 
 class J3DAnmTransform;
 class J3DMtxBuffer;
@@ -31,13 +34,25 @@ public:
     virtual void calc() = 0;
 
     static J3DMtxBuffer* getMtxBuffer() {
+#if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
+        return J3DMT::mtxBuffer();
+#else
         return mMtxBuffer;
+#endif
     }
     static J3DJoint* getJoint() {
+#if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
+        return J3DMT::joint();
+#else
         return mJoint;
+#endif
     }
     static void setJoint(J3DJoint* joint) {
+#if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
+        J3DMT::joint() = joint;
+#else
         mJoint = joint;
+#endif
     }
 
     static J3DMtxBuffer* mMtxBuffer;

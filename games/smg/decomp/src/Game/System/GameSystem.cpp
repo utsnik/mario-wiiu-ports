@@ -33,6 +33,13 @@
 #include "Game/Util/SequenceUtil.hpp"
 #include "Game/Util/SingletonHolder.hpp"
 #include "Game/Util/SystemUtil.hpp"
+#if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
+#include "wiiu/gphase.h"
+extern "C" int sms_wiiu_sd_marker(const char*);
+extern "C" void sms_wiiu_pipe5_consume_frame(void);
+extern "C" int sms_wiiu_pipe5_enabled(void);
+extern "C" void sms_wiiu_pipe5_scene_frame(void);
+#endif
 #include <JSystem/JKernel/JKRAram.hpp>
 #include <JSystem/JKernel/JKRExpHeap.hpp>
 #include <nw4r/lyt/init.h>
@@ -199,11 +206,68 @@ inline bool isSystemNormal(const GameSystem* pGameSystem) {
     return pGameSystem->isNerve(GET_NERVE(GameSystem, GameSystemNormal));
 }
 
+#if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
+bool smg_reorder_enabled() {
+    static int state = -1;
+    if (state < 0)
+        state = sms_wiiu_sd_marker("reorder") != 0 ? 1 : 0;
+    return state != 0;
+}
+#endif
+
+#if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
+namespace {
+constexpr uint32_t kPipe5SceneWarmupFrames = 120;
+Scene* s_pipe5Scene;
+uint32_t s_pipe5SceneFrames;
+}
+
+extern "C" void sms_wiiu_pipe5_scene_frame(void) {
+    GameSystem* system = SingletonHolder< GameSystem >::get();
+    GameSystemSceneController* controller = system ? system->mSceneController : nullptr;
+    Scene* scene = controller ? controller->getCurrentSceneForExecute() : nullptr;
+    if (scene != s_pipe5Scene) {
+        s_pipe5Scene = scene;
+        s_pipe5SceneFrames = 0;
+    }
+    if (!scene || controller->isChangingScene()) {
+        s_pipe5SceneFrames = 0;
+        return;
+    }
+    if (s_pipe5SceneFrames < kPipe5SceneWarmupFrames)
+        ++s_pipe5SceneFrames;
+}
+
+extern "C" int sms_wiiu_pipe5_scene_ready(void) {
+    GameSystem* system = SingletonHolder< GameSystem >::get();
+    GameSystemSceneController* controller = system ? system->mSceneController : nullptr;
+    Scene* scene = controller ? controller->getCurrentSceneForExecute() : nullptr;
+    return scene != nullptr && scene == s_pipe5Scene &&
+           s_pipe5SceneFrames >= kPipe5SceneWarmupFrames && !controller->isChangingScene();
+}
+#endif
+
+#if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
+extern "C" void sms_wiiu_reorder_drawwake(void);
+extern "C" int smg_reorder_pump_enabled(void) {
+    static int state = -1;
+    if (state < 0)
+        state = smg_reorder_enabled() && sms_wiiu_sd_marker("reorderpump") != 0 ? 1 : 0;
+    return state;
+}
+#endif
+
 bool GameSystem::isPreparedReset() const {
     return isSystemWaitForReboot(this) || isSystemNormal(this) || mStationedArchiveLoader->isPreparedReset();
 }
 
 void GameSystem::frameLoop() {
+#if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
+    sms_wiiu_pipe5_consume_frame();
+    if (sms_wiiu_pipe5_enabled())
+        sms_wiiu_pipe5_scene_frame();
+    smg_gphase_begin_frame();
+#endif
 #ifdef TARGET_PC
     port_perf_frame_begin();
     if (port_skip_fast_forwarding()) {
@@ -230,17 +294,77 @@ void GameSystem::frameLoop() {
         return;
     }
 #endif
+#if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
+    uint64_t gphase_start;
+#endif
+#if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
+    if (smg_reorder_enabled()) {
+        gphase_start = smg_gphase_begin(SmgGPhase_BeginRender);
+        MainLoopFramework::sManager->beginRender();
+        smg_gphase_end(SmgGPhase_BeginRender, gphase_start);
+        gphase_start = smg_gphase_begin(SmgGPhase_Draw);
+        draw();
+        sms_wiiu_reorder_drawwake();
+        smg_gphase_end(SmgGPhase_Draw, gphase_start);
+        gphase_start = smg_gphase_begin(SmgGPhase_Update);
+        update();
+        smg_gphase_end(SmgGPhase_Update, gphase_start);
+        gphase_start = smg_gphase_begin(SmgGPhase_CalcAnim);
+        calcAnim();
+        smg_gphase_end(SmgGPhase_CalcAnim, gphase_start);
+        gphase_start = smg_gphase_begin(SmgGPhase_EndRender);
+        MainLoopFramework::sManager->endRender();
+        smg_gphase_end(SmgGPhase_EndRender, gphase_start);
+    } else
+#endif
+    {
+#if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
+    gphase_start = smg_gphase_begin(SmgGPhase_BeginRender);
+#endif
     MainLoopFramework::sManager->beginRender();
+#if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
+    smg_gphase_end(SmgGPhase_BeginRender, gphase_start);
+    gphase_start = smg_gphase_begin(SmgGPhase_Draw);
+#endif
     draw();
+#if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
+    smg_gphase_end(SmgGPhase_Draw, gphase_start);
+    gphase_start = smg_gphase_begin(SmgGPhase_EndRender);
+#endif
     MainLoopFramework::sManager->endRender();
+#if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
+    smg_gphase_end(SmgGPhase_EndRender, gphase_start);
+    gphase_start = smg_gphase_begin(SmgGPhase_Update);
+#endif
     update();
+#if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
+    smg_gphase_end(SmgGPhase_Update, gphase_start);
+    gphase_start = smg_gphase_begin(SmgGPhase_CalcAnim);
+#endif
     calcAnim();
+#if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
+    smg_gphase_end(SmgGPhase_CalcAnim, gphase_start);
+#endif
+    }
     mObjHolder->captureIfAllowForScreenPreserver();
+#if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
+    gphase_start = smg_gphase_begin(SmgGPhase_EndFrame);
+#endif
     MainLoopFramework::sManager->endFrame();
+#if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
+    smg_gphase_end(SmgGPhase_EndFrame, gphase_start);
+    smg_gphase_report_if_due();
+#endif
 #ifdef TARGET_PC
     port_perf_frame_work_done();
 #endif
+#if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
+    gphase_start = smg_gphase_begin(SmgGPhase_WaitRetrace);
+#endif
     MainLoopFramework::sManager->waitForRetrace();
+#if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
+    smg_gphase_end(SmgGPhase_WaitRetrace, gphase_start);
+#endif
 }
 
 void GameSystem::draw() {
