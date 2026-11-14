@@ -1852,8 +1852,32 @@ void setProducerMode(bool enabled) {
 // Worker-side equivalent of pipeRun.  The producer ring owns the bytes until
 // this function copies them into the worker's private tail, so parse() never
 // sees a producer buffer that can be overwritten on core 1.
+#ifdef __WIIU__
+extern "C" int sms_wiiu_sd_marker(const char* name);
+#endif
 void producerConsume(const uint8_t* bytes, uint32_t n) {
     if (!bytes || !n) return;
+#ifdef __WIIU__
+    // Marker zcparse (from Galaxy ff2acef): with no carried tail, parse the
+    // producer's bytes in place (they are stable for this call; parse keeps no
+    // pointer into its buffer past its return) and copy only an incomplete
+    // last command.  Was 14% of worker time in Galaxy's FileSelect.
+    static int s_zcParse = -1;
+    if (s_zcParse < 0) s_zcParse = sms_wiiu_sd_marker("nozcparse") ? 0 : 1;  // default-on 2026-11-14 (batch280); nozcparse opts out
+    if (s_zcParse && !s_workerPipeLen) {
+        s_hostOps = true;
+        while (n) {
+            uint32_t need = 1;
+            const uint32_t used = parse(bytes, n, &need);
+            if (!used) { s_workerPipeNeed = need; break; }
+            bytes += used;
+            n -= used;
+        }
+        s_hostOps = false;
+        if (!n) { s_workerPipeNeed = 1; return; }
+        // fall through: the incomplete tail goes to s_workerPipe
+    }
+#endif
     if (s_workerPipe.size() < size_t(s_workerPipeLen) + n)
         s_workerPipe.resize(size_t(s_workerPipeLen) + n);
     memcpy(s_workerPipe.data() + s_workerPipeLen, bytes, n);

@@ -930,6 +930,7 @@ static bool s_noDiff, s_noDiffMarker;
 static bool s_noApplyCache, s_noShaderCache, s_noTevUniformCache;
 static bool s_noVtxLiveCache, s_noBindCache, s_noXfUniformCache;
 static int s_padUniforms;  // shot A/B: 2 = a full upload's volume to unused registers in one packet, 3 = in 4-float packets, 5 = 3 plus GX2DrawDone per draw
+static bool s_arenaDcbz;  // SD marker "arenadcbz": dcbz the compact vertex block and index lists
 static uint32_t s_copyGeneration;  // bumped by every EFB copy (copy rectangles feed the uniforms)
 
 // What each pixel texture unit holds, so an unchanged texture or sampler is
@@ -6867,6 +6868,8 @@ void rendererInit(float) {
     s_warpLowMarker = sdMarkerPresent("warplowres");
     WHBLogPrintf("SMS Wii U: [warplowres] build=warplow1 marker=%s", s_warpLowMarker ? "on" : "off");
     // Pianta 50.0 -> 33.3 ms with the mixer off core 0 (2026-10-27).
+    s_arenaDcbz = !sdMarkerPresent("noarenadcbz");  // default-on 2026-11-14 (batch280: worker -1.5 ms/frame with zcparse); noarenadcbz opts out
+    WHBLogPrintf("SMS Wii U: [arenadcbz] %s", s_arenaDcbz ? "on" : "off");
     s_compactVx = !sdMarkerPresent("nocompactvx");
     if (!s_compactVx) WHBLogPrintf("SMS Wii U: [compactvx] packed vertex batches off (SD marker nocompactvx)");
     // Both default on since 2026-10-26 (Bianco at 545 MHz: 269 -> 5 of ~1400
@@ -8077,13 +8080,21 @@ void flushBatch() {
     float* vbo = reinterpret_cast<float*>(block);
     uint32_t* ibo = reinterpret_cast<uint32_t*>(block + iboOffset);
     if (compact) {
-        // Written whole below.
+        // Written whole below.  Marker arenadcbz (from Galaxy ff2acef): claim
+        // the block's lines without reading MEM2 (the memcpy below was 17% of
+        // Galaxy's worker time).  Only lines wholly inside the block.
+        if (s_arenaDcbz)
+            for (uint32_t off = 0; off + 32 <= blockBytes; off += 32)
+                asm volatile("dcbz 0,%0" : : "r"(block + off) : "memory");
     } else if (gpuPath) {
         // Zero the vertex lines in cache without reading MEM2: the decoder
         // writes every vertex here, and cold write-allocate fills were the
         // top CPU cost.  Covers the sentinel slot too.  block is 256-aligned.
         for (uint32_t off = 0; off < vboBytes; off += 32)
             asm volatile("dcbz 0,%0" : : "r"(block + off) : "memory");
+        if (s_arenaDcbz)  // and the index list
+            for (uint32_t off = iboOffset; off + 32 <= blockBytes; off += 32)
+                asm volatile("dcbz 0,%0" : : "r"(block + off) : "memory");
     } else {
         memset(block + vertexCount * vertexStride, 0, vertexStride);
     }

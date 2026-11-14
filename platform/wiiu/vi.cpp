@@ -140,8 +140,13 @@ void sms_wiiu_frame_boundary(void)
 
 	std::strncpy(s_stage_path, port_dvd_stage_path(), sizeof(s_stage_path) - 1);
 	s_stage_path[sizeof(s_stage_path) - 1] = '\0';
-	/* During boot, show where every game thread is waiting. */
-	if (s_frame_count % 600 == 0 && s_frame_count <= 3600)
+	/* During boot, show where every game thread is waiting. Opt-in (SD marker
+	 * thrdump): each dump symbolises and logs ~110 lines and stalls the frame
+	 * boundary ~150-200 ms, a visible hitch every 10 s in Logo/FileSelect. */
+	static int s_thrdump = -1;
+	if (s_thrdump < 0)
+		s_thrdump = sms_wiiu_sd_marker("thrdump") ? 1 : 0;
+	if (s_thrdump && s_frame_count % 600 == 0 && s_frame_count <= 3600)
 		sms_wiiu_dump_threads();
 	if (s_frame_count - s_last_heartbeat >= 60) {
 		s_last_heartbeat = s_frame_count;
