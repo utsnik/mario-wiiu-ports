@@ -1,0 +1,11 @@
+name: third-party notices
+on:
+  push:
+  pull_request:
+jobs:
+  notices:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check that copied code keeps its copyright notice
+        run: python3 tools/check_notices.py
