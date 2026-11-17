@@ -268,6 +268,23 @@ Saves are the same in every language. The packs are made with the scripts in [sm
 The optional HD pack enhances all 21 original movies at 3× resolution and preserves their timing and original audio. The updated launcher installs the movie patches from your own disc when **HD textures** are enabled.
 See [HD cutscenes](docs/HD-CUTSCENES.md) for installation, conversion tools and playback checks.
 
+## How the Wii U port is made
+
+The Wii U port is a one-person hobby project, and I build it with AI coding assistants.
+I decide what to work on and in what order, read the bug reports, and judge what is good enough to ship; the assistants write most of the code.
+Every alpha runs on my own Wii U before it goes out, because the console finds problems an emulator never shows.
+When a test build has only run in the Cemu emulator, its release notes say so.
+
+None of this starts from scratch.
+The game itself comes from chasem-dev's PC port and the decompilation behind it, and the Wii U renderer learned its trade from GaryOderNichts's GX2 backend for libultraship.
+Code taken from another project keeps its original copyright notice and is listed in [tools/third_party_notices.txt](tools/third_party_notices.txt).
+
+I got that wrong once, and Gary was right to call it out.
+A file of shader macros came over from libultraship without its notice, and tracing it back showed it started life in RetroArch under the GPL.
+It is gone now: `platform/wiiu/latte_asm.h` was written from AMD's instruction set documents instead ([how](docs/wiiu/latte-asm-cleanroom/README.md)), and a CI check (`tools/check_notices.py`) fails when a copied file loses its notice.
+
+If you find code here that came from somewhere without credit, open an issue and point at the file, and I'll fix it.
+
 ## Wii U port credits
 
 The Wii U renderer was built by learning from the GX2 backend that
@@ -276,11 +293,11 @@ Thank you, Gary: this port would not exist without that work.
 
 - **libultraship GX2 backend** by GaryOderNichts
   ([HarbourMasters/libultraship](https://github.com/HarbourMasters/libultraship)):
-  the shader programs its generator produced in `platform/wiiu/gx2_shader_pack.h`,
-  and the copy of the Latte shader macros we used in `platform/wiiu/gx2_shader_inl.h`.
-- **RetroArch Wii U GX2 driver** by Ali Bouhlel: the original source of those
-  shader macros (Copyright (C) 2014-2016 Ali Bouhlel, GNU GPL v3 or later). Until
-  they are replaced by our own implementation, `gx2_shader_inl.h` is GPLv3-or-later.
+  the shader programs its generator produced in `platform/wiiu/gx2_shader_pack.h`.
+- **RetroArch Wii U GX2 driver** by Ali Bouhlel, the first GX2 renderer: earlier
+  builds used its Latte shader macros (GNU GPL v3 or later) through libultraship's
+  copy. Since 2026-11-17 the port uses its own clean-room `platform/wiiu/latte_asm.h`,
+  written from AMD's R700 instruction set documentation.
 - **NVIDIA Image Scaling** coefficients in `platform/gx/src/gx_nis_coef.h`
   (Copyright (c) 2022 NVIDIA CORPORATION & AFFILIATES, MIT).
 - Built with [wut](https://github.com/devkitPro/wut) and devkitPPC from devkitPro.

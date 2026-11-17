@@ -10,7 +10,7 @@
 #ifndef SMS_GX2_VERTEX_PROGRAM_H
 #define SMS_GX2_VERTEX_PROGRAM_H
 
-#include "gx2_shader_inl.h"
+#include "latte_asm.h"
 #include "grass_math.h"
 #include "../gx/src/gx_internal.h"
 

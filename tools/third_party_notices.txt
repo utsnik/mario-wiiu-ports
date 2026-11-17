@@ -2,8 +2,6 @@
 # Format: path | text that must appear in the file (one line per notice).
 # tools/check_notices.py fails when a listed notice is missing, or when a file
 # says it was copied/derived from somewhere but is not listed here.
-platform/wiiu/gx2_shader_inl.h | Copyright (C) 2014-2016 - Ali Bouhlel
-platform/wiiu/gx2_shader_inl.h | Copyright (C) 2022 - GaryOderNichts
 platform/wiiu/gx2_shader_pack.h | GaryOderNichts
 platform/gx/src/gx_nis_coef.h | Copyright(c) 2022 NVIDIA CORPORATION & AFFILIATES
 platform/gx/third_party/GL/glcorearb.h | Copyright 2013-2026 The Khronos Group Inc.
@@ -12,4 +10,3 @@ platform/gx/src/third_party/stb_image.h | Copyright (c) 2017 Sean Barrett
 platform/gx/src/third_party/stb_image_write.h | Copyright (c) 2017 Sean Barrett
 platform/gx/src/third_party/stb_easy_font.h | Copyright (c) 2017 Sean Barrett
 platform/gx/src/third_party/bcdec.h | Copyright (c) 2022 Sergii Kudlai
-platform/wiiu/gx2_shader_inl.h | GNU General Public License

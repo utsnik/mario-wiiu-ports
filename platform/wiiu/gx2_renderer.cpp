@@ -41,7 +41,7 @@
 #include "../gx/src/gx_internal.h"
 #include "../gx/src/gx_texture_pack_common.h"
 #include "gx2_shader_pack.h"
-#include "gx2_shader_inl.h"
+#include "latte_asm.h"
 #include "gx2_texture.h"
 #include "gx2_vertex_program.h"
 #include "gx2_texture_pack.h"
