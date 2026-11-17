@@ -267,3 +267,22 @@ Saves are the same in every language. The packs are made with the scripts in [sm
 
 The optional HD pack enhances all 21 original movies at 3× resolution and preserves their timing and original audio. The updated launcher installs the movie patches from your own disc when **HD textures** are enabled.
 See [HD cutscenes](docs/HD-CUTSCENES.md) for installation, conversion tools and playback checks.
+
+## Wii U port credits
+
+The Wii U renderer was built by learning from the GX2 backend that
+GaryOderNichts wrote for libultraship, and it still uses parts of it.
+Thank you, Gary: this port would not exist without that work.
+
+- **libultraship GX2 backend** by GaryOderNichts (MIT,
+  [HarbourMasters/libultraship](https://github.com/HarbourMasters/libultraship)):
+  the Latte shader macros in `platform/wiiu/gx2_shader_inl.h` and the shader
+  programs its generator produced in `platform/wiiu/gx2_shader_pack.h`.
+- **RetroArch Wii U GX2 driver** by Ali Bouhlel: the original source of those
+  shader macros (Copyright (C) 2014-2016 Ali Bouhlel, MIT).
+- **NVIDIA Image Scaling** coefficients in `platform/gx/src/gx_nis_coef.h`
+  (Copyright (c) 2022 NVIDIA CORPORATION & AFFILIATES, MIT).
+- Built with [wut](https://github.com/devkitPro/wut) and devkitPPC from devkitPro.
+
+[platform/wiiu/README.md](platform/wiiu/README.md#third-party-code) lists the
+third-party files in the Wii U code.

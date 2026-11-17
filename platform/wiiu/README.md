@@ -78,3 +78,12 @@ sd:/wiiu/apps/sms/4x3
   during play if the GPU falls behind, and steps up one size on a later visit
   when there was room. With `nodynres` the old fixed sizes apply: Delfino
   Plaza 900 lines, the Corona boss 810, everything else 1080.
+
+## Third-party code
+
+- `gx2_shader_inl.h` and the shader programs in `gx2_shader_pack.h` come from
+  the GX2 backend of [libultraship](https://github.com/HarbourMasters/libultraship)
+  (MIT). Copyright (C) 2014-2016 Ali Bouhlel, Copyright (C) 2022
+  GaryOderNichts.
+- `../gx/src/gx_nis_coef.h`: NVIDIA Image Scaling coefficients (MIT),
+  Copyright (c) 2022 NVIDIA CORPORATION & AFFILIATES.

@@ -1,11 +1,18 @@
 /*
+ *  Copyright (C) 2014-2016 - Ali Bouhlel
+ *  Copyright (C) 2022 - GaryOderNichts
+ *
+ *  Licensed as MIT.
+ */
+
+/*
  * Latte instruction packing used by the Wii U TEV shader generator.
  *
- * This is the small instruction subset mirrored from
- * lus-rebase/include/fast/backends/gx2_shader_inl.h.  Keep the encodings in
- * sync with lus-rebase when extending the generator; the renderer deliberately
- * uses the same macros as the libultraship GX2 backend rather than a second
- * hand-written bytecode format.
+ * Derived from libultraship's include/fast/backends/gx2_shader_inl.h
+ * (https://github.com/HarbourMasters/libultraship), which carries the notice above.
+ * This copy keeps a subset of those macros and adds a few predicate and
+ * comparison encodings; the original copyright notice and the MIT licence
+ * apply to it.
  */
 #ifndef SMS_GX2_SHADER_INL_H
 #define SMS_GX2_SHADER_INL_H
