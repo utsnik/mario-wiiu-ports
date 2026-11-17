@@ -8,11 +8,27 @@
 /*
  * Latte instruction packing used by the Wii U TEV shader generator.
  *
- * Derived from libultraship's include/fast/backends/gx2_shader_inl.h
- * (https://github.com/HarbourMasters/libultraship), which carries the notice above.
- * This copy keeps a subset of those macros and adds a few predicate and
- * comparison encodings; the original copyright notice and the MIT licence
- * apply to it.
+ * Origin: these macros come from RetroArch's os/wiiu/gx2_shader_inl.h by Ali
+ * Bouhlel, which RetroArch distributes under the GNU GPL v3 or later (its
+ * header is reproduced below). We took them from libultraship's copy, which
+ * adds GaryOderNichts' 2022 additions and labels the file MIT (header above).
+ * Because of the RetroArch origin, treat this file as GPLv3-or-later. It is
+ * being replaced by an independent implementation written from AMD's R700
+ * instruction set documentation.
+ *
+ *  RetroArch - A frontend for libretro.
+ *  Copyright (C) 2014-2016 - Ali Bouhlel
+ *
+ *  RetroArch is free software: you can redistribute it and/or modify it under the terms
+ *  of the GNU General Public License as published by the Free Software Found-
+ *  ation, either version 3 of the License, or (at your option) any later version.
+ *
+ *  RetroArch is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
+ *  without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR
+ *  PURPOSE.  See the GNU General Public License for more details.
+ *
+ *  You should have received a copy of the GNU General Public License along with RetroArch.
+ *  If not, see <http://www.gnu.org/licenses/>.
  */
 #ifndef SMS_GX2_SHADER_INL_H
 #define SMS_GX2_SHADER_INL_H

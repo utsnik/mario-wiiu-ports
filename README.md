@@ -274,12 +274,13 @@ The Wii U renderer was built by learning from the GX2 backend that
 GaryOderNichts wrote for libultraship, and it still uses parts of it.
 Thank you, Gary: this port would not exist without that work.
 
-- **libultraship GX2 backend** by GaryOderNichts (MIT,
-  [HarbourMasters/libultraship](https://github.com/HarbourMasters/libultraship)):
-  the Latte shader macros in `platform/wiiu/gx2_shader_inl.h` and the shader
-  programs its generator produced in `platform/wiiu/gx2_shader_pack.h`.
+- **libultraship GX2 backend** by GaryOderNichts
+  ([HarbourMasters/libultraship](https://github.com/HarbourMasters/libultraship)):
+  the shader programs its generator produced in `platform/wiiu/gx2_shader_pack.h`,
+  and the copy of the Latte shader macros we used in `platform/wiiu/gx2_shader_inl.h`.
 - **RetroArch Wii U GX2 driver** by Ali Bouhlel: the original source of those
-  shader macros (Copyright (C) 2014-2016 Ali Bouhlel, MIT).
+  shader macros (Copyright (C) 2014-2016 Ali Bouhlel, GNU GPL v3 or later). Until
+  they are replaced by our own implementation, `gx2_shader_inl.h` is GPLv3-or-later.
 - **NVIDIA Image Scaling** coefficients in `platform/gx/src/gx_nis_coef.h`
   (Copyright (c) 2022 NVIDIA CORPORATION & AFFILIATES, MIT).
 - Built with [wut](https://github.com/devkitPro/wut) and devkitPPC from devkitPro.
