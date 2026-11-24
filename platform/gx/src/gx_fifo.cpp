@@ -1966,7 +1966,7 @@ static void callDisplayListImpl(const uint8_t* data, uint32_t size) { SMS_PORT_H
             s_dlCacheBytes -= v->bytes;
             DlEntry* next = v->alt;
             *v = DlEntry();
-            v->alt = next;
+            v = next;
         }
         head.alt = nullptr;
     }
