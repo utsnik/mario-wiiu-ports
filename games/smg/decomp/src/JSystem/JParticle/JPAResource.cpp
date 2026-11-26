@@ -2505,6 +2505,10 @@ static void setBillboardBatchTev(JPAEmitterWorkData* work, const BillboardBatchM
         if (mode.rasterAlphaPrm && alpha[i] == GX_CA_A0) alpha[i] = GX_CA_RASA;
         if (mode.rasterAlphaEnv && alpha[i] == GX_CA_A1) alpha[i] = GX_CA_RASA;
     }
+    // JPAEmitterManager::draw leaves GXSetNumChans(0): without one channel
+    // the raster colour reads as zero, so per-particle alpha-animated
+    // billboards (the Honeyhive fountain spray) drew fully transparent.
+    GXSetNumChans(1);
     GXSetChanCtrl(GX_COLOR0A0, GX_FALSE, GX_SRC_REG, GX_SRC_VTX, GX_LIGHT_NULL, GX_DF_NONE, GX_AF_NONE);
     GXSetTevOrder(GX_TEVSTAGE0, GX_TEXCOORD0, texMap, GX_COLOR0A0);
     GXSetTevColorIn(GX_TEVSTAGE0, color[0], color[1], color[2], color[3]);
@@ -2534,6 +2538,7 @@ static void restoreBillboardBatchTev(JPAEmitterWorkData* work, const BillboardBa
         GXSetNumIndStages(0);
         return;
     }
+    GXSetNumChans(0);
     GXSetTevColorIn(GX_TEVSTAGE0, color[0], color[1], color[2], color[3]);
     GXSetTevAlphaIn(GX_TEVSTAGE0, alpha[0], alpha[1], alpha[2], alpha[3]);
     GXSetTevOrder(GX_TEVSTAGE0, GX_TEXCOORD0, texMap, GX_COLOR_NULL);
