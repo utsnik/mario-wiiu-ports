@@ -16,6 +16,9 @@
 #include "j3d_state_delta.h"
 
 struct SmsWiiuJpaFinalVxDesc;
+#if defined(__WIIU__) && defined(PORT_GAME_SMG)
+#include "../../wiiu/shadow_volume_instancing.h"
+#endif
 
 namespace gx {
 
@@ -97,6 +100,11 @@ enum {
     CP_ARRAY_STRIDE = 0xB0,
 };
 
+// The upper VCD word is unused by GX hardware.  Keep this host-only bit as
+// the unambiguous discriminator for the software projected-TEX0 extension;
+// all four ordinary GX VCD modes, including GX_INDEX16 (3), remain valid.
+static constexpr uint32_t kHostVcdProjectedTex0 = 1u << 31;
+
 struct EfbCopy;  // defined in gx_render.cpp
 
 struct State {
@@ -140,6 +148,7 @@ extern State gProducer;
 // Copy the consumer state into gProducer, all but tlutMem (512 KiB, which
 // only the direct path writes; a recording emits TLUT loads as BP commands).
 void syncProducerState();
+void syncCoreStateFromProducer();
 void shadowBP(uint32_t value);
 void shadowCP(uint8_t reg, uint32_t value);
 void shadowXF(uint16_t addr, uint32_t count, const uint32_t* words);
@@ -224,6 +233,7 @@ enum ProducerHostKind : uint8_t {
     kHostTexStreamPtr, kHostTexStreamBytes, kHostTexStreamLinearBytes, kHostTexStreamPitch,
     kHostGpuCat,  // marker gpucat: slot = kind, value = draw category id
     kHostJpaFinalVx,
+    kHostShadowVolumeInstanced,
 #endif
 };
 void producerHostState(uint8_t kind, uint8_t slot, uint32_t value);
@@ -232,6 +242,9 @@ extern "C" bool sms_wiiu_jpa_finalvx_begin_check(const ::SmsWiiuJpaFinalVxDesc* 
 extern "C" bool sms_wiiu_jpa_finalvx_submit(const ::SmsWiiuJpaFinalVxDesc* desc);
 void jpaFinalVxBeginCheck(const ::SmsWiiuJpaFinalVxDesc* desc);
 void jpaFinalVxSubmit(const ::SmsWiiuJpaFinalVxDesc* desc);
+void rendererShadowVolumeInstanced(const struct SmsWiiuShadowVolumeInstancedDesc* desc);
+// The worker receives only the descriptor address; the renderer consumes its
+// ready flag before reading vertices or indices.
 #endif
 
 #if defined(PORT_GAME_SMG)
@@ -250,6 +263,11 @@ struct HostVertex {
     uint8_t clr[2][4];
     float tex[8][2];
     uint8_t mtx[12];  // pos matrix index, tex0..7 matrix index, 3 pad
+    // STQ formats keep Q after mtx: the first 132 bytes are the raw GX2 fetch
+    // ABI, and the Wii U display-list path decodes HostVertex straight into
+    // 132-byte arena slots (texQ before mtx made the GPU read Q as matrix
+    // indices: alpha 4 glitched models/textures with every marker off).
+    float texQ[8];
     HostVertex() {}   // left uninitialised: the loader writes every field
 };
 
@@ -268,6 +286,7 @@ enum VtxFmtBits : uint32_t {
     VF_CLR0 = 1u << 2,  // VF_CLR1 = VF_CLR0 << 1
     VF_TEX0 = 1u << 4,  // texcoord t: VF_TEX0 << t
     VF_MTX = 1u << 12,  // per-vertex matrix indices
+    VF_TEX0_STQ = 1u << 13,  // projected TEX0: f32 S,T,Q
 };
 struct VtxFmtLayout {
     uint16_t stride, nrm, clr[2], tex[8], mtx;  // byte offsets; position is at 0

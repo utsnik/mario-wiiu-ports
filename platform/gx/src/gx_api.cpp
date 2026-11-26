@@ -51,7 +51,7 @@ static bool s_cpuTextureWritePending;
 static int s_texInvNoWait = -1;
 static bool texInvNoWaitEnabled() {
     if (s_texInvNoWait < 0)
-        s_texInvNoWait = sms_wiiu_sd_marker("texinvnowait") != 0 ? 1 : 0;
+        s_texInvNoWait = sms_wiiu_sd_marker("notexinvnowait") == 0 ? 1 : 0;  // default-on 2026-11-17 (Galaxy only: used under PORT_GAME_SMG)
     return s_texInvNoWait != 0;
 }
 #endif
@@ -523,7 +523,15 @@ void GXGetVtxDesc(GXAttr attr, GXAttrType* type) {
     else if (attr == GX_VA_NRM || attr == GX_VA_NBT) t = getField(lo, 2, 11);
     else if (attr == GX_VA_CLR0) t = getField(lo, 2, 13);
     else if (attr == GX_VA_CLR1) t = getField(lo, 2, 15);
-    else if (attr >= GX_VA_TEX0 && attr <= GX_VA_TEX7) t = getField(hi, 2, 2 * (attr - GX_VA_TEX0));
+    else if (attr >= GX_VA_TEX0 && attr <= GX_VA_TEX7) {
+        t = getField(hi, 2, 2 * (attr - GX_VA_TEX0));
+        // The upper VCD word carries the host-only projected-TEX0 marker.
+        // Keep the public GX getter's logical contract as DIRECT.
+        if (attr == GX_VA_TEX0 && t == 3 &&
+            (hi & kHostVcdProjectedTex0) &&
+            ((GX_STATE.cpVatA[0] >> 29) & 1) && ((GX_STATE.cpVatA[0] >> 21) & 3) == 2)
+            t = GX_DIRECT;
+    }
     *type = GXAttrType(t);
 }
 void GXGetVtxDescv(GXVtxDescList* vcd) {
@@ -539,6 +547,8 @@ void GXGetVtxDescv(GXVtxDescList* vcd) {
 void GXSetVtxAttrFmt(GXVtxFmt fmt, GXAttr attr, GXCompCnt cnt, GXCompType type, u8 frac) {
     noteVcdVatWriter();
     uint32_t A = GX_STATE.cpVatA[fmt], B = GX_STATE.cpVatB[fmt], C = GX_STATE.cpVatC[fmt];
+    uint32_t hi = GX_STATE.cpVcdHi;
+    const bool tex0Stq = attr == GX_VA_TEX0 && cnt == GX_TEX_STQ;
     uint32_t c = uint32_t(cnt), t = uint32_t(type), f = frac;
     switch (attr) {
     case GX_VA_POS: A = setField(A, 1, 0, c); A = setField(A, 3, 1, t); A = setField(A, 5, 4, f); break;
@@ -550,7 +560,27 @@ void GXSetVtxAttrFmt(GXVtxFmt fmt, GXAttr attr, GXCompCnt cnt, GXCompType type, 
         break;
     case GX_VA_CLR0: A = setField(A, 1, 13, c); A = setField(A, 3, 14, t); break;
     case GX_VA_CLR1: A = setField(A, 1, 17, c); A = setField(A, 3, 18, t); break;
-    case GX_VA_TEX0: A = setField(A, 1, 21, c); A = setField(A, 3, 22, t); A = setField(A, 5, 25, f); break;
+    case GX_VA_TEX0:
+        // The stock VAT has a one-bit ST/STQ count.  The software GX parser
+        // reserves VAT-A bit 29 plus VCD mode 3 to carry the projected STQ
+        // extension while leaving every legacy ST/S write in its original
+        // bit layout.
+        if (tex0Stq) {
+            A = setField(A, 2, 21, c);
+            A = setField(A, 3, 23, t);
+            // VAT-A bit 29 is the projected-TEX0 marker in the host stream,
+            // so write the STQ fraction first and restore the marker last.
+            // The projected path uses fraction zero; bits 26..28 retain the
+            // representable STQ fraction range without consuming BYTEDEQUANT.
+            A = setField(A, 3, 26, f);
+            A = setField(A, 1, 29, 1);
+            hi = setField(hi, 2, 0, 3);
+            hi |= kHostVcdProjectedTex0;
+        } else {
+            A = setField(A, 1, 21, c); A = setField(A, 3, 22, t); A = setField(A, 5, 25, f);
+            hi &= ~kHostVcdProjectedTex0;
+        }
+        break;
     case GX_VA_TEX1: B = setField(B, 1, 0, c); B = setField(B, 3, 1, t); B = setField(B, 5, 4, f); break;
     case GX_VA_TEX2: B = setField(B, 1, 9, c); B = setField(B, 3, 10, t); B = setField(B, 5, 13, f); break;
     case GX_VA_TEX3: B = setField(B, 1, 18, c); B = setField(B, 3, 19, t); B = setField(B, 5, 22, f); break;
@@ -562,6 +592,7 @@ void GXSetVtxAttrFmt(GXVtxFmt fmt, GXAttr attr, GXCompCnt cnt, GXCompType type, 
     }
     A |= 1u << 30;
     const bool always = forceVtxState();
+    if (always || hi != GX_STATE.cpVcdHi) apiCP(CP_VCD_HI, hi);
     if (always || A != GX_STATE.cpVatA[fmt]) apiCP(uint8_t(CP_VAT_A + fmt), A);
     if (always || B != GX_STATE.cpVatB[fmt]) apiCP(uint8_t(CP_VAT_B + fmt), B);
     if (always || C != GX_STATE.cpVatC[fmt]) apiCP(uint8_t(CP_VAT_C + fmt), C);
@@ -578,7 +609,15 @@ void GXGetVtxAttrFmt(GXVtxFmt fmt, GXAttr attr, GXCompCnt* cnt, GXCompType* type
     case GX_VA_NBT: c = getField(A, 1, 9); t = getField(A, 3, 10); if (c && (A >> 31)) c = GX_NRM_NBT3; break;
     case GX_VA_CLR0: c = getField(A, 1, 13); t = getField(A, 3, 14); break;
     case GX_VA_CLR1: c = getField(A, 1, 17); t = getField(A, 3, 18); break;
-    case GX_VA_TEX0: c = getField(A, 1, 21); t = getField(A, 3, 22); f = getField(A, 5, 25); break;
+    case GX_VA_TEX0:
+        if (getField(GX_STATE.cpVcdHi, 2, 0) == 3 &&
+            (GX_STATE.cpVcdHi & kHostVcdProjectedTex0) &&
+            ((A >> 29) & 1) && (((A >> 21) & 3) == 2)) {
+            c = GX_TEX_STQ; t = getField(A, 3, 23); f = getField(A, 3, 26);
+        } else {
+            c = getField(A, 1, 21); t = getField(A, 3, 22); f = getField(A, 5, 25);
+        }
+        break;
     case GX_VA_TEX1: c = getField(B, 1, 0); t = getField(B, 3, 1); f = getField(B, 5, 4); break;
     case GX_VA_TEX2: c = getField(B, 1, 9); t = getField(B, 3, 10); f = getField(B, 5, 13); break;
     case GX_VA_TEX3: c = getField(B, 1, 18); t = getField(B, 3, 19); f = getField(B, 5, 22); break;
@@ -1290,7 +1329,9 @@ void GXPeekZ(u16 x, u16 y, u32* z) {
 #ifdef __WIIU__
     if (producerMode()) {
 #if defined(PORT_GAME_SMG)
-        if (peekZNeedsSync()) sms_wiiu_gx2_wait_peek(0);
+        // The Wii U depth backend serves its last retired sample and queues
+        // the next resolve. Waiting here serialized the game with the GPU
+        // and producer worker on the Star Pointer draw-sync callback.
 #else
         if (peekZNeedsSync()) ::gx2prod::wait(::gx2prod::kWaitPeek);
 #endif

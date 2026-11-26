@@ -13,17 +13,31 @@ extern "C" u32 OSGetCoreId(void);
 namespace J3DMT {
 namespace {
 J3DMTTraversalContext* s_active[3];
+/* Cores with an active context.  Zero unless the j3dmt marker runs joint
+ * calc on core 2, so the accessors (several per joint, every model, every
+ * frame) skip the coreinit OSGetCoreId call.  A core only finds its own
+ * context after its own activate() incremented this, so the fast path never
+ * hides a context from the core that set it. */
+volatile u32 s_activeCount;
 }
 
 J3DMTTraversalContext* getActiveContext() {
+    if (s_activeCount == 0)
+        return nullptr;
     const u32 core = OSGetCoreId();
     return core < 3 ? s_active[core] : nullptr;
 }
 
 void activate(J3DMTTraversalContext* context) {
     const u32 core = OSGetCoreId();
-    if (core < 3)
-        s_active[core] = context;
+    if (core >= 3)
+        return;
+    J3DMTTraversalContext* const previous = s_active[core];
+    if (context != nullptr && previous == nullptr)
+        __sync_fetch_and_add(&s_activeCount, 1);
+    s_active[core] = context;
+    if (context == nullptr && previous != nullptr)
+        __sync_fetch_and_sub(&s_activeCount, 1);
 }
 
 void deactivate() {

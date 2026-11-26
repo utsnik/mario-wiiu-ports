@@ -2,7 +2,7 @@
  * Dependency-free dense allocator for generated Latte vertex programs.
  *
  * The renderer converts its packed uint64_t instructions into the canonical
- * uint32_t words described by gx2_shader_inl.h before calling this header.
+ * uint32_t words described by latte_asm.h before calling this header.
  * Keeping the allocator on those words makes the host test exercise exactly
  * the same decoder and rewriter as the Wii U build, without pulling GX2 types
  * or libc allocation into the test executable.
@@ -56,7 +56,7 @@ inline bool denseIsGprSelector(uint32_t selector) {
 }
 
 inline bool denseIsOp3(uint32_t word1) {
-    // OP2's encoding field is zero in gx2_shader_inl.h.  OP3 puts its opcode
+    // OP2's encoding field is zero in latte_asm.h.  OP3 puts its opcode
     // in bits 13..17, which makes the three-bit OP3 encoding field nonzero.
     return ((word1 >> 15) & 7u) != 0;
 }

@@ -45,7 +45,7 @@ void GXNormal1x8(u8 x);
 SMS_GXV4(GXColor, u8) SMS_GXV1(GXColor, u32) SMS_GXV3(GXColor, u8) SMS_GXV1(GXColor, u16)
 void GXColor1x16(u16 x);
 void GXColor1x8(u8 x);
-SMS_GXV2(GXTexCoord, f32) SMS_GXV2(GXTexCoord, s16) SMS_GXV2(GXTexCoord, u16)
+SMS_GXV2(GXTexCoord, f32) SMS_GXV3(GXTexCoord, f32) SMS_GXV2(GXTexCoord, s16) SMS_GXV2(GXTexCoord, u16)
 SMS_GXV2(GXTexCoord, s8) SMS_GXV2(GXTexCoord, u8)
 SMS_GXV1(GXTexCoord, f32) SMS_GXV1(GXTexCoord, s16) SMS_GXV1(GXTexCoord, u16)
 SMS_GXV1(GXTexCoord, s8) SMS_GXV1(GXTexCoord, u8)

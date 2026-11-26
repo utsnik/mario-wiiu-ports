@@ -28,14 +28,16 @@ bool ShadowVolumeSphere::isDraw() const {
     return controller->isProjected() && controller->isDraw();
 }
 
-void ShadowVolumeSphere::loadModelDrawMtx() const {
+u32 ShadowVolumeSphere::calcModelDrawMtx(ShadowVolumeModelDrawMtx* pMtx, u32 max) const {
+    if (!pMtx || max == 0) return 0;
     ShadowController* controller = getController();
     f32 radius = mRadius / ::sModelScale;
     if (controller->isFollowHostScale()) {
         radius *= controller->getHost()->mScale.x;
     }
 
-    TPos3f mtx;
+    TPos3f& mtx = pMtx[0].mMtx;
+    pMtx[0].mIndex = GX_PNMTX0;
     mtx.identity();
     mtx.mMtx[0][0] = radius;
     mtx.mMtx[0][1] = 0.0f;
@@ -51,5 +53,5 @@ void ShadowVolumeSphere::loadModelDrawMtx() const {
     mtx.setTrans(position);
 
     PSMTXConcat(MR::getCameraViewMtx(), mtx, mtx);
-    GXLoadPosMtxImm(mtx, 0);
+    return 1;
 }

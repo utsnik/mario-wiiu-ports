@@ -1,5 +1,7 @@
 #pragma once
 
+#include "../../../../include/wiiu/jpa_async.h"
+
 // The GX template is signed-byte XYZ. Keep this transform independent of GX so
 // the host test exercises the same vertex materialization as the Wii U path.
 class JPAEmitterWorkData;
@@ -27,4 +29,5 @@ bool materialize(::JPAEmitterWorkData*, ::JPABaseParticle*, const signed char* t
 // inherited draw() is the empty JPA default. Unknown callback hierarchies must
 // remain on the legacy per-particle path.
 bool callbackDrawsNothing(::JPAParticleCallBack*);
+
 }

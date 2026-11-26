@@ -151,6 +151,27 @@ static void texSetup() {
     GXSetTexCoordGen(GX_TEXCOORD0, GX_TG_MTX2x4, GX_TG_TEX0, GX_IDENTITY);
 }
 
+// Keep this immediate STQ draw in the host self-test.  It goes through the
+// same GX command FIFO and worker parser as JPA's projected check stream, so
+// a two-float decoder cannot silently consume the next command as vertex data.
+static void stqSetup() {
+    GXClearVtxDesc();
+    GXSetVtxDesc(GX_VA_POS, GX_DIRECT);
+    GXSetVtxDesc(GX_VA_TEX0, GX_DIRECT);
+    GXSetVtxAttrFmt(GX_VTXFMT3, GX_VA_POS, GX_POS_XYZ, GX_F32, 0);
+    GXSetVtxAttrFmt(GX_VTXFMT3, GX_VA_TEX0, GX_TEX_STQ, GX_F32, 0);
+    GXSetNumTexGens(0);
+}
+
+static void stqQuad() {
+    GXBegin(GX_QUADS, GX_VTXFMT3, 4);
+    GXPosition3f32(10, 130, -1); GXTexCoord3f32(0, 0, 1);
+    GXPosition3f32(60, 130, -1); GXTexCoord3f32(1, 0, 1);
+    GXPosition3f32(60, 180, -1); GXTexCoord3f32(1, 1, 1);
+    GXPosition3f32(10, 180, -1); GXTexCoord3f32(0, 1, 1);
+    GXEnd();
+}
+
 int main(int argc, char** argv) {
     // Assertions need the current EFB, rather than the game's pipelined peeks.
 #ifdef _WIN32
@@ -189,6 +210,13 @@ int main(int argc, char** argv) {
     colorQuad(10, 10, 60, 60, 255, 0, 0, 255);
     expectPixel("vertex colour quad", 30, 30, 255, 0, 0);
     expectPixel("outside the quad", 70, 70, 32, 48, 64);
+
+    // 1b. projected JPA's direct f32 S,T,Q stream.  The colour pipeline is
+    // deliberately disabled: this check is about command/stride alignment.
+    colorSetup();
+    stqSetup();
+    stqQuad();
+    expectPixel("STQ stream remains parser-aligned", 30, 155, 255, 255, 255);
 
     // 2. textured quad with a two-stage TEV (texture*ras, then *konst)
     {

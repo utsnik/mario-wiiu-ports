@@ -20,14 +20,16 @@ void ShadowVolumeCylinder::setRadius(f32 radius) {
     mRadius = radius;
 }
 
-void ShadowVolumeCylinder::loadModelDrawMtx() const {
+u32 ShadowVolumeCylinder::calcModelDrawMtx(ShadowVolumeModelDrawMtx* pMtx, u32 max) const {
+    if (!pMtx || max == 0) return 0;
     ShadowController* controller = getController();
     TVec3f position;
     calcBaseDropPosition(&position);
     TVec3f direction;
     controller->getDropDir(&direction);
     TVec3f up(-direction);
-    TPos3f mtx;
+    TPos3f& mtx = pMtx[0].mMtx;
+    pMtx[0].mIndex = GX_PNMTX0;
     MR::makeMtxUpNoSupportPos(&mtx, up, position);
 
     f32 radius = mRadius / ::sModelScale;
@@ -38,5 +40,5 @@ void ShadowVolumeCylinder::loadModelDrawMtx() const {
     TVec3f scale(radius, calcBaseDropLength() / ::sModelScale, radius);
     MR::preScaleMtx(mtx, scale);
     PSMTXConcat(MR::getCameraViewMtx(), mtx, mtx);
-    GXLoadPosMtxImm(mtx, 0);
+    return 1;
 }

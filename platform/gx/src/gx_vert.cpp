@@ -40,6 +40,7 @@ void GXColor1u16(u16 x) { GXPC_Put16(x); }
 void GXColor1x16(u16 x) { GXPC_Put16(x); }
 void GXColor1x8(u8 x) { GXPC_Put8(x); }
 void GXTexCoord2f32(f32 s, f32 t) { GXPC_PutF32(s); GXPC_PutF32(t); }
+void GXTexCoord3f32(f32 s, f32 t, f32 q) { GXPC_PutF32(s); GXPC_PutF32(t); GXPC_PutF32(q); }
 void GXTexCoord2s16(s16 s, s16 t) { GXPC_Put16(uint16_t(s)); GXPC_Put16(uint16_t(t)); }
 void GXTexCoord2u16(u16 s, u16 t) { GXPC_Put16(s); GXPC_Put16(t); }
 void GXTexCoord2s8(s8 s, s8 t) { GXPC_Put8(uint8_t(s)); GXPC_Put8(uint8_t(t)); }

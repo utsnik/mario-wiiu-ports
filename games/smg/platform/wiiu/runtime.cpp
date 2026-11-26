@@ -11,6 +11,7 @@
 #include <coreinit/systeminfo.h>
 #include <coreinit/thread.h>
 #include <coreinit/time.h>
+#include <coreinit/userconfig.h>
 #include <whb/log.h>
 #include <whb/proc.h>
 
@@ -22,6 +23,8 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
+#include <cctype>
+#include <sys/stat.h>
 #include <functional>
 #include <malloc.h>
 #include <stdarg.h>
@@ -62,6 +65,10 @@ unsigned s_app_root_index;
 int s_warp_pending;
 char s_warp_galaxy[64];
 int s_warp_scenario;
+int s_warp_start;
+int s_warp_tp_set;
+unsigned s_warp_tp_frame;
+float s_warp_tp[3];
 
 /* Game, audio and loader threads all log: without a lock their open/append/
  * close sequences interleaved and cut each other's lines. */
@@ -145,14 +152,28 @@ void read_warp_marker()
 
     char galaxy[sizeof(s_warp_galaxy)];
     int scenario = 0;
+    int start = 0;
+    float tp[3] = {};
     char extra = '\0';
-    if (std::sscanf(marker, " %63s %d %c", galaxy, &scenario, &extra) != 2 || scenario <= 0)
+    // "<galaxy> <scenario> [start [x y z]]": start = a Mario start point (MarioNo) in the main zone, 0 = the default;
+    // x y z = move Mario there once the scene has run 3 s without a demo or talk (test shortcut past the opening events).
+    // An optional 7th field holds the teleport back until that presented frame (long-session tests).
+    unsigned tpFrame = 0;
+    const int fields = std::sscanf(marker, " %63s %d %d %f %f %f %u %c", galaxy, &scenario, &start, &tp[0], &tp[1], &tp[2], &tpFrame, &extra);
+    if ((fields != 2 && fields != 3 && fields != 6 && fields != 7) || scenario <= 0 || start < 0)
         return;
 
     std::snprintf(s_warp_galaxy, sizeof(s_warp_galaxy), "%s", galaxy);
     s_warp_scenario = scenario;
+    s_warp_start = fields >= 3 ? start : 0;
+    s_warp_tp_set = fields >= 6;
+    s_warp_tp_frame = fields == 7 ? tpFrame : 0;
+    for (int i = 0; i < 3; i++)
+        s_warp_tp[i] = tp[i];
+    if (s_warp_tp_set)
+        port_log("[warp] teleport armed to %.1f %.1f %.1f from frame %u", tp[0], tp[1], tp[2], s_warp_tp_frame);
     s_warp_pending = 1;
-    port_log("[warp] marker=on galaxy=%s scenario=%d", s_warp_galaxy, s_warp_scenario);
+    port_log("[warp] marker=on galaxy=%s scenario=%d start=%d", s_warp_galaxy, s_warp_scenario, s_warp_start);
 }
 
 void log_unsupported_once(int* flag, const char* what)
@@ -221,6 +242,32 @@ int sms_wiiu_sd_marker(const char* name)
 int smg_wiiu_warp_pending(void) { return s_warp_pending; }
 const char* smg_wiiu_warp_galaxy(void) { return s_warp_galaxy; }
 int smg_wiiu_warp_scenario(void) { return s_warp_scenario; }
+int smg_wiiu_warp_start(void) { return s_warp_start; }
+int smg_wiiu_warp_teleport(float* xyz)
+{
+    if (!s_warp_tp_set || sms_wiiu_frame_count() < s_warp_tp_frame)
+        return 0;
+    for (int i = 0; i < 3; i++)
+        xyz[i] = s_warp_tp[i];
+    return 1;
+}
+void smg_wiiu_warp_teleport_done(void) { s_warp_tp_set = 0; }
+// A pipe within 100 units of the teleport target moves the target just above its mouth (pos + up * 120)
+// and returns 1: that pipe then treats its switch as on, so the test can enter a pipe the story has not opened yet.
+int smg_wiiu_warp_teleport_pipe(const float* pos, const float* up)
+{
+    if (!s_warp_tp_set)
+        return 0;
+    float d2 = 0.0f;
+    for (int i = 0; i < 3; i++)
+        d2 += (pos[i] - s_warp_tp[i]) * (pos[i] - s_warp_tp[i]);
+    if (d2 > 100.0f * 100.0f)
+        return 0;
+    for (int i = 0; i < 3; i++)
+        s_warp_tp[i] = pos[i] + up[i] * 120.0f;
+    port_log("[warp] teleport target is a pipe: up %.2f %.2f %.2f, target %.1f %.1f %.1f", up[0], up[1], up[2], s_warp_tp[0], s_warp_tp[1], s_warp_tp[2]);
+    return 1;
+}
 void smg_wiiu_warp_consume(void) { s_warp_pending = 0; }
 const char* smg_wiiu_save_root(void)
 {
@@ -247,12 +294,142 @@ void smg_wiiu_runtime_init(void)
     port_log("SMG Wii U: stage2 runtime initialized; static arenas");
 }
 
-/* Wii system language (SC_LANG_*). The Stage 1 stub returned 0, which is
- * SC_LANG_JAPANESE: MR::getDecidedLanguageFromIPL() then picked JpJapanese on
- * the PAL disc (row RMGP), whose data has only the Eu* language trees, so every
- * language-dependent path (makeFileNameConsideringLanguage) was missing.
- * English is the PAL default; mapping the Wii U system language is later work. */
-u8 SCGetLanguage(void) { return 1; /* SC_LANG_ENGLISH */ }
+/* Wii system language (SC_LANG_*), which MR::getDecidedLanguageFromIPL() turns
+ * into a language folder of the disc (EuFrench, UsSpanish, ...). Order:
+ *   1. smg-data/language.txt (written by the Pack Helper): english, french,
+ *      german, spanish, italian, dutch or japanese ("auto" or a missing file
+ *      skips this step);
+ *   2. the Wii U system language (cafe.language);
+ *   3. English.
+ * A choice is used only if its folder is on the card, so a PAL disc never
+ * gets a language it does not have (Stage 1 returned 0 = Japanese, and the
+ * missing JpJapanese tree broke every language-dependent path). */
+namespace {
+
+struct SmgLanguage {
+    const char* name;      // language.txt word
+    u8 sc;                 // SC_LANG_*
+    const char* folders[2];
+};
+const SmgLanguage kSmgLanguages[] = {
+    {"japanese", 0, {"JpJapanese", nullptr}},
+    {"english", 1, {"EuEnglish", "UsEnglish"}},
+    {"german", 2, {"EuGerman", nullptr}},
+    {"french", 3, {"EuFrench", "UsFrench"}},
+    {"spanish", 4, {"EuSpanish", "UsSpanish"}},
+    {"italian", 5, {"EuItalian", nullptr}},
+    {"dutch", 6, {"EuDutch", nullptr}},
+};
+
+const SmgLanguage* smg_language_by_sc(int sc)
+{
+    for (const SmgLanguage& language : kSmgLanguages)
+        if (language.sc == sc)
+            return &language;
+    return nullptr;
+}
+
+bool smg_language_on_card(const SmgLanguage* language)
+{
+    if (!language)
+        return false;
+    for (const char* folder : language->folders) {
+        if (!folder)
+            continue;
+        char path[192];
+        std::snprintf(path, sizeof(path), "%sfiles/%s", sms_wiiu_app_root(), folder);
+        struct stat info;
+        if (stat(path, &info) == 0 && S_ISDIR(info.st_mode))
+            return true;
+    }
+    return false;
+}
+
+const SmgLanguage* smg_language_from_file(bool* present)
+{
+    *present = false;
+    char path[192];
+    std::snprintf(path, sizeof(path), "%slanguage.txt", sms_wiiu_app_root());
+    FILE* file = std::fopen(path, "rb");
+    if (!file)
+        return nullptr;
+    *present = true;
+    char text[32] = {};
+    const size_t got = std::fread(text, 1, sizeof(text) - 1, file);
+    std::fclose(file);
+    text[got] = '\0';
+    char word[16] = {};
+    size_t n = 0;
+    for (size_t i = 0; i < got && n + 1 < sizeof(word); ++i) {
+        const unsigned char c = static_cast<unsigned char>(text[i]);
+        if (std::isalpha(c))
+            word[n++] = static_cast<char>(std::tolower(c));
+        else if (n)
+            break;
+    }
+    for (const SmgLanguage& language : kSmgLanguages)
+        if (std::strcmp(word, language.name) == 0)
+            return &language;
+    if (std::strcmp(word, "auto") != 0)
+        port_log("SMG Wii U: language.txt says \"%s\", not a known language; using the console language", word);
+    return nullptr;
+}
+
+/* cafe.language: 0 ja, 1 en, 2 fr, 3 de, 4 it, 5 es, 6 zh, 7 ko, 8 nl, 9 pt, 10 ru, 11 tw. */
+const SmgLanguage* smg_language_from_console(int* cafe)
+{
+    *cafe = -1;
+    const UCHandle handle = UCOpen();
+    if (handle < 0)
+        return nullptr;
+    alignas(64) uint32_t value = 0;
+    alignas(64) UCSysConfig setting = {};
+    std::strcpy(setting.name, "cafe.language");
+    setting.access = 0x777;
+    setting.dataType = UC_DATATYPE_UNSIGNED_INT;
+    setting.dataSize = sizeof(value);
+    setting.data = &value;
+    const UCError error = UCReadSysConfig(handle, 1, &setting);
+    UCClose(handle);
+    if (error != UC_ERROR_OK)
+        return nullptr;
+    *cafe = static_cast<int>(value);
+    static const signed char kCafeToSc[] = {0, 1, 3, 2, 5, 4, -1, -1, 6, -1, -1, -1};
+    if (value >= sizeof(kCafeToSc))
+        return nullptr;
+    return smg_language_by_sc(kCafeToSc[value]);
+}
+
+}  // namespace
+
+u8 SCGetLanguage(void)
+{
+    static int s_decided = -1;
+    if (s_decided >= 0)
+        return static_cast<u8>(s_decided);
+    bool file_present = false;
+    const SmgLanguage* chosen = smg_language_from_file(&file_present);
+    const char* source = "language.txt";
+    if (chosen && !smg_language_on_card(chosen)) {
+        port_log("SMG Wii U: language.txt asks for %s, which this disc does not have", chosen->name);
+        chosen = nullptr;
+    }
+    int cafe = -1;
+    if (!chosen) {
+        chosen = smg_language_from_console(&cafe);
+        source = "console";
+        if (chosen && !smg_language_on_card(chosen))
+            chosen = nullptr;
+    }
+    if (!chosen) {
+        chosen = smg_language_by_sc(1);
+        source = "default";
+    }
+    s_decided = chosen->sc;
+    port_log("SMG Wii U: language=%s (from %s; language.txt %s, cafe.language=%d)", chosen->name, source,
+             file_present ? "present" : "absent", cafe);
+    return static_cast<u8>(s_decided);
+}
 
 void port_log(const char* fmt, ...)
 {

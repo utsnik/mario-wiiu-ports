@@ -12,7 +12,7 @@ public:
 
     inline virtual ~ShadowVolumeFlatModel();
     virtual void draw() const;
-    virtual void loadModelDrawMtx() const;
+    virtual u32 calcModelDrawMtx(ShadowVolumeModelDrawMtx*, u32) const override;
 
     void initModel(const char*);
     void setBaseMatrixPtr(MtxPtr);

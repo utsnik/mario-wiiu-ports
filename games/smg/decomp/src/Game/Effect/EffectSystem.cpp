@@ -14,6 +14,9 @@
 #include <JSystem/JParticle/JPAParticle.hpp>
 #include <JSystem/JParticle/JPAEmitter.hpp>
 #include <JSystem/JParticle/JPAEmitterManager.hpp>
+#if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
+#include "../../../../include/wiiu/jpa_async.h"
+#endif
 
 EffectSystem::EffectSystem(const char* pName, bool createAdaptors)
     : NameObj(pName), mEmitterManager(), mDrawExec(), mCalcExec(), mGroupHolder(new AutoEffectGroupHolder()), _20(true) {
@@ -43,6 +46,9 @@ ParticleEmitter* EffectSystem::createEmitter(u16 resourceId, u8 groupId, u8 reso
 }
 
 void EffectSystem::forceDeleteEmitter(ParticleEmitter* pEmitter) const {
+#if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
+    sms_wiiu_jpa_async_join();
+#endif
     if (pEmitter->mEmitter != nullptr) {
         SingleEmitter* pSingleEmitter = MR::Effect::getLinkSingleEmitter(pEmitter->mEmitter);
 
@@ -56,6 +62,9 @@ void EffectSystem::forceDeleteEmitter(ParticleEmitter* pEmitter) const {
 }
 
 void EffectSystem::forceDeleteSingleEmitter(SingleEmitter* pSingleEmitter) const {
+#if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
+    sms_wiiu_jpa_async_join();
+#endif
     ParticleEmitter* pEmitter = pSingleEmitter->mEmitter;
 
     if (pSingleEmitter->mEmitter != nullptr) {

@@ -120,6 +120,7 @@ if(PORT_GAME STREQUAL "smg")
     ${CMAKE_CURRENT_SOURCE_DIR}/../../games/smg/platform/wiiu/alarm.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../../games/smg/platform/wiiu/thp_mt.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../../games/smg/platform/wiiu/j3dmt.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../games/smg/platform/wiiu/jpaasync.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../../games/smg/platform/wiiu/gphase.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../../games/smg/platform/wiiu/msl_printf.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../../games/smg/platform/wiiu/wstring.cpp
@@ -242,6 +243,20 @@ if(PORT_GAME STREQUAL "smg")
     # audit tools/tests/test_smg_wiiu_link_symbols.py verifies every provider
     # symbol is unique and attributed to input.cpp.
     -Wl,--allow-multiple-definition
+    # Galaxy wraps the wut KPAD entry points so it can translate wut's
+    # KPADStatus ABI into Revolution's game-facing KPADStatus while retaining
+    # the real Wii Remote/extension samples.
+    -Wl,--wrap=KPADInit
+    -Wl,--wrap=WPADInit
+    -Wl,--wrap=WPADControlMotor
+    -Wl,--wrap=KPADReset
+    -Wl,--wrap=KPADReadEx
+    -Wl,--wrap=KPADSetAccParam
+    -Wl,--wrap=KPADSetBtnRepeat
+    -Wl,--wrap=KPADSetDistParam
+    -Wl,--wrap=KPADSetHoriParam
+    -Wl,--wrap=KPADSetPosParam
+    -Wl,--wrap=KPADSetSensorHeight
     # Ruling R17: Sunshine's port-heap mechanism. port_heap.cpp's wraps send
     # operator new inside SMS_PORT_HEAP_SCOPE to the system heap and every
     # other new to __real_ = Galaxy's JKRHeap.cpp operator new; delete pairs

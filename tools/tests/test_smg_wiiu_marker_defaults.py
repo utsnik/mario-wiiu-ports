@@ -31,6 +31,7 @@ def main() -> int:
         "SMS Wii U: [peekasync] marker=%s",
         "std::snprintf(disableName, sizeof(disableName), \"no%s\", name)",
         "[defaults] earlyz=%d hiz=%d peek2=%d peekasync=%d textiled=%d tv720=%d texnative=%d mem1copy=%d",
+        's_jpaAsyncMarker = sdMarkerPresent("jpaasync")',
     ]
     missing = [needle for needle in required if needle not in source]
     if missing:
@@ -76,6 +77,13 @@ int main() {
     for name in ("textiled", "tv720", "texnative", "peekasync"):
         assert not resolve(name, set(), smg=False), (name, "other-game default")
         assert resolve(name, {name}, smg=False), (name, "other-game opt-in")
+
+    # jpaasync is intentionally absent from MARKERS: it is opt-in on SMG as
+    # well, and a positive marker is the only way to enable it.
+    assert "jpaasync" not in MARKERS
+    assert ("jpaasync" in set()) is False
+    assert ("jpaasync" in {"jpaasync"}) is True
+    assert ("jpaasync" in {"nojpaasync"}) is False
 
     print("marker-defaults: PASS: default on, no<name> off, positive marker no-op")
     return 0

@@ -4,6 +4,9 @@
 #include "JSystem/JParticle/JPAEmitterManager.hpp"
 #include "JSystem/JParticle/JPAParticle.hpp"
 #include "JSystem/JParticle/JPAResourceManager.hpp"
+#if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
+#include "../../../../include/wiiu/jpa_async.h"
+#endif
 
 JPAEmitterCallBack::~JPAEmitterCallBack() {
 }
@@ -32,6 +35,9 @@ JPABaseParticle* JPABaseEmitter::createChild(JPABaseParticle* parent) {
 }
 
 void JPABaseEmitter::deleteAllParticle() {
+#if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
+    sms_wiiu_jpa_async_join();
+#endif
     while (mAlivePtclBase.getNum())
         mpPtclPool->push_front(mAlivePtclBase.pop_back());
     while (mAlivePtclChld.getNum())

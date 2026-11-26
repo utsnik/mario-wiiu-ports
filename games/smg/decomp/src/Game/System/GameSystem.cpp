@@ -210,7 +210,7 @@ inline bool isSystemNormal(const GameSystem* pGameSystem) {
 bool smg_reorder_enabled() {
     static int state = -1;
     if (state < 0)
-        state = sms_wiiu_sd_marker("reorder") != 0 ? 1 : 0;
+        state = sms_wiiu_sd_marker("noreorder") == 0 ? 1 : 0;  // default-on 2026-11-17 (Observatory 51 -> 57.6 fps with pump+texinvnowait); noreorder opts out
     return state != 0;
 }
 #endif
@@ -252,7 +252,7 @@ extern "C" void sms_wiiu_reorder_drawwake(void);
 extern "C" int smg_reorder_pump_enabled(void) {
     static int state = -1;
     if (state < 0)
-        state = smg_reorder_enabled() && sms_wiiu_sd_marker("reorderpump") != 0 ? 1 : 0;
+        state = smg_reorder_enabled() && sms_wiiu_sd_marker("noreorderpump") == 0 ? 1 : 0;  // default-on 2026-11-17
     return state;
 }
 #endif

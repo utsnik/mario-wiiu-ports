@@ -304,6 +304,8 @@ void port_pad_init(void)
 	}
 	VPADInit();
 	KPADInit();
+	/* Without this a Pro Controller cannot connect while the game runs (user, 2026-11-16). */
+	WPADEnableURCC(TRUE);
 	port_log("[pad] VPAD/KPAD input ready; neutral state is stable without a controller\n");
 }
 

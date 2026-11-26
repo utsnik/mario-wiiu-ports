@@ -81,7 +81,7 @@ def main():
                         "gx_fifo.h",
                         "JKRUnitHeap.cpp",
                         "platform/wiiu/gx2_renderer.cpp",
-                        "platform/wiiu/gx2_shader_inl.h",
+                        "platform/wiiu/latte_asm.h",
                         "platform/gx/src/",
                         "platform/endian/endian_util.h",
                         "platform/mods/eclipse/fixup_sources.py",

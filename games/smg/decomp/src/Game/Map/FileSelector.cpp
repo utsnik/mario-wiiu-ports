@@ -815,7 +815,7 @@ bool FileSelector::isUserFileCorrupted(s32 id) const {
 }
 
 bool FileSelector::isUserFileAppearLuigi(s32 id) const {
-#ifdef TARGET_PC
+#if defined(TARGET_PC) && !defined(TARGET_WIIU)
     // Luigi can be chosen for every file, new ones included, without first
     // finishing the game with Mario: the Mario/Luigi switch shows on each
     // file's start screen, and the Luigi icon in the icon choice.

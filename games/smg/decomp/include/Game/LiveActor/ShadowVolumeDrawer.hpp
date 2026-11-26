@@ -11,6 +11,8 @@ public:
     virtual ~ShadowVolumeDrawInit();
 };
 
+class ShadowVolumeModel;
+
 class ShadowVolumeDrawer : public ShadowDrawer {
 public:
     ShadowVolumeDrawer(const char*);
@@ -27,6 +29,7 @@ public:
     virtual bool isDraw() const;
     virtual bool isShadowVolumeBatchable() const;
     virtual u32 getShadowVolumeBatchState() const;
+    virtual const ShadowVolumeModel* getShadowVolumeModel() const;
 
     void setStartDrawShepeOffset(f32);
     void setEndDrawShepeOffset(f32);

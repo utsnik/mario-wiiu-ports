@@ -3,6 +3,8 @@
 
 #include <stdint.h>
 
+struct SmsWiiuJpaFinalVxDesc;
+
 namespace gx2prod {
 
 enum WaitKind {
@@ -71,6 +73,17 @@ bool commit(uint32_t size);
 void wake();
 /* Flush the producer's coalescing buffer before a worker wake or wait. */
 void set_flush_hook(void (*fn)());
+/* HOME/ProcUI release: ask the worker to run the park hook at its next safe
+ * point (between consume chunks or while it waits) and acknowledge.  Never
+ * blocks on core-1 work; returns false after timeoutMicros without an ack. */
+void set_park_hook(void (*fn)());
+/* Runs on the worker just before it sleeps (closes its open display list, so
+ * an idle worker holds no GX2 state and core 1 may park it without a wake). */
+void set_idle_hook(void (*fn)());
+uint32_t park_idle_acks();
+bool request_park(uint32_t timeoutMicros);
+/* Microseconds from the last park request to the worker's ack; ~0 = not acked. */
+uint32_t park_ack_micros();
 /* Every wait kind services through its worker-published barrier before it
  * returns.  In particular kWaitFlush and kWaitPresent cannot leave a
  * completed display-list call queued on the worker side. */
@@ -82,7 +95,13 @@ bool queueBoundary(uint32_t kind, ServiceFn fn, void* arg);
 /* Wait for the most recently queued boundary operation. */
 void waitPending(uint32_t kind);
 void service();
+/* True when the worker has consumed every byte appended so far and handled
+ * every boundary: it touches no renderer state until the next append. */
+bool drained();
 void stop();
+
+/* Worker-side JPA final-vx protocol. */
+bool waitJpaFinalVxReady(const SmsWiiuJpaFinalVxDesc* descriptor);
 
 /* Worker-only API used by boundary/parser hooks.  enqueue_list() publishes
  * a completed, cache-flushed display list for ordered replay on core 1.
@@ -91,6 +110,8 @@ bool enqueue_list(void* displayList, uint32_t bytes);
 /* Queue an ordered worker-produced operation for core 1.  arg remains owned
  * by the renderer and must stay valid through the next wait/present drain. */
 bool enqueueService(ServiceFn fn, void* arg);
+/* Like enqueueService(), but never waits for room in the service ring. */
+bool tryEnqueueService(ServiceFn fn, void* arg);
 void publish_token(uint16_t token);
 
 /* Bind before lists can be emitted.  The callback is invoked only by

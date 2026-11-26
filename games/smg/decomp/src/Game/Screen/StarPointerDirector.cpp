@@ -17,6 +17,10 @@
 #include <JSystem/JGeometry/TMatrix.hpp>
 #include <JSystem/JMath/JMath.hpp>
 #include <revolution/gx/GXGet.h>
+#ifdef TARGET_WIIU
+#include "port/port.h"
+#include "wiiu/peek_z.h"
+#endif
 
 StarPointerDirector::StarPointerDirector()
     : mIsUpdateTransHolder(false), mIsAllowP1StarPieceShot(false), mIsAllowP2StarPieceShot(false), mControllers(nullptr),
@@ -162,12 +166,26 @@ void StarPointerPeekZ::setDrawSyncToken() {
 }
 
 void StarPointerPeekZ::drawSyncCallback(u16 token) {
+#ifdef TARGET_WIIU
+    static u32 sLogCount;
+#endif
     for (s32 channel = 0; channel < StarPointerFunction::getNumStarPointer(); channel++) {
         if (MR::isInRange(mInfos[channel]->mPos.x, 0.0f, MR::getScreenWidth() - 1) &&
             MR::isInRange(mInfos[channel]->mPos.y, 0.0f, MR::getScreenHeight() - 1)) {
             TVec2f pos;
             MR::convertScreenPosToFrameBufferPos(&pos, mInfos[channel]->mPos);
             GXPeekZ(pos.x, pos.y, &mInfos[channel]->mZDepth);
+#ifdef TARGET_WIIU
+            const bool bHeld = MR::testCorePadButtonB(channel);
+            if ((sLogCount % 30) == 0 || bHeld) {
+                u32 sampleAge, rawBits;
+                sms_wiiu_gx2_peek_z_info(&sampleAge, &rawBits);
+                port_log("[starptr] peekZ %.1f %.1f -> %u age=%u raw=0x%08x\n", pos.x, pos.y,
+                         static_cast<unsigned>(mInfos[channel]->mZDepth),
+                         static_cast<unsigned>(sampleAge), static_cast<unsigned>(rawBits));
+            }
+            ++sLogCount;
+#endif
             mInfos[channel]->mDrawReady = true;
         }
     }

@@ -121,6 +121,21 @@ Dolphin's DSP HLE gave the same levels (the boot jingle peaks at 13760 in both).
   Streams (0x7FFF sends) therefore play at 1.25×, and their loudest peaks can saturate, as they would under either reading.
 - `SMS_AUDIO_MASTER_SHIFT` and `SMS_AUDIO_SLOT_SHIFT` override the two shifts.
 
+### Galaxy (microcode 0xD643001F)
+
+Galaxy's later microcode does not use Sunshine's scales, and JAudio2 caps both
+paths at `MAX_MIXERLEVEL` = 12000, so the Sunshine shifts made it too quiet:
+
+- explicit `mixChannels` sends: Q16 (2x Sunshine's calibrated path);
+- auto mixer: sample * volume / 65536 with a unity sine pan (4x), wet send = dry * `fx` / 32768;
+- master: 4.12 (`outputGain` 0.9 -> 0x3999 = 3.6).
+
+Measured 2026-11-25 against RMGP01 in Dolphin (`DumpAudio`, boot to file select): HLE and LLE
+agree within 0.3 % rms in every 10 s window. The title music is two auto-mixer voices
+(pan 0x00/0x7f, volume 0x2B03). The old scales plus a mono downmix predicted rms 545 / peak
+4008 for the first 6 s; the console logged 182 / 1343, and the remaining 1/3 was the
+screen-saver duck (`VIGetDimmingCount` returned 0). `tests/smg_level_test.cc` pins the scales.
+
 ## Bus → channel
 
 In retail file select, every voice uses buses 1–4 (0x0D00/0x0D60/0x0DC0/0x0E20), with no FX sends; the auto-mixer voices' `mixChannels` hold garbage bus words, as on the port.

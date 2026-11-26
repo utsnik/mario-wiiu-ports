@@ -7,7 +7,7 @@ public:
     ShadowVolumeSphere();
 
     virtual ~ShadowVolumeSphere();
-    virtual void loadModelDrawMtx() const;
+    virtual u32 calcModelDrawMtx(ShadowVolumeModelDrawMtx*, u32) const override;
     virtual bool isDraw() const;
 
     void setRadius(f32);

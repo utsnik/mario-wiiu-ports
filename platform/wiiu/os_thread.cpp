@@ -90,6 +90,7 @@ ThreadRecord s_threads[kMaxThreads];
 QueueRecord s_queues[kMaxQueues];
 OSThread s_main_thread;
 unsigned s_scheduler_depth;
+static uint32_t s_threadCreates;
 
 ThreadRecord* record_for_game(OSThread* game)
 {
@@ -325,9 +326,14 @@ int sms_wiiu_OSCreateThread(OSThread* game, void* (*entry)(void*), void* arg,
 	if (!wut_OSCreateThread(r->wut, thread_entry, 0,
 	                        reinterpret_cast<char*>(r), stack, stack_size,
 	                        priority, kGameThreadAffinityCpu1)) {
+		MEMFreeToDefaultHeap(r->wut);
+		r->wut = nullptr;
 		r->active = false;
 		return FALSE;
 	}
+	const uint32_t create = ++s_threadCreates;
+	if ((create % 16) == 0)
+		port_log("[os] thread create #%u game=%p\n", unsigned(create), game);
 	return TRUE;
 }
 

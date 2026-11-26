@@ -48,6 +48,16 @@ extern "C" void smg_stage1_stub_log_once(const char* symbol)
 
 SMG_STAGE1_STUB_SYMBOLS(SMG_DEFINE_STAGE1_STUB)
 
+extern "C" unsigned char SCGetSoundMode(void)
+{
+  return 1; // SC_SOUND_MODE_STEREO
+}
+
+extern "C" unsigned int VIGetDimmingCount(void)
+{
+  return 1; // One positive frame keeps AudSystem's screen-saver duck inactive.
+}
+
 #define SMG_DEFINE_STAGE1_VALUE_STUB(symbol, value) \
   extern "C" unsigned char symbol(void) \
   { \

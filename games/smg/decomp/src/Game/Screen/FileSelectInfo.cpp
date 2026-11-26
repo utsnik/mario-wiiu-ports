@@ -198,7 +198,7 @@ void FileSelectInfo::reflectInfo() {
         MR::hidePane(this, "Complete2");
     }
 
-#ifdef TARGET_PC
+#if defined(TARGET_PC) && !defined(TARGET_WIIU)
     // Every file can be played with Mario or Luigi (FileSelector::isUserFileAppearLuigi):
     // always say which one is selected.
     bool bVar1 = true;

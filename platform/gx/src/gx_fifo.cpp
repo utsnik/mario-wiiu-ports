@@ -7,6 +7,7 @@
 #endif
 #include "gx_internal.h"
 #include "j3d_state_delta.h"
+#include <dolphin/gx/GXEnum.h>
 #ifdef __WIIU__
 #include "../../wiiu/gx2_producer_worker.h"
 #endif
@@ -54,6 +55,16 @@ void syncProducerState() {
     const size_t head = offsetof(State, tlutMem), tail = offsetof(State, tlutMem) + sizeof(g.tlutMem);
     memcpy(&gProducer, &g, head);
     memcpy(reinterpret_cast<uint8_t*>(&gProducer) + tail, reinterpret_cast<const uint8_t*>(&g) + tail,
+           sizeof(State) - tail);
+}
+// The reverse of syncProducerState, for turning the worker off mid-game (HOME
+// return, 2026-11-18): since the worker started, every GX register write was
+// parsed into gProducer, so core 1's copy is stale.  Same split as above
+// (tlutMem is shared).  Only while the worker is stopped.
+void syncCoreStateFromProducer() {
+    const size_t head = offsetof(State, tlutMem), tail = offsetof(State, tlutMem) + sizeof(g.tlutMem);
+    memcpy(&g, &gProducer, head);
+    memcpy(reinterpret_cast<uint8_t*>(&g) + tail, reinterpret_cast<const uint8_t*>(&gProducer) + tail,
            sizeof(State) - tail);
 }
 extern uint32_t g_traceLastVat;
@@ -822,7 +833,14 @@ static void buildLayoutFromCp(uint32_t lo, uint32_t hi, const uint32_t* vatA, co
     L.nrm = {uint8_t((lo >> 11) & 3), uint8_t((A >> 9) & 1), uint8_t((A >> 10) & 7), 0};
     L.clr[0] = {uint8_t((lo >> 13) & 3), uint8_t((A >> 13) & 1), uint8_t((A >> 14) & 7), 0};
     L.clr[1] = {uint8_t((lo >> 15) & 3), uint8_t((A >> 17) & 1), uint8_t((A >> 18) & 7), 0};
-    L.tex[0] = {uint8_t(hi & 3), uint8_t((A >> 21) & 1), uint8_t((A >> 22) & 7), uint8_t((A >> 25) & 31)};
+    // VAT-A bit 29 is also the high bit of a legacy TEX0 fraction, and VCD
+    // mode 3 is ordinary GX_INDEX16.  Only the unused upper VCD marker makes
+    // the software projected-TEX0 extension unambiguous.
+    const bool tex0Stq = ((hi & kHostVcdProjectedTex0) != 0) &&
+                         ((hi & 3) == 3) && ((A >> 29) & 1) && (((A >> 21) & 3) == 2);
+    L.tex[0] = {uint8_t(tex0Stq ? 1 : (hi & 3)), uint8_t(tex0Stq ? GX_TEX_STQ : ((A >> 21) & 1)),
+                uint8_t(tex0Stq ? ((A >> 23) & 7) : ((A >> 22) & 7)),
+                uint8_t(tex0Stq ? ((A >> 26) & 7) : ((A >> 25) & 31))};
     L.tex[1] = {uint8_t((hi >> 2) & 3), uint8_t(B & 1), uint8_t((B >> 1) & 7), uint8_t((B >> 4) & 31)};
     L.tex[2] = {uint8_t((hi >> 4) & 3), uint8_t((B >> 9) & 1), uint8_t((B >> 10) & 7), uint8_t((B >> 13) & 31)};
     L.tex[3] = {uint8_t((hi >> 6) & 3), uint8_t((B >> 18) & 1), uint8_t((B >> 19) & 7), uint8_t((B >> 22) & 31)};
@@ -847,7 +865,10 @@ static void buildLayoutFromCp(uint32_t lo, uint32_t hi, const uint32_t* vatA, co
         else s += idxSize(L.clr[c].mode);
     }
     for (int t = 0; t < 8; t++) {
-        if (L.tex[t].mode == 1) s += comp(L.tex[t].type) * (L.tex[t].cnt ? 2 : 1);
+        if (L.tex[t].mode == 1) {
+            const uint32_t components = L.tex[t].cnt == GX_TEX_STQ ? 3 : L.tex[t].cnt ? 2 : 1;
+            s += comp(L.tex[t].type) * components;
+        }
         else s += idxSize(L.tex[t].mode);
     }
     L.size = s;
@@ -984,9 +1005,9 @@ const VtxFmtLayout& vtxFmtLayout(uint32_t fmt) {
             o += 4;
         }
     for (int t = 0; t < 8; t++)
-        if (fmt & (VF_TEX0 << t)) {
+        if ((t == 0 && (fmt & VF_TEX0_STQ)) || (fmt & (VF_TEX0 << t))) {
             l.tex[t] = o;
-            o += 8;
+            o += (t == 0 && (fmt & VF_TEX0_STQ)) ? 12 : 8;
         }
     if (fmt & VF_MTX) {
         l.mtx = o;
@@ -1011,7 +1032,10 @@ void unpackVertex(uint32_t fmt, const uint8_t* src, const uint8_t defMtx[9], Hos
     for (int c = 0; c < 2; c++)
         if (fmt & (VF_CLR0 << c)) memcpy(hv.clr[c], src + l.clr[c], 4);
     for (int t = 0; t < 8; t++)
-        if (fmt & (VF_TEX0 << t)) memcpy(hv.tex[t], src + l.tex[t], 8);
+        if ((t == 0 && (fmt & VF_TEX0_STQ)) || (fmt & (VF_TEX0 << t)))
+            memcpy(hv.tex[t], src + l.tex[t], 8);
+    if (fmt & VF_TEX0_STQ)
+        memcpy(&hv.texQ[0], src + l.tex[0] + 8, sizeof(float));
     if (fmt & VF_MTX) memcpy(hv.mtx, src + l.mtx, 12);
 }
 
@@ -1234,7 +1258,8 @@ static void buildSetup(DecSetup& S, const VtxLayout& L) {
     for (int c = 0; c < 2; c++)
         if (L.clr[c].mode) fmt |= VF_CLR0 << c;
     for (int t = 0; t < 8; t++)
-        if (L.tex[t].mode) fmt |= VF_TEX0 << t;
+        if (L.tex[t].mode)
+            fmt |= (t == 0 && L.tex[t].cnt == GX_TEX_STQ) ? VF_TEX0_STQ : VF_TEX0 << t;
     const VtxFmtLayout& lay = vtxFmtLayout(fmt);
     S.fmt = fmt;
     S.stride = lay.stride;
@@ -1295,11 +1320,13 @@ static void buildSetup(DecSetup& S, const VtxLayout& L) {
         if (L.tex[t].mode) {
             const AttrFmt& a = L.tex[t];
             DecOp& op = ops[nops++];
+            const uint16_t components = a.cnt == GX_TEX_STQ ? 3 : a.cnt ? 2 : 1;
             attrOp(op, ARR_TEX0 + t, a.mode, 1.0f / float(1u << a.frac), at, lay.tex[t],
-                   uint16_t(comp(a.type) * (a.cnt ? 2 : 1)));
-            at += a.mode == 1 ? uint16_t(comp(a.type) * (a.cnt ? 2 : 1)) : idxSize(a.mode);
+                   uint16_t(comp(a.type) * components));
+            at += a.mode == 1 ? uint16_t(comp(a.type) * components) : idxSize(a.mode);
             bool be = a.mode == 1 || g.arrayBigEndian[ARR_TEX0 + t];
-            op.fn = a.cnt ? pickVecN<2, 2>(a.mode, a.type, be) : pickVecN<1, 2>(a.mode, a.type, be);
+            op.fn = a.cnt == GX_TEX_STQ ? pickVecN<3, 3>(a.mode, a.type, be) :
+                    a.cnt ? pickVecN<2, 2>(a.mode, a.type, be) : pickVecN<1, 2>(a.mode, a.type, be);
         }
     S.nops = nops;
     if (at != L.size) fatal("vertex loader: attributes take %u of the vertex's %u bytes", at, L.size);
@@ -1368,6 +1395,9 @@ static void loadIndexedXF(uint8_t op, uint32_t idx, uint32_t v) {
 
 // ------------------------------------------------------------------ command parser
 static bool s_dlRecFail = false;  // the list being recorded does more than draw
+#ifdef SMS_GX_HOST_STREAM_TEST
+static uint32_t s_hostTestUnknownOpcodes;
+#endif
 
 // Executes complete commands from [p, p+n).  Returns bytes consumed; if the
 // tail holds an incomplete command, *need receives its total length.
@@ -1378,10 +1408,17 @@ static void applyHostState(uint8_t kind, uint8_t slot, uint32_t value);
 static bool s_hostOps = false;
 #endif
 
+// Set by the Wii U HOME park (gx2_renderer.cpp): a worker preempted inside a
+// consume resumes only after every ProcUI release callback has run (3.1 test
+// 2h, worker context in setTevShader), so it must stop issuing GX work at the
+// next command instead of finishing its chunk while the GPU is released.
+extern "C" { volatile bool sms_gx_parse_abort = false; }
+
 static uint32_t parse(const uint8_t* p, uint32_t n, uint32_t* need) {
     const uint8_t* start = p;
     const uint8_t* end = p + n;
     while (p < end) {
+        if (sms_gx_parse_abort) return uint32_t(end - start);  // drop the rest while parked
         uint8_t op = p[0];
         uint32_t avail = uint32_t(end - p);
         uint32_t len;
@@ -1448,6 +1485,9 @@ static uint32_t parse(const uint8_t* p, uint32_t n, uint32_t* need) {
                 decodeVertices(op & 0xF8, p + 3, cnt, L, op & 7);
             }
         } else {
+#ifdef SMS_GX_HOST_STREAM_TEST
+            ++s_hostTestUnknownOpcodes;
+#endif
             logmsg("unknown FIFO opcode 0x%02X, skipping byte", op);
             p++;
             continue;
@@ -1478,6 +1518,32 @@ static uint32_t parse(const uint8_t* p, uint32_t n, uint32_t* need) {
     }
     return uint32_t(p - start);
 }
+
+#ifdef SMS_GX_HOST_STREAM_TEST
+#ifdef __WIIU__
+void producerHostState(uint8_t kind, uint8_t slot, uint32_t value);
+#endif
+extern "C" uint32_t sms_gx_host_test_parse(const uint8_t* data, uint32_t size) {
+    uint32_t need = 0;
+    s_hostOps = true;
+    const uint32_t used = parse(data, size, &need);
+    s_hostOps = false;
+    return used == size && need == 0 ? used : 0;
+}
+
+extern "C" uint32_t sms_gx_host_test_cp_vcd_hi() { return g.cpVcdHi; }
+
+extern "C" void sms_gx_host_test_reset() {
+    resetState();
+    s_hostTestUnknownOpcodes = 0;
+}
+
+extern "C" uint32_t sms_gx_host_test_unknown_opcodes() { return s_hostTestUnknownOpcodes; }
+
+extern "C" void sms_gx_host_test_record(uint8_t phase, uint32_t value) {
+    producerHostState(kHostJpaFinalVx, phase, value);
+}
+#endif
 
 void runCommands(const uint8_t* data, uint32_t size) { SMS_PORT_HEAP_SCOPE();
     uint32_t need = 0;
@@ -2565,6 +2631,12 @@ void setPipeRedirect(uint8_t* dest) {
     s_redirect = s_redirectStart = dest;
     pipeFastUpdate();
 }
+#ifdef SMS_GX_HOST_STREAM_TEST
+extern "C" void sms_gx_host_test_redirect(uint8_t* dest) { setPipeRedirect(dest); }
+extern "C" uint32_t sms_gx_host_test_redirect_len() {
+    return s_redirect && s_redirectStart ? uint32_t(s_redirect - s_redirectStart) : 0;
+}
+#endif
 uint8_t* getPipeRedirect() { return s_redirect; }
 bool pipeIdle() { return s_pipeLen == 0; }
 
@@ -2786,6 +2858,9 @@ static void applyHostState(uint8_t kind, uint8_t slot, uint32_t value) {
         rendererGpuCatMark(slot, value);
         break;
     case kHostJpaFinalVx: {
+        // The host record deliberately carries only the descriptor address;
+        // jpaFinalVxSubmit performs the helper READY wait at the worker
+        // boundary before touching any payload bytes.
         const SmsWiiuJpaFinalVxDesc* desc =
             reinterpret_cast<const SmsWiiuJpaFinalVxDesc*>(uintptr_t(value));
         if (slot == SMS_WIIU_JPA_FINALVX_BEGIN_CHECK)
@@ -2796,6 +2871,13 @@ static void applyHostState(uint8_t kind, uint8_t slot, uint32_t value) {
             sms_wiiu_jpa_finalvx_fallback(SMS_WIIU_JPA_FINALVX_FALLBACK_UNSUPPORTED);
             logmsg("gx2prod: unknown jpafinalvx record phase %u", unsigned(slot));
         }
+        break;
+    }
+    case kHostShadowVolumeInstanced: {
+        const SmsWiiuShadowVolumeInstancedDesc* desc =
+            reinterpret_cast<const SmsWiiuShadowVolumeInstancedDesc*>(uintptr_t(value));
+        rendererShadowVolumeInstanced(desc);
+        delete[] reinterpret_cast<const uint8_t*>(desc);
         break;
     }
     case kHostTexStreamPitch:

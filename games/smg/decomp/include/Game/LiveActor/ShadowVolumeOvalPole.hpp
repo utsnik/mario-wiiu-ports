@@ -7,7 +7,7 @@ public:
     ShadowVolumeOvalPole();
 
     virtual ~ShadowVolumeOvalPole();
-    virtual void loadModelDrawMtx() const;
+    virtual u32 calcModelDrawMtx(ShadowVolumeModelDrawMtx*, u32) const override;
 
     void setSize(const TVec3f&);
 

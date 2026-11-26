@@ -24,6 +24,35 @@ struct CopySizes {
     uint32_t physicalW, physicalH;
 };
 
+struct CopyRect {
+    bool valid;
+    bool clipped;
+    uint32_t x, y, w, h;
+};
+
+// Clip before subtracting. An origin at or beyond the target must reject the
+// copy instead of turning target - origin into a huge unsigned width/height.
+inline CopyRect clipCopyRect(uint32_t x, uint32_t y, uint32_t w, uint32_t h,
+                             uint32_t targetW, uint32_t targetH) {
+    CopyRect result = {true, false, x, y, w, h};
+    if (!w || !h || x >= targetW || y >= targetH) {
+        result.valid = false;
+        result.clipped = true;
+        result.w = result.h = 0;
+        return result;
+    }
+    if (w > targetW - x) {
+        result.w = targetW - x;
+        result.clipped = true;
+    }
+    if (h > targetH - y) {
+        result.h = targetH - y;
+        result.clipped = true;
+    }
+    if (!result.w || !result.h) result.valid = false;
+    return result;
+}
+
 inline CopySizes selectCopySizes(bool marker, uint32_t owner, uint32_t sourceW, uint32_t sourceH,
                                  bool mipmap, uint32_t destinationW, uint32_t destinationH,
                                  float gameScaleX, float gameScaleY, bool cemu,

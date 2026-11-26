@@ -28,6 +28,7 @@ ROOT = Path(__file__).resolve().parents[2]
 FIFO_INCLUDE = ROOT / "games/smg/include"
 GXVERT = ROOT / "games/smg/decomp/libs/RVL_SDK/include/revolution/gx/GXVert.h"
 GXREGS = ROOT / "games/smg/decomp/libs/RVL_SDK/include/revolution/gx/GXRegs.h"
+GX2_RENDERER = ROOT / "platform/wiiu/gx2_renderer.cpp"
 
 HARNESS = r"""
 #include <stdio.h>
@@ -63,6 +64,9 @@ int main(void) {
         0x11, 0x22, 0x33, 0x44,       /* GXColor1u32 */
         0x02, 0x80,                   /* GXPosition2u16-style u16 */
         0x7f,                         /* u8 */
+        0x3f, 0x80, 0x00, 0x00,       /* GXTexCoord3f32(1, -2, 0.5) */
+        0xc0, 0x00, 0x00, 0x00,
+        0x3f, 0x00, 0x00, 0x00,
     };
     for (int fastCap = 0; fastCap <= 64; fastCap += 64) {
         streamLen = 0;
@@ -76,6 +80,9 @@ int main(void) {
         __PortGXFifo_u32(0x11223344u);
         __PortGXFifo_u16(0x0280);
         __PortGXFifo_u8(0x7f);
+        __PortGXFifo_f32(1.0f);
+        __PortGXFifo_f32(-2.0f);
+        __PortGXFifo_f32(0.5f);
         sync();
         if (streamLen != sizeof(want) || memcmp(stream, want, sizeof(want)) != 0) {
             printf("stream mismatch (fast=%d, %u bytes):", fastCap, streamLen);
@@ -94,7 +101,22 @@ def fail(message: str) -> int:
     return 1
 
 
+def test_tex_clause_alignment() -> None:
+    renderer = GX2_RENDERER.read_text(encoding="utf-8")
+    pad_start = renderer.index("static void tevPadTexClause")
+    pad_end = renderer.index("static bool initTevPixel", pad_start)
+    pad = renderer[pad_start:pad_end]
+    assert "if (cf & 1) program[cf++] = 0;" in pad
+    assert "tevPadTexClause(program, cf);" in pad
+    assert pad.index("tevPadTexClause(program, cf);") < pad.index(
+        "program[cf++] = TEX(offset + 2 * at, n) VALID_PIX;"
+    )
+    init = renderer[renderer.index("static bool initTevPixel"):]
+    assert init.count("tevTexClauses(program, cf,") >= 2
+
+
 def main() -> int:
+    test_tex_clause_alignment()
     vert = GXVERT.read_text(encoding="utf-8")
     regs = GXREGS.read_text(encoding="utf-8")
     if '#include "port/gx_fifo.h"' not in vert or "__PortGXFifo_##td" not in vert:

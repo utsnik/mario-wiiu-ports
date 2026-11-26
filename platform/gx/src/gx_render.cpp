@@ -292,7 +292,9 @@ static GLuint makeVao(uint32_t fmt, GLuint buf) {
     attr(3, (fmt & VF_NRM) && (fmt & VF_NBT), 3, GL_FLOAT, GL_FALSE, l.nrm + 24);
     attr(4, fmt & VF_CLR0, 4, GL_UNSIGNED_BYTE, GL_TRUE, l.clr[0]);
     attr(5, fmt & (VF_CLR0 << 1), 4, GL_UNSIGNED_BYTE, GL_TRUE, l.clr[1]);
-    for (int t = 0; t < 8; t++) attr(GLuint(6 + t), fmt & (VF_TEX0 << t), 2, GL_FLOAT, GL_FALSE, l.tex[t]);
+    for (int t = 0; t < 8; t++)
+        attr(GLuint(6 + t), (t == 0 && (fmt & VF_TEX0_STQ)) || (fmt & (VF_TEX0 << t)),
+             t == 0 && (fmt & VF_TEX0_STQ) ? 3 : 2, GL_FLOAT, GL_FALSE, l.tex[t]);
     if (fmt & VF_MTX) {
         glVertexAttribIPointer(14, 3, GL_UNSIGNED_INT, st, off(l.mtx));
         glEnableVertexAttribArray(14);

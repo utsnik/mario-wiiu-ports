@@ -1,13 +1,19 @@
 #include "gx2_producer_worker.h"
 #include "gx2_producer_ring.h"
+#include "jpa_counters.h"
 
 #include "runtime.h"
 #include "port_heap.h"
 
 #include <coreinit/core.h>
+#include <coreinit/cache.h>
 #include <coreinit/time.h>
 
 #include <cstring>
+
+#if defined(PORT_GAME_SMG)
+#include "jpa_final_vertex.h"
+#endif
 
 #if defined(PORT_GAME_SMG)
 #include "../../games/smg/include/wiiu/gphase.h"
@@ -42,6 +48,10 @@ BOOL wut_OSSendMessage(WutMessageQueue*, WutMessage*, int32_t)
 BOOL wut_OSReceiveMessage(WutMessageQueue*, WutMessage*, int32_t)
     __asm__("OSReceiveMessage");
 void wut_OSSleepTicks(int64_t) __asm__("OSSleepTicks");
+/* coreinit's spinlock, not __sync: Espresso needs the OS's stwcx. workaround. */
+struct WutSpinLock { uint32_t owner, pad0, recursion, pad1; } __attribute__((aligned(16)));
+BOOL wut_OSUninterruptibleSpinLock_Acquire(WutSpinLock*) __asm__("OSUninterruptibleSpinLock_Acquire");
+BOOL wut_OSUninterruptibleSpinLock_Release(WutSpinLock*) __asm__("OSUninterruptibleSpinLock_Release");
 void wut_OSYieldThread(void) __asm__("OSYieldThread");
 int64_t wut_OSGetSystemTime(void) __asm__("OSGetSystemTime");
 int sms_wiiu_pipe2_enabled(void);
@@ -87,6 +97,33 @@ static volatile uint32_t s_workerHandled;
 static volatile uint32_t s_serviceDone;
 static volatile uint32_t s_pendingRequest;
 static volatile uint32_t s_stopRequested;
+/* HOME/ProcUI release park (2026-11-18).  The ProcUI release callback must not
+ * block on core-1 work (test 2c froze at the HOME press), so it only bumps
+ * s_parkRequest and wakes the worker; the worker runs s_parkHook (closes the
+ * display list it has open on its own core) at its next safe point and
+ * acknowledges.  A list left open across the release was ended after the
+ * return: DSI store to 0 in GX2 on the worker stack (3.1 test 1, 17 Nov). */
+static volatile uint32_t s_parkRequest, s_parkAck;
+static volatile OSTime s_parkRequestTick, s_parkAckTick;
+static void (*s_parkHook)();
+/* The worker is asleep in OSReceiveMessage with nothing open (the idle hook
+ * closed its display list first).  A real HOME press on test 2h showed the
+ * wake sent from the release callback is not delivered until the callback
+ * returns (worker context = workerMain -> OSReceiveMessage, acked 502 ms
+ * late); the late wake then ran GX2 while WHBGfx released the GPU.  An idle
+ * worker therefore counts as parked: core 1 acks for it. */
+static void (*s_idleHook)();
+static volatile bool s_workerIdle;
+static volatile uint32_t s_parkIdleAcks;
+static void checkPark() {
+    const uint32_t req = s_parkRequest;
+    if (req == s_parkAck) return;
+    __sync_synchronize();
+    if (s_parkHook) s_parkHook();
+    s_parkAckTick = OSGetTime();
+    __sync_synchronize();
+    s_parkAck = req;
+}
 static bool s_started;
 static uint32_t s_wokenAt;
 #if defined(PORT_GAME_SMG)
@@ -193,8 +230,21 @@ static void wakeWorker() {
     wut_OSSendMessage(&s_wakeQueue, &wake, 0);
 }
 
+/* The service ring has TWO writers: the worker (lists, barriers, copy and
+ * texture services from its parse path) and the game thread on core 1
+ * (colour and depth peeks, enqueueService/tryEnqueueService).  Unlocked, both
+ * could claim the same slot and one record was lost: a lost barrier leaves
+ * gx2prod::wait spinning forever (the GXPeekZ hang "minutes in", alpha 2,
+ * 2026-11-15), a lost list drops a frame's draws.  The claim-fill-publish is
+ * now under one spinlock; nothing sleeps while holding it.  pushes[] counts
+ * pushes by core (logged once when core 1 first pushes). */
+static WutSpinLock s_pushLock;
+static volatile uint32_t s_pushesByCore[3];
+static bool s_foreignPushLogged;
+
 static bool pushService(const ServiceRecord& record, bool mustSucceed) {
     for (;;) {
+        wut_OSUninterruptibleSpinLock_Acquire(&s_pushLock);
         const uint32_t write = s_serviceWrite;
         acquireBarrier();
         const uint32_t read = s_serviceRead;
@@ -202,8 +252,17 @@ static bool pushService(const ServiceRecord& record, bool mustSucceed) {
             s_serviceRing[write % kServiceRingSize] = record;
             releaseBarrier();
             s_serviceWrite = write + 1;
+            const uint32_t core = OSGetCoreId();
+            if (core < 3) ++s_pushesByCore[core];
+            const bool logForeign = core == 1 && !s_foreignPushLogged;
+            if (logForeign) s_foreignPushLogged = true;
+            wut_OSUninterruptibleSpinLock_Release(&s_pushLock);
+            if (logForeign)
+                port_log("SMS Wii U: [prod] service push from core 1 (type %u); the ring is locked for two writers\n",
+                         unsigned(record.type));
             return true;
         }
+        wut_OSUninterruptibleSpinLock_Release(&s_pushLock);
         if (!mustSucceed) {
             add(&s_totals.serviceFailures, 1);
             if (!s_serviceFailureLogged) {
@@ -214,6 +273,7 @@ static bool pushService(const ServiceRecord& record, bool mustSucceed) {
         }
         /* A wait on core 1 drains this queue while its barrier is pending. */
         if (s_stopRequested) return false;
+        checkPark();
         wut_OSSleepTicks(62156250 / 20000); // about 50 us
     }
 }
@@ -228,11 +288,13 @@ static void consumeThrough(uint32_t target) {
 #if defined(PORT_GAME_SMG)
         smg_wprof_note_consume();
 #endif
+        checkPark();
         s_hooks.consume(s_byteRing + offset, bytes);
         read += bytes;
         releaseBarrier();
         s_byteRead = read;
     }
+    checkPark();
 }
 
 static void drainWorker() {
@@ -270,8 +332,10 @@ static void drainWorker() {
              * Do not parse the next frame until core 1 has replayed the
              * operation and performed its resource rotation. */
             if (kind == WAIT_END_FRAME) {
-                while (!reached(s_serviceDone, request) && !s_stopRequested)
+                while (!reached(s_serviceDone, request) && !s_stopRequested) {
+                    checkPark();
                     wut_OSSleepTicks(62156250 / 20000);
+                }
             }
         }
         add(&s_totals.workerBusyMicros, microsSince(busyStart));
@@ -294,8 +358,16 @@ static int workerMain(int, const char**) {
     sms_wiiu_profiler_worker_start();
     for (;;) {
         WutMessage message = {nullptr, {0, 0, 0}};
-        if (!wut_OSReceiveMessage(&s_wakeQueue, &message, kMessageBlock))
-            continue;
+        if (s_idleHook) s_idleHook();   // close the open display list before sleeping
+        __sync_synchronize();
+        s_workerIdle = true;
+        __sync_synchronize();
+        checkPark();
+        const BOOL got = wut_OSReceiveMessage(&s_wakeQueue, &message, kMessageBlock);
+        s_workerIdle = false;
+        __sync_synchronize();
+        if (!got) continue;
+        checkPark();
         if (!message.message || s_stopRequested) break;
         drainWorker();
     }
@@ -317,6 +389,28 @@ static Counters delta(const Counters& now, const Counters& before) {
 }
 
 } // namespace
+
+bool waitJpaFinalVxReady(const SmsWiiuJpaFinalVxDesc* descriptor) {
+    if (!descriptor) return false;
+    // No DCInvalidateRange: CPU caches are coherent between cores, and an
+    // invalidate can discard core 1's dirty writes to a neighbouring descriptor.
+#if defined(PORT_GAME_SMG)
+    const OSTime start = OSGetTime();
+    static bool s_loggedSlowWait;
+    while (descriptor->ready != 1u) {
+        if (!s_loggedSlowWait && OSTicksToMilliseconds(OSGetTime() - start) > 100) {
+            s_loggedSlowWait = true;
+            port_log("SMS Wii U: [jpaasync] worker waiting >100 ms for a final-vx payload\n");
+        }
+        wut_OSYieldThread();
+    }
+    __sync_synchronize();
+    sms_wiiu_jpa_async_worker_wait(static_cast<unsigned>(OSTicksToMicroseconds(OSGetTime() - start)));
+#else
+    __sync_synchronize();
+#endif
+    return true;
+}
 
 bool start(const Hooks& hooks, bool core2) {
     if (s_started) return true;
@@ -345,6 +439,7 @@ bool start(const Hooks& hooks, bool core2) {
     s_requestFn = nullptr;
     s_requestArg = nullptr;
     s_stopRequested = 0;
+    s_parkRequest = s_parkAck = 0;
     s_wokenAt = 0;
     s_appendFailureLogged = s_serviceFailureLogged = false;
     s_wrongServiceCoreLogged = false;
@@ -462,8 +557,75 @@ void drawown_report(uint32_t frame) {
 }
 
 void set_flush_hook(void (*fn)()) { s_flushHook = fn; }
+void set_park_hook(void (*fn)()) { s_parkHook = fn; }
+void set_idle_hook(void (*fn)()) { s_idleHook = fn; }
+uint32_t park_idle_acks() { return s_parkIdleAcks; }
 
 static void serviceImpl(bool allowNested);
+
+/* Where the worker is when a park times out: its saved context (valid while
+ * it is blocked, stale if it is running) and the saved LRs up its stack.  A
+ * real HOME press on 3.1 test 2f timed out 3 of 3 times while homesim never
+ * did; this names the wait.  Offsets: OSThread starts with OSContext; gpr[1]
+ * at 0x0C, lr 0x8C, srr0 0x98. */
+static void logWorkerContext() {
+    const uint8_t* t = reinterpret_cast<const uint8_t*>(&s_worker);
+    const uint32_t sp = *reinterpret_cast<const uint32_t*>(t + 0x0C);
+    const uint32_t lr = *reinterpret_cast<const uint32_t*>(t + 0x8C);
+    const uint32_t pc = *reinterpret_cast<const uint32_t*>(t + 0x98);
+    const uint32_t lo = uint32_t(uintptr_t(s_workerStack));
+    const uint32_t hi = lo + uint32_t(sizeof s_workerStack);
+    uint32_t chain[8] = {};
+    uint32_t n = 0;
+    for (uint32_t frame = sp; n < 8 && frame >= lo && frame + 8 <= hi && !(frame & 3);) {
+        const uint32_t back = *reinterpret_cast<const uint32_t*>(uintptr_t(frame));
+        if (back <= frame || back + 8 > hi) break;
+        chain[n++] = *reinterpret_cast<const uint32_t*>(uintptr_t(back + 4));
+        frame = back;
+    }
+    port_log("SMS Wii U: [home] worker context pc=%08X lr=%08X sp=%08X chain %08X %08X %08X %08X %08X %08X %08X %08X\n",
+             pc, lr, sp, chain[0], chain[1], chain[2], chain[3], chain[4], chain[5], chain[6], chain[7]);
+}
+
+/* Called from the HOME release callback on core 1 while the GPU is still the
+ * app's (ProcUI runs the priority-255 callback before WHBGfx's 100 on a HOME
+ * press).  The worker may be blocked on work only core 1 submits (a display
+ * list fence), so core 1 keeps servicing the ring while it waits; it never
+ * waits on a barrier (test 2c froze doing that). */
+bool request_park(uint32_t timeoutMicros) {
+    if (!s_started) return true;
+    const uint32_t req = s_parkRequest + 1;
+    s_parkRequestTick = OSGetTime();
+    s_parkAckTick = 0;
+    releaseBarrier();
+    s_parkRequest = req;
+    wakeWorker();
+    const OSTime startTime = OSGetTime();
+    while (s_parkAck != req) {
+        if (s_workerIdle) {
+            acquireBarrier();
+            s_parkAckTick = OSGetTime();
+            s_parkAck = req;
+            ++s_parkIdleAcks;
+            break;
+        }
+        if (microsSince(startTime) >= timeoutMicros) {
+            logWorkerContext();
+            return false;
+        }
+        if (OSGetCoreId() == 1) serviceImpl(false);
+        wut_OSSleepTicks(62156250 / 20000); // about 50 us
+    }
+    acquireBarrier();
+    return true;
+}
+
+uint32_t park_ack_micros() {
+    const OSTime req = s_parkRequestTick, ack = s_parkAckTick;
+    if (!req || !ack || ack < req) return ~0u;
+    return uint32_t(OSTicksToMicroseconds(ack - req));
+}
+
 void waitPending(uint32_t kind);
 
 bool append(const uint8_t* bytes, uint32_t size) {
@@ -687,6 +849,14 @@ bool enqueueService(ServiceFn fn, void* arg) {
     return true;
 }
 
+bool tryEnqueueService(ServiceFn fn, void* arg) {
+    if (!s_started || !fn) return false;
+    ServiceRecord record = {SERVICE_CALLBACK, 0, nullptr, 0, fn, arg};
+    if (!pushService(record, false)) return false;
+    add(&s_totals.segments, 1);
+    return true;
+}
+
 void publish_token(uint16_t token) {
     if (s_started && s_hooks.publish_token) s_hooks.publish_token(token);
 }
@@ -710,9 +880,16 @@ static void serviceImpl(bool allowNested) {
     const OSTime startTime = OSGetTime();
     uint32_t serviced = 0;
     for (;;) {
+        /* Acquire AFTER loading the producer's write index and BEFORE the
+         * record: pushService fills the slot, syncs, then publishes
+         * s_serviceWrite.  With the barrier before the index load (as it was)
+         * the record copy could see a half-filled slot -- a SERVICE_CALLBACK
+         * with fn 0: ISI at PC 0 in serviceImpl on core 1 (Honeyhive
+         * 2026-11-20, under the workerprof sampler's timing). */
         const uint32_t read = s_serviceRead;
+        const uint32_t write = s_serviceWrite;
         acquireBarrier();
-        if (read == s_serviceWrite) break;
+        if (read == write) break;
         const ServiceRecord record = s_serviceRing[read % kServiceRingSize];
         if (record.type != SERVICE_BARRIER) {
             releaseBarrier();
@@ -747,6 +924,11 @@ static void serviceImpl(bool allowNested) {
     }
     if (outer) s_inService = false;
     if (serviced) add(&s_totals.core1ReplayMicros, microsSince(startTime));
+}
+
+bool drained() {
+    acquireBarrier();
+    return s_byteRead == s_byteWrite && s_workerHandled == s_requestId;
 }
 
 void service() {
@@ -811,6 +993,9 @@ void note_frame(uint32_t frame) {
              d.waitMicros[WAIT_END_FRAME], d.workerBusyMicros, d.core1ReplayMicros,
              now.queueHighWaterBytes, d.segments, d.listsCalled,
              d.appendFailures, d.serviceFailures);
+    if (frame % 600 == 0)
+        port_log("SMS Wii U: [prod] service pushes core0=%u core1=%u core2=%u\n", unsigned(s_pushesByCore[0]),
+                 unsigned(s_pushesByCore[1]), unsigned(s_pushesByCore[2]));
     s_lastLog = now;
     s_lastLogFrame = frame;
     drawown_report(frame);

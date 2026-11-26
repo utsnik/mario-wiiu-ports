@@ -21,8 +21,6 @@
   X(VIGetCurrentFrameBuffer) \
   X(VIGetNextFrameBuffer) \
   X(VIEnableDimming) \
-  X(VIGetDimmingCount) \
-  X(SCGetSoundMode) \
   X(SCGetProgressiveMode) \
   X(SCGetEuRgb60Mode) \
   X(RFLSearchOfficialData) \

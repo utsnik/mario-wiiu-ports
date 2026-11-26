@@ -440,9 +440,9 @@ int resample(Decoder& d, const Voice& v, int32_t* out, int n)
 	return k;
 }
 
-// `shift` is the volume's fixed point: 14 for mixChannels sends (JAudio caps
-// them at MAX_MIXERLEVEL = gain x 16384), 15 for the auto mixer
-// (volume x 32767.5). Both measured against retail (PROTOCOL.md, Levels).
+// `shift` is the volume's fixed point. Sunshine uses Q14 mixChannels sends
+// and Q15 auto-mixer/master levels; Galaxy's microcode uses Q16 sends and
+// auto-mixer volume, with a Q12 master level.
 void mix_slot(int32_t* bus, const int32_t* src, int n, int32_t cur, int32_t tgt, int shift)
 {
 	if (cur == 0 && tgt == 0)
@@ -510,17 +510,27 @@ void render_voice(int vi, int n)
 			v.amVolTarget = (uint16_t)tgt;
 			v.done = tgt == 0;
 		}
-		// Sunshine's early Zelda DSP uses a Q16 auto-mixer reverb factor.
-		// Normalising its high byte to 127 doubled the wet send (and made
-		// short footsteps leave an unusually prominent ringing tail).
 		double pan = (v.amPan >> 8) / 127.0, fx = v.amFx / 65536.0;
 		double gl = cos(pan * M_PI / 2), gr = sin(pan * M_PI / 2);
 		int32_t lc = (int32_t)(cur * gl), lt = (int32_t)(tgt * gl);
 		int32_t rc = (int32_t)(cur * gr), rt = (int32_t)(tgt * gr);
+#if defined(PORT_GAME_SMG)
+		// Galaxy's auto-mixer volume is Q16, and its effect factor is a Q15
+		// multiplier applied after the dry sine-pan mix.
+		fx = v.amFx / 32768.0;
+		mix_slot(g.bus[1], src, n, lc, lt, 16);
+		mix_slot(g.bus[2], src, n, rc, rt, 16);
+		mix_slot(g.bus[5], src, n, (int32_t)(lc * fx), (int32_t)(lt * fx), 16);
+		mix_slot(g.bus[6], src, n, (int32_t)(rc * fx), (int32_t)(rt * fx), 16);
+#else
+		// Sunshine's early Zelda DSP uses a Q16 auto-mixer reverb factor.
+		// Normalising its high byte to 127 doubled the wet send (and made
+		// short footsteps leave an unusually prominent ringing tail).
 		mix_slot(g.bus[1], src, n, lc, lt, 15);
 		mix_slot(g.bus[2], src, n, rc, rt, 15);
 		mix_slot(g.bus[5], src, n, (int32_t)(lc * fx), (int32_t)(lt * fx), 15);
 		mix_slot(g.bus[6], src, n, (int32_t)(rc * fx), (int32_t)(rt * fx), 15);
+#endif
 		v.amVolCurrent = (uint16_t)tgt;
 	} else {
 		bool released = true;
@@ -683,9 +693,19 @@ extern "C" void port_dspmix_setup(uint32_t nvoices, void* voices, const uint32_t
 	const char* e = getenv("SMS_AUDIO_FX");
 	g.fxOff       = e && strcmp(e, "0") == 0;
 	e             = getenv("SMS_AUDIO_MASTER_SHIFT");
-	g.masterShift = e && *e ? atoi(e) : 15;
+	g.masterShift = e && *e ? atoi(e) :
+#if defined(PORT_GAME_SMG)
+		12;
+#else
+		15;
+#endif
 	e             = getenv("SMS_AUDIO_SLOT_SHIFT");
-	g.slotShift   = e && *e ? atoi(e) : 14;
+	g.slotShift   = e && *e ? atoi(e) :
+#if defined(PORT_GAME_SMG)
+		16;
+#else
+		14;
+#endif
 	e             = getenv("SMS_AUDIO_TRACE");
 	g.trace       = e && *e && strcmp(e, "0") != 0;
 }

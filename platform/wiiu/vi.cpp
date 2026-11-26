@@ -1,4 +1,5 @@
 #include <sysapp/launch.h>
+#include <coreinit/memdefaultheap.h>
 #include "runtime.h"
 extern "C" uint32_t sms_port_heap_fallbacks(void);
 extern "C" uint32_t sms_port_heap_fallback_bytes(void);
@@ -26,6 +27,7 @@ extern "C" {
 void sms_wiiu_gfx_frame(void);
 uint32_t sms_wiiu_vsync_fields(void);
 void sms_wiiu_gx2_renderer_exit_quiesce(void);
+void sms_wiiu_gx2_renderer_home_sim(void);
 int sms_wiiu_gfx_is_initialized(void);
 void sms_wiiu_exit(void);
 void sms_wiiu_dump_threads(void);
@@ -203,6 +205,9 @@ void sms_wiiu_frame_boundary(void)
 		             (unsigned long long)GX2GetRetiredTimeStamp());
 #endif
 	}
+#if defined(PORT_GAME_SMG)
+	sms_wiiu_gx2_renderer_home_sim();  /* SD marker homesim only */
+#endif
 	/* WHBProcIsRunning owns the sole ProcUI pump after SMS_main starts. */
 	if (!WHBProcIsRunning()) {
 		s_exit_logged = true;

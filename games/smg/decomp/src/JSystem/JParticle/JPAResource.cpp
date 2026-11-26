@@ -11,12 +11,14 @@
 #include "JSystem/JParticle/JPAKeyBlock.hpp"
 #include "JSystem/JParticle/JPAParticle.hpp"
 #include "JSystem/JParticle/JPAResourceManager.hpp"
+#define SMG_WIIU_JPA_ASYNC_JOB_TYPES 1
 #include "JPADirectionalBatch.hpp"
 #include <revolution/mtx.h>
 #include <cstring>
 #if defined(TARGET_WIIU)
 #include "wiiu/jpa_counters.h"
 #include "wiiu/jpa_final_vertex.h"
+#include "wiiu/jpa_async.h"
 extern "C" int sms_wiiu_sd_marker(const char*);
 extern "C" const char* sms_wiiu_stage_path(void);
 extern "C" void port_log(const char*, ...);
@@ -25,11 +27,14 @@ extern "C" void GXGetVtxAttrFmt(GXVtxFmt, GXAttr, GXCompCnt*, GXCompType*, u8*);
 extern "C" int sms_wiiu_jpa_finalvx_enabled(void);
 extern "C" int sms_wiiu_jpa_finalvx_check_enabled(void);
 extern "C" int sms_wiiu_jpa_finalvx_billboard_enabled(void);
+extern "C" int sms_wiiu_jpa_async_enabled(void);
 extern "C" int sms_wiiu_jpa_finalvx_native_quads(void);
+extern "C" int sms_wiiu_jpa_prj_enabled(void);
 extern "C" void* sms_wiiu_jpa_finalvx_alloc(uint32_t bytes, uint32_t alignment, uint32_t* slotOut);
 extern "C" unsigned sms_wiiu_jpa_finalvx_alloc_failure_reason(void);
 extern "C" bool sms_wiiu_jpa_finalvx_begin_check(const SmsWiiuJpaFinalVxDesc* desc);
 extern "C" bool sms_wiiu_jpa_finalvx_submit(const SmsWiiuJpaFinalVxDesc* desc);
+extern "C" void sms_wiiu_jpa_finalvx_slot_pending(uint32_t slot);
 #endif
 
 #if defined(TARGET_WIIU)
@@ -90,11 +95,26 @@ bool sameDirectionKey(const DirectionKey& a, const DirectionKey& b) {
     return !(a.flags & DirectionKeyAge) || a.age == b.age;
 }
 
+// Default on (SD marker nojpacbdir opts out): a draws-nothing callback (SMG's
+// MultiEmitterParticleCallBack family only overrides execute()) no longer keeps
+// child particles or plain/cross Direction shapes off the batch path. Gusty
+// Garden: ~810 such child particles per frame were drawn one by one; 50.1 ->
+// 57.7 fps, the other galaxies within noise (11-20 sweep).
+bool jpaCallbackDirectionalMarker() {
+    static int marker = -1;
+    if (marker < 0) {
+        marker = sms_wiiu_sd_marker("nojpacbdir") == 0;
+        if (!marker) port_log("nojpacbdir: draws-nothing callbacks batch only rotated directional parents\n");
+    }
+    return marker != 0;
+}
+
 bool directionalCallbackAllowed(JPAEmitterWorkData* work, JPAResource::ParticleFunc* funcs,
                                 int funcCount, int shapeType, bool child) {
-    return work->mpEmtr->mpPtclCallBack == NULL ||
-        (!child && shapeType == 3 && funcCount > 0 && funcs[0] == &JPADrawRotDirection &&
-         jpa_batch::callbackDrawsNothing(work->mpEmtr->mpPtclCallBack));
+    if (work->mpEmtr->mpPtclCallBack == NULL) return true;
+    if (!jpa_batch::callbackDrawsNothing(work->mpEmtr->mpPtclCallBack)) return false;
+    if (jpaCallbackDirectionalMarker()) return true;
+    return !child && shapeType == 3 && funcCount > 0 && funcs[0] == &JPADrawRotDirection;
 }
 
 void countDirectionalParticle(JPAEmitterWorkData* work, JPABaseParticle* particle, int shapeType,
@@ -105,7 +125,8 @@ void countDirectionalParticle(JPAEmitterWorkData* work, JPABaseParticle* particl
         sms_wiiu_jpa_reject_type();
     } else if (!directionalCallbackAllowed(work, funcs, funcCount, shapeType, child)) {
         sms_wiiu_jpa_reject_callback();
-    } else if (work->mPrjType != 0) {
+    } else if (work->mPrjType != 0 &&
+               (work->mPrjType < 1 || work->mPrjType > 2 || !sms_wiiu_jpa_prj_enabled())) {
         sms_wiiu_jpa_reject_prj();
         sms_wiiu_jpa_reject_reason(SMS_WIIU_JPA_REJECT_PROJECTION);
     } else if (!jpa_batch::eligible(work, particle)) {
@@ -393,7 +414,8 @@ void countBillboardParticle(JPAEmitterWorkData* work, JPABaseParticle* particle,
         sms_wiiu_jpa_reject_type();
     } else if (!billboardCallbackAllowed(work, child)) {
         sms_wiiu_jpa_reject_callback();
-    } else if (work->mPrjType != 0) {
+    } else if (work->mPrjType != 0 &&
+               (work->mPrjType < 1 || work->mPrjType > 2 || !sms_wiiu_jpa_prj_enabled())) {
         sms_wiiu_jpa_reject_prj();
         sms_wiiu_jpa_reject_reason(SMS_WIIU_JPA_REJECT_PROJECTION);
     } else {
@@ -410,6 +432,15 @@ void countBillboardParticle(JPAEmitterWorkData* work, JPABaseParticle* particle,
 bool batchMarker() {
     static int marker = -1;
     if (marker < 0) marker = sms_wiiu_sd_marker("nojpabatch") == 0;
+    return marker != 0;
+}
+
+// The per-particle [jpa]/split/histogram counters cost about 7% of core-1
+// particle draw time (Honeyhive, 11-20 profile): collect them only with the
+// jpastats or jpadiag SD marker.
+bool jpaStatsMarker() {
+    static int marker = -1;
+    if (marker < 0) marker = (sms_wiiu_sd_marker("jpastats") != 0 || jpadiagMarker()) ? 1 : 0;
     return marker != 0;
 }
 
@@ -434,7 +465,9 @@ bool jpaNoEmitMarker() {
 
 bool canBatchDirectional(JPAEmitterWorkData* work, JPAResource::ParticleFunc* funcs, int funcCount,
                          int shapeType, bool child) {
-    return batchMarker() && (shapeType == 3 || shapeType == 4) && work->mPrjType == 0 &&
+    const bool projected = work->mPrjType == 1 || work->mPrjType == 2;
+    return batchMarker() && (shapeType == 3 || shapeType == 4) &&
+        (work->mPrjType == 0 || (projected && sms_wiiu_jpa_prj_enabled())) &&
         directionalCallbackAllowed(work, funcs, funcCount, shapeType, child) && funcCount > 0 &&
         (funcs[0] == &JPADrawDirection || funcs[0] == &JPADrawRotDirection);
 }
@@ -455,7 +488,9 @@ bool canBatchDirectionalRaster(JPAEmitterWorkData* work, JPAResource::ParticleFu
 bool canBatchBillboard(JPAEmitterWorkData* work, JPAResource::ParticleFunc* funcs, int funcCount,
                        int shapeType, bool child, BillboardBatchMode* mode) {
     BillboardRejectReason rejectReason;
-    return batchMarker() && shapeType == 2 && work->mPrjType == 0 && funcCount > 0 &&
+    const bool projected = work->mPrjType == 1 || work->mPrjType == 2;
+    return batchMarker() && shapeType == 2 &&
+        (work->mPrjType == 0 || (projected && sms_wiiu_jpa_prj_enabled())) && funcCount > 0 &&
         (funcs[0] == &JPADrawBillboard || funcs[0] == &JPADrawRotBillboard) &&
         billboardCallbackAllowed(work, child) &&
         billboardBatchMode(work, funcs, funcCount, mode, &rejectReason);
@@ -478,6 +513,7 @@ const char* jpaDrawFuncName(JPAResource::ParticleFunc func) {
 
 void noteParticle(JPAEmitterWorkData* work, JPABaseParticle* particle, int shapeType,
                   bool child, JPAResource::ParticleFunc* funcs, int funcCount) {
+    if (!jpaStatsMarker()) return;
     sms_wiiu_jpa_particle();
     const bool directionalFunc = funcCount > 0 &&
         (funcs[0] == &JPADrawDirection || funcs[0] == &JPADrawRotDirection);
@@ -494,7 +530,7 @@ struct DirectionTracker {
     DirectionTracker() : have(false) { }
     void observe(JPAEmitterWorkData* work, JPABaseParticle* particle, bool directional, bool ageMatters,
                  JPAResource::ParticleFunc* funcs, int funcCount) {
-        if (!directional || !jpa_batch::eligible(work, particle)) return;
+        if (!directional || !jpaStatsMarker() || !jpa_batch::eligible(work, particle)) return;
         const DirectionKey key = directionKey(particle, funcs, funcCount, ageMatters);
         if (have && !sameDirectionKey(previous, key)) sms_wiiu_jpa_split();
         previous = key;
@@ -1291,7 +1327,59 @@ static void setBillboardBatchTev(JPAEmitterWorkData* work, const BillboardBatchM
 static void restoreBillboardBatchTev(JPAEmitterWorkData* work, const BillboardBatchMode& mode,
                                      GXTexMapID texMap);
 
+static bool finalVxProjected(JPAEmitterWorkData* work) {
+    return work != NULL && (work->mPrjType == 1 || work->mPrjType == 2) &&
+           sms_wiiu_jpa_prj_enabled();
+}
+
+// Read-only counterpart of JPABaseShape's loadPrj/loadPrjAnm.  The normal GX
+// path loads this matrix into TEXMTX0; final-vx keeps the same 3x4 result in
+// the producer-owned STQ payload instead.
+static void finalVxProjectionMatrix(JPAEmitterWorkData* work, const Mtx srt, Mtx out) {
+    if (work->mPrjType == 1) {
+        PSMTXConcat(work->mPrjMtx, srt, out);
+        return;
+    }
+    JPABaseShape* const shape = work->mpRes->getBsp();
+    const f32 age = work->mpEmtr->getAge();
+    const f32 tilingS = 0.5f * (1.0f + shape->getTilingS());
+    const f32 tilingT = 0.5f * (1.0f + shape->getTilingT());
+    const f32 transX = age * shape->getIncTransX() + shape->getInitTransX();
+    const f32 transY = age * shape->getIncTransY() + shape->getInitTransY();
+    const f32 scaleX = age * shape->getIncScaleX() + shape->getInitScaleX();
+    const f32 scaleY = age * shape->getIncScaleY() + shape->getInitScaleY();
+    const s32 rotation = age * shape->getIncRot() + shape->getInitRot();
+    const f32 sinRot = JMASSin(rotation);
+    const f32 cosRot = JMASCos(rotation);
+    Mtx animated;
+    animated[0][0] = scaleX * cosRot;
+    animated[0][1] = -scaleX * sinRot;
+    animated[0][2] = tilingS + scaleX * (sinRot * (tilingT + transY) - cosRot * (tilingS + transX));
+    animated[0][3] = 0.0f;
+    animated[1][0] = scaleY * sinRot;
+    animated[1][1] = scaleY * cosRot;
+    animated[1][2] = tilingT - scaleY * (sinRot * (tilingS + transX) + cosRot * (tilingT + transY));
+    animated[1][3] = 0.0f;
+    animated[2][0] = 0.0f;
+    animated[2][1] = 0.0f;
+    animated[2][2] = 1.0f;
+    animated[2][3] = 0.0f;
+    Mtx combined;
+    PSMTXConcat(animated, work->mPrjMtx, combined);
+    PSMTXConcat(combined, srt, out);
+}
+
+static void finalVxPackVertex(uint8_t* dst, uint32_t packedFmt, bool projected,
+                              const float pos[3], const uint8_t* clr0, const uint8_t* clr1,
+                              const float tex[3]) {
+    if (projected)
+        sms_wiiu_jpa_finalvx_pack_stq(dst, packedFmt, pos, clr0, clr1, tex);
+    else
+        sms_wiiu_jpa_finalvx_pack(dst, packedFmt, pos, clr0, clr1, tex);
+}
+
 static bool finalVxVatForRun(const BillboardBatchMode* rasterMode,
+                             bool projected,
                              uint32_t* packedFmt, uint32_t* stride,
                              uint8_t* texFrac, unsigned* colorCount,
                              unsigned* fallbackReason) {
@@ -1310,8 +1398,12 @@ static bool finalVxVatForRun(const BillboardBatchMode* rasterMode,
     GXGetVtxAttrFmt(GX_VTXFMT0, GX_VA_TEX0, &texCnt, &texType, &texFraction);
     GXGetVtxAttrFmt(GX_VTXFMT0, GX_VA_CLR0, &clrCnt[0], &clrType[0], &clrFrac[0]);
     GXGetVtxAttrFmt(GX_VTXFMT0, GX_VA_CLR1, &clrCnt[1], &clrType[1], &clrFrac[1]);
-    if (posDesc != GX_DIRECT || posCnt != GX_POS_XYZ || posType != GX_F32 || posFrac != 0 ||
-        texDesc != GX_INDEX8 || texCnt != GX_TEX_ST || texType != GX_S8 || texFraction >= 31) return false;
+    if (posDesc != GX_DIRECT || posCnt != GX_POS_XYZ || posType != GX_F32 || posFrac != 0) return false;
+    if (projected) {
+        if (texDesc != GX_DIRECT || texCnt != GX_TEX_STQ || texType != GX_F32 || texFraction != 0) return false;
+    } else if (texDesc != GX_INDEX8 || texCnt != GX_TEX_ST || texType != GX_S8 || texFraction >= 31) {
+        return false;
+    }
 
     const GXAttr forbidden[] = {
         GX_VA_PNMTXIDX, GX_VA_TEX0MTXIDX, GX_VA_TEX1MTXIDX, GX_VA_TEX2MTXIDX,
@@ -1352,11 +1444,221 @@ static bool finalVxVatForRun(const BillboardBatchMode* rasterMode,
     }
     *colorCount = count;
     *texFrac = texFraction;
-    *packedFmt = SMS_WIIU_JPA_FINALVX_TEX0 |
+    *packedFmt = (projected ? SMS_WIIU_JPA_FINALVX_TEX0_STQ : SMS_WIIU_JPA_FINALVX_TEX0) |
         (count >= 1 ? SMS_WIIU_JPA_FINALVX_CLR0 : 0u) |
         (count >= 2 ? SMS_WIIU_JPA_FINALVX_CLR1 : 0u);
     *stride = sms_wiiu_jpa_finalvx_stride(*packedFmt);
     return *stride != 0;
+}
+
+static SmsWiiuJpaFinalVxDesc* allocFinalVxPayload(unsigned particleCapacity,
+                                                   unsigned quadCount, uint32_t packedFmt,
+                                                   uint32_t stride, bool nativeQuads) {
+    const uint32_t vertexCount = particleCapacity * quadCount * 4u;
+    const uint32_t indexCount = particleCapacity * quadCount * (nativeQuads ? 4u : 6u);
+    const uint32_t vertexBytes = vertexCount * stride;
+    const uint32_t indexBytes = indexCount * sizeof(uint32_t);
+    uint32_t slot = 0;
+    SmsWiiuJpaFinalVxDesc* desc = static_cast<SmsWiiuJpaFinalVxDesc*>(
+        sms_wiiu_jpa_finalvx_alloc(sizeof(SmsWiiuJpaFinalVxDesc), 32, &slot));
+    if (!desc) return NULL;
+    const uint32_t descriptorSlot = slot;
+    uint8_t* vertices = static_cast<uint8_t*>(
+        sms_wiiu_jpa_finalvx_alloc(vertexBytes, 32, &slot));
+    if (!vertices || slot != descriptorSlot) return NULL;
+    uint32_t* indices = static_cast<uint32_t*>(
+        sms_wiiu_jpa_finalvx_alloc(indexBytes, 256, &slot));
+    if (!indices || slot != descriptorSlot) return NULL;
+    memset(desc, 0, sizeof(*desc));
+    desc->vertices = vertices;
+    desc->indices = indices;
+    desc->vertexCount = vertexCount;
+    desc->indexCount = indexCount;
+    desc->particleCount = particleCapacity;
+    desc->vertexStride = stride;
+    desc->packedFmt = packedFmt;
+    desc->primitiveClass = nativeQuads ? SMS_WIIU_JPA_FINALVX_PRIM_QUADS : SMS_WIIU_JPA_FINALVX_PRIM_TRIS;
+    static uint32_t nextRunId = 1;
+    desc->runId = nextRunId++;
+    if (desc->runId == 0) desc->runId = nextRunId++;
+    desc->vertexBytes = vertexBytes;
+    desc->indexBytes = indexBytes;
+    desc->slot = slot;
+    desc->ready = SMS_WIIU_JPA_FINALVX_PENDING;
+    return desc;
+}
+
+static bool asyncMode(const smg_jpa_async::Job* job, BillboardBatchMode& out) {
+    if (!job) return false;
+    out.prmRgb = job->billboard.prmRgb != 0;
+    out.envRgb = job->billboard.envRgb != 0;
+    out.alpha = job->billboard.alpha != 0;
+    out.envAlpha = job->billboard.envAlpha != 0;
+    out.alphaAnimated = job->billboard.alphaAnimated != 0;
+    out.alphaFromParticlePrm = job->billboard.alphaFromParticlePrm != 0;
+    out.rasterColorPrm = job->billboard.rasterColorPrm != 0;
+    out.rasterColorEnv = job->billboard.rasterColorEnv != 0;
+    out.rasterColorAlphaPrm = job->billboard.rasterColorAlphaPrm != 0;
+    out.rasterColorAlphaEnv = job->billboard.rasterColorAlphaEnv != 0;
+    out.rasterAlphaPrm = job->billboard.rasterAlphaPrm != 0;
+    out.rasterAlphaEnv = job->billboard.rasterAlphaEnv != 0;
+    out.twoColor = job->billboard.twoColor != 0;
+    out.textureAnimated = job->billboard.textureAnimated != 0;
+    return true;
+}
+
+static void fillAsyncBillboard(smg_jpa_async::Job* job) {
+    BillboardBatchMode mode;
+    if (!asyncMode(job, mode)) return;
+    JPAEmitterWorkData* work = &job->work;
+    SmsWiiuJpaFinalVxDesc* desc = job->descriptor;
+    const bool projected = job->projected;
+    const uint32_t packedFmt = desc->packedFmt;
+    const uint32_t stride = desc->vertexStride;
+    const uint8_t texFrac = static_cast<uint8_t>(job->texFraction);
+    const unsigned colorCount = job->colorCount;
+    const bool nativeQuads = job->nativeQuads;
+    static const uint8_t texTemplate[4] = {0, 1, 2, 3};
+    unsigned particleIndex = 0;
+    for (JPANode< JPABaseParticle >* scan = job->first; scan != job->end;
+         scan = job->reverse ? scan->getPrev() : scan->getNext()) {
+        JPABaseParticle* particle = scan->getObject();
+        if (particle->checkStatus(8)) continue;
+        work->mpCurNode = scan;
+        Mtx matrix;
+        billboardMatrix(work, particle, job->rotated, matrix);
+        Mtx projectionMatrix;
+        if (projected) finalVxProjectionMatrix(work, matrix, projectionMatrix);
+        uint8_t clr0[4] = {}, clr1[4] = {};
+        const uint8_t* color0 = NULL;
+        const uint8_t* color1 = NULL;
+        if (colorCount == 2) {
+            const GXColor prm = billboardPrmColor(work, particle);
+            const GXColor env = billboardEnvColor(work, particle);
+            clr0[0] = prm.r; clr0[1] = prm.g; clr0[2] = prm.b; clr0[3] = prm.a;
+            clr1[0] = env.r; clr1[1] = env.g; clr1[2] = env.b; clr1[3] = env.a;
+            color0 = clr0; color1 = clr1;
+        } else if (colorCount == 1) {
+            const GXColor color = billboardColor(work, particle, mode);
+            clr0[0] = color.r; clr0[1] = color.g; clr0[2] = color.b; clr0[3] = color.a;
+            color0 = clr0;
+        }
+        for (unsigned corner = 0; corner < 4; ++corner) {
+            float tex[3] = {};
+            if (projected) {
+                const jpa_batch::Vertex stq = jpa_batch::transform(
+                    projectionMatrix, job->templateXYZ + corner * 3);
+                tex[0] = stq.x; tex[1] = stq.y; tex[2] = stq.z;
+            } else {
+                sms_wiiu_jpa_finalvx_resolve_s8(static_cast<const uint8_t*>(job->texArray), 2,
+                                                texTemplate[corner], texFrac, tex);
+            }
+            const jpa_batch::Vertex vertex =
+                jpa_batch::transform(matrix, job->templateXYZ + corner * 3);
+            const float pos[3] = {vertex.x, vertex.y, vertex.z};
+            finalVxPackVertex(const_cast<uint8_t*>(desc->vertices) +
+                                  (particleIndex * 4u + corner) * stride,
+                              packedFmt, projected, pos, color0, color1, tex);
+        }
+        uint32_t local[6] = {};
+        const uint32_t localCount = sms_wiiu_jpa_finalvx_quad_indices(nativeQuads, 1, local);
+        const uint32_t vertexBase = particleIndex * 4u;
+        const uint32_t indexBase = particleIndex * localCount;
+        for (uint32_t i = 0; i < localCount; ++i)
+            const_cast<uint32_t*>(desc->indices)[indexBase + i] = local[i] + vertexBase;
+        ++particleIndex;
+    }
+    desc->particleCount = particleIndex;
+    desc->vertexCount = particleIndex * 4u;
+    desc->indexCount = particleIndex * (nativeQuads ? 4u : 6u);
+    desc->vertexBytes = desc->vertexCount * stride;
+    desc->indexBytes = desc->indexCount * sizeof(uint32_t);
+    sms_wiiu_jpa_finalvx_run(desc->particleCount, desc->vertexCount,
+                             desc->vertexBytes + desc->indexBytes);
+}
+
+static void fillAsyncDirectional(smg_jpa_async::Job* job) {
+    BillboardBatchMode mode;
+    if (!asyncMode(job, mode)) return;
+    JPAEmitterWorkData* work = &job->work;
+    SmsWiiuJpaFinalVxDesc* desc = job->descriptor;
+    const bool projected = job->projected;
+    const uint32_t packedFmt = desc->packedFmt;
+    const uint32_t stride = desc->vertexStride;
+    const uint8_t texFrac = static_cast<uint8_t>(job->texFraction);
+    const unsigned colorCount = job->colorCount;
+    const bool nativeQuads = job->nativeQuads;
+    const unsigned quadCount = job->shapeType == 4 ? 2u : 1u;
+    static const uint8_t texTemplate[2][4] = {{0, 1, 2, 3}, {0, 1, 2, 3}};
+    unsigned output = 0;
+    JPANode< JPABaseParticle >* emit = job->first;
+    for (unsigned particleIndex = 0; particleIndex < job->particleCount; ++particleIndex) {
+        work->mpCurNode = emit;
+        JPABaseParticle* particle = emit->getObject();
+        const auto savedAxis = particle->mBaseAxis;
+        Mtx lastMatrix;
+        jpa_batch::Vertex corners[4];
+        jpa_batch::materialize(work, particle, job->templateXYZ, corners, lastMatrix, job->rotated);
+        Mtx projectionMatrix;
+        if (projected) finalVxProjectionMatrix(work, lastMatrix, projectionMatrix);
+        for (unsigned quad = 0; quad < quadCount; ++quad) {
+            const signed char* xyz = job->templateXYZ + (quad ? 0x48 * 3 : 0);
+            for (unsigned corner = 0; corner < 4; ++corner) {
+                float tex[3] = {};
+                if (projected) {
+                    const jpa_batch::Vertex stq = jpa_batch::transform(projectionMatrix, xyz + corner * 3);
+                    tex[0] = stq.x; tex[1] = stq.y; tex[2] = stq.z;
+                } else {
+                    sms_wiiu_jpa_finalvx_resolve_s8(static_cast<const uint8_t*>(job->texArray), 2,
+                                                    texTemplate[quad][corner], texFrac, tex);
+                }
+                uint8_t clr0[4] = {}, clr1[4] = {};
+                const uint8_t* c0 = NULL;
+                const uint8_t* c1 = NULL;
+                if (colorCount == 2) {
+                    const GXColor prm = billboardPrmColor(work, particle);
+                    const GXColor env = billboardEnvColor(work, particle);
+                    clr0[0] = prm.r; clr0[1] = prm.g; clr0[2] = prm.b; clr0[3] = prm.a;
+                    clr1[0] = env.r; clr1[1] = env.g; clr1[2] = env.b; clr1[3] = env.a;
+                    c0 = clr0; c1 = clr1;
+                } else if (colorCount == 1) {
+                    const GXColor color = billboardColor(work, particle, mode);
+                    clr0[0] = color.r; clr0[1] = color.g; clr0[2] = color.b; clr0[3] = color.a;
+                    c0 = clr0;
+                }
+                const jpa_batch::Vertex vertex = quad == 0
+                    ? corners[corner]
+                    : jpa_batch::transform(lastMatrix, xyz + corner * 3);
+                const float pos[3] = {vertex.x, vertex.y, vertex.z};
+                finalVxPackVertex(const_cast<uint8_t*>(desc->vertices) +
+                                      ((output * quadCount + quad) * 4u + corner) * stride,
+                                  packedFmt, projected, pos, c0, c1, tex);
+            }
+        }
+        uint32_t local[12] = {};
+        const uint32_t localCount = sms_wiiu_jpa_finalvx_quad_indices(nativeQuads, quadCount, local);
+        const uint32_t indexBase = output * localCount;
+        const uint32_t vertexBase = output * quadCount * 4u;
+        for (uint32_t i = 0; i < localCount; ++i)
+            const_cast<uint32_t*>(desc->indices)[indexBase + i] = local[i] + vertexBase;
+        if (sms_wiiu_jpa_finalvx_check_enabled()) particle->mBaseAxis = savedAxis;
+        ++output;
+        emit = job->reverse ? emit->getPrev() : emit->getNext();
+    }
+    desc->particleCount = output;
+    desc->vertexCount = output * quadCount * 4u;
+    desc->indexCount = output * quadCount * (nativeQuads ? 4u : 6u);
+    desc->vertexBytes = desc->vertexCount * stride;
+    desc->indexBytes = desc->indexCount * sizeof(uint32_t);
+    sms_wiiu_jpa_finalvx_run(desc->particleCount, desc->vertexCount,
+                             desc->vertexBytes + desc->indexBytes);
+}
+
+static void fillAsyncFinalVx(smg_jpa_async::Job* job) {
+    if (job->runKind == smg_jpa_async::RunBillboard)
+        fillAsyncBillboard(job);
+    else
+        fillAsyncDirectional(job);
 }
 
 static SmsWiiuJpaFinalVxDesc* finalVxPayloadForRun(
@@ -1364,10 +1666,11 @@ static SmsWiiuJpaFinalVxDesc* finalVxPayloadForRun(
     unsigned runLength, bool reverse, int shapeType, bool rotated,
     const signed char* template_xyz, const void* tex_array,
     const BillboardBatchMode* rasterMode) {
+    const bool projected = finalVxProjected(work);
     uint32_t packedFmt = 0, stride = 0;
     uint8_t texFrac = 0;
     unsigned colorCount = 0, reason = SMS_WIIU_JPA_FINALVX_FALLBACK_VAT;
-    if (!finalVxVatForRun(rasterMode, &packedFmt, &stride, &texFrac, &colorCount, &reason)) {
+    if (!finalVxVatForRun(rasterMode, projected, &packedFmt, &stride, &texFrac, &colorCount, &reason)) {
         sms_wiiu_jpa_finalvx_fallback(reason);
         return NULL;
     }
@@ -1426,10 +1729,16 @@ static SmsWiiuJpaFinalVxDesc* finalVxPayloadForRun(
         const auto savedAxis = axisParticle->mBaseAxis;
         jpa_batch::Vertex corners[4];
         jpa_batch::materialize(work, emit->getObject(), xyz_template[0], corners, lastMatrix, rotated);
+        Mtx projectionMatrix;
+        if (projected) finalVxProjectionMatrix(work, lastMatrix, projectionMatrix);
         for (unsigned corner = 0; corner < 4; ++corner) {
-            float tex[2];
-            if (!sms_wiiu_jpa_finalvx_resolve_s8(static_cast<const uint8_t*>(tex_array), 2,
-                                                 tex_template[0][corner], texFrac, tex)) {
+            float tex[3] = {};
+            if (projected) {
+                const jpa_batch::Vertex stq = jpa_batch::transform(
+                    projectionMatrix, xyz_template[0] + corner * 3);
+                tex[0] = stq.x; tex[1] = stq.y; tex[2] = stq.z;
+            } else if (!sms_wiiu_jpa_finalvx_resolve_s8(static_cast<const uint8_t*>(tex_array), 2,
+                                                         tex_template[0][corner], texFrac, tex)) {
                 sms_wiiu_jpa_finalvx_fallback(SMS_WIIU_JPA_FINALVX_FALLBACK_VAT);
                 return NULL;
             }
@@ -1448,14 +1757,18 @@ static SmsWiiuJpaFinalVxDesc* finalVxPayloadForRun(
                 c0 = clr0;
             }
             const float pos[3] = {corners[corner].x, corners[corner].y, corners[corner].z};
-            sms_wiiu_jpa_finalvx_pack(vertices + (particleIndex * quadCount * 4u + corner) * stride,
-                                      packedFmt, pos, c0, c1, tex);
+            finalVxPackVertex(vertices + (particleIndex * quadCount * 4u + corner) * stride,
+                              packedFmt, projected, pos, c0, c1, tex);
         }
         if (shapeType == 4) {
             for (unsigned corner = 0; corner < 4; ++corner) {
-                float tex[2];
-                if (!sms_wiiu_jpa_finalvx_resolve_s8(static_cast<const uint8_t*>(tex_array), 2,
-                                                     tex_template[1][corner], texFrac, tex)) {
+                float tex[3] = {};
+                if (projected) {
+                    const jpa_batch::Vertex stq = jpa_batch::transform(
+                        projectionMatrix, xyz_template[1] + corner * 3);
+                    tex[0] = stq.x; tex[1] = stq.y; tex[2] = stq.z;
+                } else if (!sms_wiiu_jpa_finalvx_resolve_s8(static_cast<const uint8_t*>(tex_array), 2,
+                                                             tex_template[1][corner], texFrac, tex)) {
                     sms_wiiu_jpa_finalvx_fallback(SMS_WIIU_JPA_FINALVX_FALLBACK_VAT);
                     return NULL;
                 }
@@ -1475,8 +1788,8 @@ static SmsWiiuJpaFinalVxDesc* finalVxPayloadForRun(
                 }
                 corners[corner] = jpa_batch::transform(lastMatrix, xyz_template[1] + corner * 3);
                 const float pos[3] = {corners[corner].x, corners[corner].y, corners[corner].z};
-                sms_wiiu_jpa_finalvx_pack(vertices + (particleIndex * quadCount * 4u + 4u + corner) * stride,
-                                          packedFmt, pos, c0, c1, tex);
+                finalVxPackVertex(vertices + (particleIndex * quadCount * 4u + 4u + corner) * stride,
+                                  packedFmt, projected, pos, c0, c1, tex);
             }
         }
         uint32_t local[12] = {};
@@ -1496,10 +1809,11 @@ static SmsWiiuJpaFinalVxDesc* finalVxBillboardPayloadForRun(
     JPANode< JPABaseParticle >* runEnd, unsigned visible, bool reverse,
     bool rotated, const signed char* template_xyz, const void* tex_array,
     const BillboardBatchMode* mode) {
+    const bool projected = finalVxProjected(work);
     uint32_t packedFmt = 0, stride = 0;
     uint8_t texFrac = 0;
     unsigned colorCount = 0, reason = SMS_WIIU_JPA_FINALVX_FALLBACK_VAT;
-    if (!finalVxVatForRun(mode, &packedFmt, &stride, &texFrac, &colorCount, &reason)) {
+    if (!finalVxVatForRun(mode, projected, &packedFmt, &stride, &texFrac, &colorCount, &reason)) {
         sms_wiiu_jpa_finalvx_fallback(reason);
         return NULL;
     }
@@ -1558,6 +1872,8 @@ static SmsWiiuJpaFinalVxDesc* finalVxBillboardPayloadForRun(
         work->mpCurNode = scan;
         Mtx matrix;
         billboardMatrix(work, particle, rotated, matrix);
+        Mtx projectionMatrix;
+        if (projected) finalVxProjectionMatrix(work, matrix, projectionMatrix);
         uint8_t clr0[4] = {}, clr1[4] = {};
         const uint8_t* color0 = NULL;
         const uint8_t* color1 = NULL;
@@ -1574,17 +1890,21 @@ static SmsWiiuJpaFinalVxDesc* finalVxBillboardPayloadForRun(
             color0 = clr0;
         }
         for (unsigned corner = 0; corner < 4; ++corner) {
-            float tex[2];
-            if (!sms_wiiu_jpa_finalvx_resolve_s8(static_cast<const uint8_t*>(tex_array), 2,
-                                                 texTemplate[corner], texFrac, tex)) {
+            float tex[3] = {};
+            if (projected) {
+                const jpa_batch::Vertex stq = jpa_batch::transform(
+                    projectionMatrix, template_xyz + corner * 3);
+                tex[0] = stq.x; tex[1] = stq.y; tex[2] = stq.z;
+            } else if (!sms_wiiu_jpa_finalvx_resolve_s8(static_cast<const uint8_t*>(tex_array), 2,
+                                                         texTemplate[corner], texFrac, tex)) {
                 sms_wiiu_jpa_finalvx_fallback(SMS_WIIU_JPA_FINALVX_FALLBACK_VAT);
                 return NULL;
             }
             const jpa_batch::Vertex vertex =
                 jpa_batch::transform(matrix, template_xyz + corner * 3);
             const float pos[3] = {vertex.x, vertex.y, vertex.z};
-            sms_wiiu_jpa_finalvx_pack(vertices + (particleIndex * 4u + corner) * stride,
-                                      packedFmt, pos, color0, color1, tex);
+            finalVxPackVertex(vertices + (particleIndex * 4u + corner) * stride,
+                              packedFmt, projected, pos, color0, color1, tex);
         }
         uint32_t local[6] = {};
         const uint32_t localCount = sms_wiiu_jpa_finalvx_quad_indices(nativeQuads, 1, local);
@@ -1598,6 +1918,119 @@ static SmsWiiuJpaFinalVxDesc* finalVxBillboardPayloadForRun(
     return desc;
 }
 
+static void copyAsyncMode(smg_jpa_async::BillboardMode& out, const BillboardBatchMode& mode) {
+    out.prmRgb = mode.prmRgb;
+    out.envRgb = mode.envRgb;
+    out.alpha = mode.alpha;
+    out.envAlpha = mode.envAlpha;
+    out.alphaAnimated = mode.alphaAnimated;
+    out.alphaFromParticlePrm = mode.alphaFromParticlePrm;
+    out.rasterColorPrm = mode.rasterColorPrm;
+    out.rasterColorEnv = mode.rasterColorEnv;
+    out.rasterColorAlphaPrm = mode.rasterColorAlphaPrm;
+    out.rasterColorAlphaEnv = mode.rasterColorAlphaEnv;
+    out.rasterAlphaPrm = mode.rasterAlphaPrm;
+    out.rasterAlphaEnv = mode.rasterAlphaEnv;
+    out.twoColor = mode.twoColor;
+    out.textureAnimated = mode.textureAnimated;
+}
+
+static SmsWiiuJpaFinalVxDesc* finalVxAsyncDirectionalPayloadForRun(
+    JPAEmitterWorkData* work, JPANode< JPABaseParticle >* first,
+    unsigned runLength, bool reverse, int shapeType, bool rotated,
+    const signed char* template_xyz, const void* tex_array,
+    const BillboardBatchMode* rasterMode) {
+    const bool projected = finalVxProjected(work);
+    uint32_t packedFmt = 0, stride = 0;
+    uint8_t texFrac = 0;
+    unsigned colorCount = 0, reason = SMS_WIIU_JPA_FINALVX_FALLBACK_VAT;
+    if (!finalVxVatForRun(rasterMode, projected, &packedFmt, &stride, &texFrac, &colorCount, &reason)) {
+        sms_wiiu_jpa_finalvx_fallback(reason);
+        return NULL;
+    }
+    if (!template_xyz || !tex_array) {
+        sms_wiiu_jpa_finalvx_fallback(SMS_WIIU_JPA_FINALVX_FALLBACK_VAT);
+        return NULL;
+    }
+    const bool nativeQuads = sms_wiiu_jpa_finalvx_native_quads() != 0;
+    const unsigned quadCount = shapeType == 4 ? 2u : 1u;
+    SmsWiiuJpaFinalVxDesc* desc = allocFinalVxPayload(runLength, quadCount, packedFmt, stride, nativeQuads);
+    if (!desc) {
+        sms_wiiu_jpa_async_fallback(SMS_WIIU_JPA_ASYNC_FALLBACK_SLOT_BUSY);
+        return NULL;
+    }
+    JPANode< JPABaseParticle >* runEnd = first;
+    for (unsigned i = 0; i < runLength; ++i)
+        runEnd = reverse ? runEnd->getPrev() : runEnd->getNext();
+    smg_jpa_async::Job job = {};
+    job.work = *work;
+    job.first = first;
+    job.end = runEnd;
+    job.descriptor = desc;
+    job.fill = &fillAsyncFinalVx;
+    job.templateXYZ = template_xyz;
+    job.texArray = tex_array;
+    job.runKind = smg_jpa_async::RunDirectional;
+    job.shapeType = static_cast<uint32_t>(shapeType);
+    job.particleCount = runLength;
+    job.texFraction = texFrac;
+    job.colorCount = colorCount;
+    copyAsyncMode(job.billboard, rasterMode ? *rasterMode : BillboardBatchMode());
+    job.reverse = reverse;
+    job.rotated = rotated;
+    job.nativeQuads = nativeQuads;
+    job.projected = projected;
+    if (!sms_wiiu_jpa_async_enqueue(job)) return NULL;
+    sms_wiiu_jpa_finalvx_slot_pending(desc->slot);
+    return desc;
+}
+
+static SmsWiiuJpaFinalVxDesc* finalVxAsyncBillboardPayloadForRun(
+    JPAEmitterWorkData* work, JPANode< JPABaseParticle >* first,
+    JPANode< JPABaseParticle >* runEnd, unsigned runLength, bool reverse,
+    bool rotated, const signed char* template_xyz, const void* tex_array,
+    const BillboardBatchMode* mode) {
+    const bool projected = finalVxProjected(work);
+    uint32_t packedFmt = 0, stride = 0;
+    uint8_t texFrac = 0;
+    unsigned colorCount = 0, reason = SMS_WIIU_JPA_FINALVX_FALLBACK_VAT;
+    if (!finalVxVatForRun(mode, projected, &packedFmt, &stride, &texFrac, &colorCount, &reason)) {
+        sms_wiiu_jpa_finalvx_fallback(reason);
+        return NULL;
+    }
+    if (!template_xyz || !tex_array || !mode) {
+        sms_wiiu_jpa_finalvx_fallback(SMS_WIIU_JPA_FINALVX_FALLBACK_VAT);
+        return NULL;
+    }
+    const bool nativeQuads = sms_wiiu_jpa_finalvx_native_quads() != 0;
+    SmsWiiuJpaFinalVxDesc* desc = allocFinalVxPayload(runLength, 1, packedFmt, stride, nativeQuads);
+    if (!desc) {
+        sms_wiiu_jpa_async_fallback(SMS_WIIU_JPA_ASYNC_FALLBACK_SLOT_BUSY);
+        return NULL;
+    }
+    smg_jpa_async::Job job = {};
+    job.work = *work;
+    job.first = first;
+    job.end = runEnd;
+    job.descriptor = desc;
+    job.fill = &fillAsyncFinalVx;
+    job.templateXYZ = template_xyz;
+    job.texArray = tex_array;
+    job.runKind = smg_jpa_async::RunBillboard;
+    job.shapeType = 2;
+    job.particleCount = runLength;
+    job.texFraction = texFrac;
+    job.colorCount = colorCount;
+    copyAsyncMode(job.billboard, *mode);
+    job.reverse = reverse;
+    job.rotated = rotated;
+    job.nativeQuads = nativeQuads;
+    job.projected = projected;
+    if (!sms_wiiu_jpa_async_enqueue(job)) return NULL;
+    sms_wiiu_jpa_finalvx_slot_pending(desc->slot);
+    return desc;
+}
+
 static void drawDirectionalList(JPAEmitterWorkData* work, JPAResource::ParticleFunc* funcs,
                                 int funcCount, bool reverse, bool ageMatters,
                                 int shapeType, bool child,
@@ -1608,7 +2041,8 @@ static void drawDirectionalList(JPAEmitterWorkData* work, JPAResource::ParticleF
     GXCompCnt savedPosCnt, savedTexCnt, savedClr0Cnt, savedClr1Cnt;
     GXCompType savedPosType, savedTexType, savedClr0Type, savedClr1Type;
     u8 savedPosFrac, savedTexFrac, savedClr0Frac, savedClr1Frac;
-    if (rasterMode != NULL) {
+    const bool projected = finalVxProjected(work);
+    if (rasterMode != NULL || projected) {
         GXGetVtxDesc(GX_VA_POS, &savedPosDesc);
         GXGetVtxDesc(GX_VA_TEX0, &savedTexDesc);
         GXGetVtxDesc(GX_VA_CLR0, &savedClr0Desc);
@@ -1667,7 +2101,27 @@ static void drawDirectionalList(JPAEmitterWorkData* work, JPAResource::ParticleF
             (rasterMode->rasterColorPrm || rasterMode->rasterColorEnv ||
              rasterMode->rasterColorAlphaPrm || rasterMode->rasterColorAlphaEnv ||
              rasterMode->rasterAlphaPrm || rasterMode->rasterAlphaEnv);
-        if (rasterMode != NULL) {
+        if (projected) {
+            // A directional run may follow a coloured particle run.  Its
+            // projected payload only emits colours when this run requests
+            // them, so leave no inherited colour descriptors in the VAT.
+            GXSetVtxDesc(GX_VA_CLR0, GX_NONE);
+            GXSetVtxDesc(GX_VA_CLR1, GX_NONE);
+            GXSetVtxDesc(GX_VA_TEX0, GX_DIRECT);
+            GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_TEX0, GX_TEX_STQ, GX_F32, 0);
+            GXSetTexCoordGen2(GX_TEXCOORD0, GX_TG_MTX3x4, GX_TG_TEX0,
+                              GX_IDENTITY, GX_FALSE, GX_PTIDENTITY);
+            if (rasterMode != NULL) {
+                if (rasterColor) {
+                    GXSetVtxDesc(GX_VA_CLR0, GX_DIRECT);
+                    GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_CLR0, GX_CLR_RGBA, GX_RGBA8, 0);
+                }
+                if (rasterMode->twoColor) {
+                    GXSetVtxDesc(GX_VA_CLR1, GX_DIRECT);
+                    GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_CLR1, GX_CLR_RGBA, GX_RGBA8, 0);
+                }
+            }
+        } else if (rasterMode != NULL) {
             GXSetVtxDesc(GX_VA_TEX0, GX_INDEX8);
             GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_TEX0, GX_TEX_ST, GX_S8, 0);
             if (rasterColor) {
@@ -1693,8 +2147,13 @@ static void drawDirectionalList(JPAEmitterWorkData* work, JPAResource::ParticleF
         bool finalSuppress = false;
         bool finalCheckRecord = false;
         if (!noEmit && sms_wiiu_jpa_finalvx_enabled()) {
-            finalDesc = finalVxPayloadForRun(work, node, runLength, reverse, shapeType, rotated,
-                                             template_xyz, tex_array, rasterMode);
+            if (sms_wiiu_jpa_async_enabled())
+                finalDesc = finalVxAsyncDirectionalPayloadForRun(work, node, runLength, reverse,
+                                                                  shapeType, rotated, template_xyz,
+                                                                  tex_array, rasterMode);
+            else
+                finalDesc = finalVxPayloadForRun(work, node, runLength, reverse, shapeType, rotated,
+                                                 template_xyz, tex_array, rasterMode);
             if (finalDesc) {
                 if (sms_wiiu_jpa_finalvx_check_enabled()) {
                     finalCheckRecord = sms_wiiu_jpa_finalvx_begin_check(finalDesc);
@@ -1718,6 +2177,8 @@ static void drawDirectionalList(JPAEmitterWorkData* work, JPAResource::ParticleF
             }
             jpa_batch::Vertex corners[4];
             jpa_batch::materialize(work, emit->getObject(), xyz_template[0], corners, lastMatrix, rotated);
+            Mtx projectionMatrix;
+            if (projected) finalVxProjectionMatrix(work, lastMatrix, projectionMatrix);
             for (unsigned corner = 0; corner < 4; ++corner) {
                 const unsigned scratchCorner = corner;
                 if (noEmit) {
@@ -1756,8 +2217,15 @@ static void drawDirectionalList(JPAEmitterWorkData* work, JPAResource::ParticleF
                         }
                     }
                 }
-                if (!noEmit)
-                    GXTexCoord1x8(tex_template[0][corner]);
+                if (!noEmit) {
+                    if (projected) {
+                        const jpa_batch::Vertex stq = jpa_batch::transform(
+                            projectionMatrix, xyz_template[0] + corner * 3);
+                        GXTexCoord3f32(stq.x, stq.y, stq.z);
+                    } else {
+                        GXTexCoord1x8(tex_template[0][corner]);
+                    }
+                }
             }
             if (shapeType == 4) {
                 for (unsigned corner = 0; corner < 4; ++corner) {
@@ -1799,8 +2267,15 @@ static void drawDirectionalList(JPAEmitterWorkData* work, JPAResource::ParticleF
                             }
                         }
                     }
-                    if (!noEmit)
-                        GXTexCoord1x8(tex_template[1][corner]);
+                    if (!noEmit) {
+                        if (projected) {
+                            const jpa_batch::Vertex stq = jpa_batch::transform(
+                                projectionMatrix, xyz_template[1] + corner * 3);
+                            GXTexCoord3f32(stq.x, stq.y, stq.z);
+                        } else {
+                            GXTexCoord1x8(tex_template[1][corner]);
+                        }
+                    }
                 }
             }
             if (noEmit)
@@ -1817,7 +2292,7 @@ static void drawDirectionalList(JPAEmitterWorkData* work, JPAResource::ParticleF
             !sms_wiiu_jpa_finalvx_submit(finalDesc))
             sms_wiiu_jpa_finalvx_fallback(SMS_WIIU_JPA_FINALVX_FALLBACK_RECORD_FULL);
         sms_wiiu_jpa_draw();
-        if (rasterMode != NULL) {
+        if (rasterMode != NULL || projected) {
             GXSetVtxDesc(GX_VA_POS, savedPosDesc);
             GXSetVtxDesc(GX_VA_TEX0, savedTexDesc);
             GXSetVtxDesc(GX_VA_CLR0, savedClr0Desc);
@@ -1828,9 +2303,14 @@ static void drawDirectionalList(JPAEmitterWorkData* work, JPAResource::ParticleF
             GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_CLR1, savedClr1Cnt, savedClr1Type, savedClr1Frac);
             GXSetArray(GX_VA_POS, pos_array, 3);
             GXSetArray(GX_VA_TEX0, tex_array, 2);
-            restoreBillboardBatchTev(work, *rasterMode, child ? GX_TEXMAP1 : GX_TEXMAP0);
-            // getEnd() is NULL: emit may have run off the list, so use the last particle drawn.
-            restoreBillboardParticleTev(work, lastEmitted->getObject(), funcs, funcCount);
+            if (rasterMode != NULL) {
+                restoreBillboardBatchTev(work, *rasterMode, child ? GX_TEXMAP1 : GX_TEXMAP0);
+                // getEnd() is NULL: emit may have run off the list, so use the last particle drawn.
+                restoreBillboardParticleTev(work, lastEmitted->getObject(), funcs, funcCount);
+            }
+            if (projected)
+                GXSetTexCoordGen2(GX_TEXCOORD0, GX_TG_MTX3x4, GX_TG_POS,
+                                  GX_TEXMTX0, GX_FALSE, GX_PTIDENTITY);
         } else {
             GXSetVtxDesc(GX_VA_POS, GX_INDEX8);
             GXSetVtxDesc(GX_VA_TEX0, GX_INDEX8);
@@ -2068,6 +2548,7 @@ static void drawBillboardList(JPAEmitterWorkData* work, JPAResource::ParticleFun
     GXCompCnt savedPosCnt, savedTexCnt, savedClr0Cnt, savedClr1Cnt;
     GXCompType savedPosType, savedTexType, savedClr0Type, savedClr1Type;
     u8 savedPosFrac, savedTexFrac, savedClr0Frac, savedClr1Frac;
+    const bool projected = finalVxProjected(work);
     GXGetVtxDesc(GX_VA_POS, &savedPosDesc);
     GXGetVtxDesc(GX_VA_TEX0, &savedTexDesc);
     GXGetVtxDesc(GX_VA_CLR0, &savedClr0Desc);
@@ -2081,6 +2562,7 @@ static void drawBillboardList(JPAEmitterWorkData* work, JPAResource::ParticleFun
     while (node != end) {
         Node* runEnd = node;
         const u8 texture = node->getObject()->mTexAnmIdx;
+        unsigned runLength = 0;
         unsigned visible = 0;
         JPABaseParticle* lastParticle = NULL;
         JPABaseParticle* lastVisibleParticle = NULL;
@@ -2089,6 +2571,7 @@ static void drawBillboardList(JPAEmitterWorkData* work, JPAResource::ParticleFun
             if (runEnd != node && mode.textureAnimated && particle->mTexAnmIdx != texture)
                 break;
             lastParticle = particle;
+            ++runLength;
             work->mpCurNode = runEnd;
             noteParticle(work, particle, 2, child, funcs, funcCount);
             if (!particle->checkStatus(8)) {
@@ -2107,7 +2590,20 @@ static void drawBillboardList(JPAEmitterWorkData* work, JPAResource::ParticleFun
             GXLoadPosMtxImm(identity, GX_PNMTX0);
             GXSetCurrentMtx(GX_PNMTX0);
             GXSetVtxDesc(GX_VA_POS, GX_DIRECT);
-            GXSetVtxDesc(GX_VA_TEX0, GX_INDEX8);
+            if (projected) {
+                // Do not inherit colour attributes from the previous JPA
+                // run: this run emits no colour bytes unless its mode asks
+                // for them below.
+                GXSetVtxDesc(GX_VA_CLR0, GX_NONE);
+                GXSetVtxDesc(GX_VA_CLR1, GX_NONE);
+                GXSetVtxDesc(GX_VA_TEX0, GX_DIRECT);
+                GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_TEX0, GX_TEX_STQ, GX_F32, 0);
+                GXSetTexCoordGen2(GX_TEXCOORD0, GX_TG_MTX3x4, GX_TG_TEX0,
+                                  GX_IDENTITY, GX_FALSE, GX_PTIDENTITY);
+            } else {
+                GXSetVtxDesc(GX_VA_TEX0, GX_INDEX8);
+                GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_TEX0, GX_TEX_ST, GX_S8, 0);
+            }
             if (mode.rasterColorPrm || mode.rasterColorEnv ||
                 mode.rasterColorAlphaPrm || mode.rasterColorAlphaEnv ||
                 mode.rasterAlphaPrm || mode.rasterAlphaEnv) {
@@ -2119,25 +2615,31 @@ static void drawBillboardList(JPAEmitterWorkData* work, JPAResource::ParticleFun
                 GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_CLR1, GX_CLR_RGBA, GX_RGBA8, 0);
             }
             GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_POS, GX_POS_XYZ, GX_F32, 0);
-            GXSetVtxAttrFmt(GX_VTXFMT0, GX_VA_TEX0, GX_TEX_ST, GX_S8, 0);
             setBillboardBatchTev(work, mode, texMap);
             const bool noEmit = jpaNoEmitMarker();
             SmsWiiuJpaFinalVxDesc* finalDesc = NULL;
             bool finalSuppress = false;
             bool finalCheckRecord = false;
-            if (!noEmit && sms_wiiu_jpa_finalvx_enabled() && sms_wiiu_jpa_finalvx_billboard_enabled()) {
-                finalDesc = finalVxBillboardPayloadForRun(
-                    work, node, runEnd, visible, reverse,
-                    funcs[0] == &JPADrawRotBillboard, template_xyz, tex_array, &mode);
-                if (finalDesc) {
-                    if (sms_wiiu_jpa_finalvx_check_enabled()) {
-                        finalCheckRecord = sms_wiiu_jpa_finalvx_begin_check(finalDesc);
-                        if (!finalCheckRecord)
-                            sms_wiiu_jpa_finalvx_fallback(SMS_WIIU_JPA_FINALVX_FALLBACK_RECORD_FULL);
-                    } else {
-                        finalSuppress = sms_wiiu_jpa_finalvx_submit(finalDesc);
-                        if (!finalSuppress)
-                            sms_wiiu_jpa_finalvx_fallback(SMS_WIIU_JPA_FINALVX_FALLBACK_RECORD_FULL);
+            if (!noEmit && sms_wiiu_jpa_finalvx_enabled()) {
+                if (sms_wiiu_jpa_finalvx_billboard_enabled()) {
+                    if (sms_wiiu_jpa_async_enabled())
+                        finalDesc = finalVxAsyncBillboardPayloadForRun(
+                            work, node, runEnd, runLength, reverse,
+                            funcs[0] == &JPADrawRotBillboard, template_xyz, tex_array, &mode);
+                    else
+                        finalDesc = finalVxBillboardPayloadForRun(
+                            work, node, runEnd, visible, reverse,
+                            funcs[0] == &JPADrawRotBillboard, template_xyz, tex_array, &mode);
+                    if (finalDesc) {
+                        if (sms_wiiu_jpa_finalvx_check_enabled()) {
+                            finalCheckRecord = sms_wiiu_jpa_finalvx_begin_check(finalDesc);
+                            if (!finalCheckRecord)
+                                sms_wiiu_jpa_finalvx_fallback(SMS_WIIU_JPA_FINALVX_FALLBACK_RECORD_FULL);
+                        } else {
+                            finalSuppress = sms_wiiu_jpa_finalvx_submit(finalDesc);
+                            if (!finalSuppress)
+                                sms_wiiu_jpa_finalvx_fallback(SMS_WIIU_JPA_FINALVX_FALLBACK_RECORD_FULL);
+                        }
                     }
                 }
             }
@@ -2154,6 +2656,8 @@ static void drawBillboardList(JPAEmitterWorkData* work, JPAResource::ParticleFun
                 }
                 Mtx matrix;
                 billboardMatrix(work, particle, funcs[0] == &JPADrawRotBillboard, matrix);
+                Mtx projectionMatrix;
+                if (projected) finalVxProjectionMatrix(work, matrix, projectionMatrix);
                 for (unsigned corner = 0; corner < 4; ++corner) {
                     const jpa_batch::Vertex vertex =
                         jpa_batch::transform(matrix, template_xyz + corner * 3);
@@ -2193,8 +2697,15 @@ static void drawBillboardList(JPAEmitterWorkData* work, JPAResource::ParticleFun
                             GXColor4u8(color.r, color.g, color.b, color.a);
                         }
                     }
-                    if (!noEmit)
-                        GXTexCoord1x8(corner);
+                    if (!noEmit) {
+                        if (projected) {
+                            const jpa_batch::Vertex stq = jpa_batch::transform(
+                                projectionMatrix, template_xyz + corner * 3);
+                            GXTexCoord3f32(stq.x, stq.y, stq.z);
+                        } else {
+                            GXTexCoord1x8(corner);
+                        }
+                    }
                 }
                 if (noEmit)
                     sJpaNoEmitScratch.count = 4;
@@ -2217,6 +2728,9 @@ static void drawBillboardList(JPAEmitterWorkData* work, JPAResource::ParticleFun
             GXSetArray(GX_VA_POS, pos_array, 3);
             GXSetArray(GX_VA_TEX0, tex_array, 2);
             restoreBillboardBatchTev(work, mode, texMap);
+            if (projected)
+                GXSetTexCoordGen2(GX_TEXCOORD0, GX_TG_MTX3x4, GX_TG_POS,
+                                  GX_TEXMTX0, GX_FALSE, GX_PTIDENTITY);
             if (lastVisibleParticle != NULL) {
                 Mtx matrix;
                 billboardMatrix(work, lastVisibleParticle, funcs[0] == &JPADrawRotBillboard, matrix);

@@ -24,12 +24,14 @@ ShadowVolumeOvalPole::ShadowVolumeOvalPole() : ShadowVolumeModel("\x89\x65\x95\x
     initVolumeModel("ShadowVolumeCylinder");
 }
 
-void ShadowVolumeOvalPole::loadModelDrawMtx() const {
+u32 ShadowVolumeOvalPole::calcModelDrawMtx(ShadowVolumeModelDrawMtx* pMtx, u32 max) const {
+    if (!pMtx || max == 0) return 0;
     ShadowController* controller = getController();
     MtxPtr dropMtx = controller->_18;
     TPos3f scaledMtx;
     TPos3f inverseMtx;
-    TPos3f mtx;
+    TPos3f& mtx = pMtx[0].mMtx;
+    pMtx[0].mIndex = GX_PNMTX0;
     TVec3f position;
     calcBaseDropPosition(&position);
     TVec3f direction;
@@ -80,7 +82,7 @@ void ShadowVolumeOvalPole::loadModelDrawMtx() const {
     mtx.setYDir(up);
     mtx.setZDir(front);
     PSMTXConcat(MR::getCameraViewMtx(), mtx, mtx);
-    GXLoadPosMtxImm(mtx, 0);
+    return 1;
 }
 
 void ShadowVolumeOvalPole::setSize(const TVec3f& rSize) {

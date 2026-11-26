@@ -39,10 +39,13 @@ void ShadowVolumeFlatModel::draw() const {
     }
 }
 
-void ShadowVolumeFlatModel::loadModelDrawMtx() const {
+u32 ShadowVolumeFlatModel::calcModelDrawMtx(ShadowVolumeModelDrawMtx* pMtx, u32 max) const {
+    if (!pMtx || max < 2) return 0;
     ShadowController* controller = getController();
-    TPos3f rootMtx;
-    TPos3f dropMtx;
+    TPos3f& rootMtx = pMtx[0].mMtx;
+    TPos3f& dropMtx = pMtx[1].mMtx;
+    pMtx[0].mIndex = mRootDrawMtxIndex;
+    pMtx[1].mIndex = mDropDrawMtxIndex;
     TVec3f displacement;
     controller->getDropDir(&displacement);
     displacement.scale(calcBaseDropLength());
@@ -52,14 +55,13 @@ void ShadowVolumeFlatModel::loadModelDrawMtx() const {
     }
 
     PSMTXConcat(MR::getCameraViewMtx(), rootMtx, rootMtx);
-    GXLoadPosMtxImm(rootMtx, mRootDrawMtxIndex);
     calcDropJoint(&dropMtx, displacement);
     if (controller->isFollowHostScale()) {
         MR::preScaleMtx(dropMtx, controller->getHost()->mScale);
     }
 
     PSMTXConcat(MR::getCameraViewMtx(), dropMtx, dropMtx);
-    GXLoadPosMtxImm(dropMtx, mDropDrawMtxIndex);
+    return 2;
 }
 
 void ShadowVolumeFlatModel::calcRootJoint(TPos3f* pMtx, const TVec3f& rDisplacement) const {

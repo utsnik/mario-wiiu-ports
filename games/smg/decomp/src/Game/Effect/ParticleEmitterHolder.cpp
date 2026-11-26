@@ -5,6 +5,9 @@
 
 #include <JSystem/JParticle/JPAEmitter.hpp>
 #include <algorithm>
+#if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
+#include "../../../../include/wiiu/jpa_async.h"
+#endif
 
 ParticleEmitterHolder::ParticleEmitterHolder(const EffectSystem* pEffectSystem, int numEmitters) : mEffectSystem(pEffectSystem) {
     mEmitters.init(numEmitters);
@@ -36,6 +39,9 @@ void ParticleEmitterHolder::update(bool param1) {
 }
 
 void ParticleEmitterHolder::forceDeleteAllOneTimeEmitters() {
+#if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
+    sms_wiiu_jpa_async_join();
+#endif
     for (ParticleEmitter* pEmitter = mEmitters.begin(); pEmitter != mEmitters.end(); pEmitter++) {
         if (pEmitter->mEmitter == nullptr) {
             continue;
@@ -50,6 +56,9 @@ void ParticleEmitterHolder::forceDeleteAllOneTimeEmitters() {
 }
 
 void ParticleEmitterHolder::forceDeleteAllEmitters() {
+#if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
+    sms_wiiu_jpa_async_join();
+#endif
     for (ParticleEmitter* pEmitter = mEmitters.begin(); pEmitter != mEmitters.end(); pEmitter++) {
         mEffectSystem->forceDeleteEmitter(pEmitter);
     }

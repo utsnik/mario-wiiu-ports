@@ -5,6 +5,10 @@
 #include "../gx/include/sms_gx/gx_pc.h"
 #include "runtime.h"
 #include "gx2_texture_pack.h"
+#include "gx2_producer_worker.h"
+#if defined(PORT_GAME_SMG)
+#include "../../games/smg/include/wiiu/jpa_async.h"
+#endif
 
 #include <dolphin/gx/GXCpu2Efb.h>
 #include <dolphin/gx/GXFrameBuffer.h>
@@ -105,8 +109,66 @@ bool s_frame_open;
 bool s_pipe5Presented;
 bool s_pipe5FrameEnded;
 bool s_pipe5Fallback;
+bool s_pipe5Rendered;
 uint64_t s_pipe5GameFrame;
 uint64_t s_pipe5PresentedGameFrame;
+
+#if defined(PORT_GAME_SMG)
+struct Pipe5OverlapDiag {
+	uint64_t queued, workerBoundaryDone, presentSubmitted, retired, owned, fallback, renderedFrames;
+	uint64_t fallbackScene, fallbackXfb, fallbackQueue, fallbackMissing, fallbackOther;
+	uint64_t duplicate, missing, outOfOrder, maxAgeUs, overlapUs;
+	uint64_t maxInFlightAgeUs, lastSubmitted, lastRetired;
+	uint32_t swaps, flips, presentCallers, arenaFenceWaits, arenaFenceTimeouts;
+	uint32_t dlRollover, deferredFreeHigh, efbCopyReuse, peekReuse, texinvWaits;
+};
+static Pipe5OverlapDiag s_pipe5OverlapDiag;
+static uint64_t s_pipe5OverlapQueuedAt;
+static uint64_t s_pipe5OverlapQueuedSequence;
+
+static void pipe5OverlapReport(void) {
+	const gx2prod::Counters p = gx2prod::counters();
+	port_log("[pipe5overlap] frame=%llu queued=%llu workerBoundaryDone=%llu presentSubmitted=%llu retired=%llu owned=%llu fallback=%llu fallbackScene=%llu fallbackXfb=%llu fallbackQueue=%llu fallbackMissing=%llu fallbackOther=%llu duplicate=%llu missing=%llu outOfOrder=%llu maxInFlightAgeUs=%llu overlapUs=%llu waitDrawDone=%u waitPresentDrain=%u waitEndFrame=%u serviceUs=%u workerBusyUs=%u replayUs=%u arenaFenceWaits=%u arenaFenceTimeouts=%u fenceSequence=%llu retiredSequence=%llu displayListRollover=%u deferredFreeHighWater=%u efbCopyReuse=%u peekSlotReuse=%u textureInvalidationWaits=%u appendFailures=%u serviceFailures=%u byteRingHighWater=%u serviceRingHighWater=0 gameFrames=%llu renderedFrames=%llu presents=%llu swaps=%u flips=%u presentCallers=%u bndFlush=0 bndWait=0 bndFields=0 gpuSubmitted=%llu gpuRetired=%llu drawCount=0 vertexCount=0\n",
+		(unsigned long long)s_pipe5GameFrame,
+		(unsigned long long)s_pipe5OverlapDiag.queued,
+		(unsigned long long)s_pipe5OverlapDiag.workerBoundaryDone,
+		(unsigned long long)s_pipe5OverlapDiag.presentSubmitted,
+		(unsigned long long)s_pipe5OverlapDiag.retired,
+		(unsigned long long)s_pipe5OverlapDiag.owned,
+		(unsigned long long)s_pipe5OverlapDiag.fallback,
+		(unsigned long long)s_pipe5OverlapDiag.fallbackScene,
+		(unsigned long long)s_pipe5OverlapDiag.fallbackXfb,
+		(unsigned long long)s_pipe5OverlapDiag.fallbackQueue,
+		(unsigned long long)s_pipe5OverlapDiag.fallbackMissing,
+		(unsigned long long)s_pipe5OverlapDiag.fallbackOther,
+		(unsigned long long)s_pipe5OverlapDiag.duplicate,
+		(unsigned long long)s_pipe5OverlapDiag.missing,
+		(unsigned long long)s_pipe5OverlapDiag.outOfOrder,
+		(unsigned long long)s_pipe5OverlapDiag.maxInFlightAgeUs,
+		(unsigned long long)s_pipe5OverlapDiag.overlapUs,
+		(unsigned)p.waitMicros[gx2prod::WAIT_DRAWDONE],
+		(unsigned)p.waitMicros[gx2prod::WAIT_PRESENT_DRAIN],
+		(unsigned)p.waitMicros[gx2prod::WAIT_END_FRAME],
+		(unsigned)p.core1ReplayMicros,
+		(unsigned)p.workerBusyMicros,
+		(unsigned)p.core1ReplayMicros,
+		s_pipe5OverlapDiag.arenaFenceWaits, s_pipe5OverlapDiag.arenaFenceTimeouts,
+		(unsigned long long)s_pipe5OverlapDiag.lastSubmitted,
+		(unsigned long long)s_pipe5OverlapDiag.lastRetired,
+		s_pipe5OverlapDiag.dlRollover, s_pipe5OverlapDiag.deferredFreeHigh,
+		s_pipe5OverlapDiag.efbCopyReuse, s_pipe5OverlapDiag.peekReuse,
+		s_pipe5OverlapDiag.texinvWaits, (unsigned)p.appendFailures,
+		(unsigned)p.serviceFailures, (unsigned)p.queueHighWaterBytes,
+		(unsigned long long)s_pipe5OverlapDiag.renderedFrames,
+		(unsigned long long)s_pipe5OverlapDiag.presentSubmitted,
+		s_pipe5OverlapDiag.swaps, s_pipe5OverlapDiag.flips,
+		s_pipe5OverlapDiag.presentCallers,
+		(unsigned long long)s_pipe5OverlapDiag.lastSubmitted,
+		(unsigned long long)GX2GetRetiredTimeStamp());
+}
+#else
+static void pipe5OverlapReport(void) {}
+#endif
 
 #if defined(PORT_GAME_SMG)
 alignas(64) uint8_t s_smg_fifo[64 * 1024];
@@ -138,6 +200,7 @@ extern "C" void sms_wiiu_d1_present_line(void);
 #if defined(PORT_GAME_SMG)
 extern "C" void sms_wiiu_gx2_renderer_foreground_release(void);
 extern "C" void sms_wiiu_gx2_renderer_foreground_acquire(void);
+extern "C" void sms_wiiu_gx2_log_allocations(const char* phase);
 #endif
 
 void log_active_once()
@@ -260,6 +323,9 @@ void drc_register_scan_buffer()
 	s_drc_registered = true;
 	port_log("[drc] DRC scan buffer registered: %p+%u mode=%d scale %ux%u\n", s_drc_scan,
 	         unsigned(bytes), int(mode), unsigned(tv->surface.width), unsigned(tv->surface.height));
+	#if defined(PORT_GAME_SMG)
+	sms_wiiu_gx2_log_allocations("scan-register");
+	#endif
 }
 
 void drc_setup(bool first)
@@ -588,6 +654,9 @@ extern "C" void sms_wiiu_gfx_init(void)
 		sms_wiiu_gx2_target_begin();
 		sms_wiiu_gx2_renderer_begin();
 		s_frame_open = true;
+	#if defined(PORT_GAME_SMG)
+		sms_wiiu_gx2_log_allocations("boot");
+	#endif
 	}
 }
 
@@ -599,6 +668,9 @@ extern "C" void sms_wiiu_vsync_pace_stop(void);
 
 extern "C" void sms_wiiu_exit(void)
 {
+	#if defined(PORT_GAME_SMG)
+	sms_wiiu_jpa_async_join();
+	#endif
 	/* Stop the audio pacer and close SDL audio before the foreground and AX
 	 * go away. */
 	/* Step logs: an exit to the Menu froze once (2026-10-19 21:49) with no
@@ -714,6 +786,12 @@ static void present_finish_pipelined(const char* caller)
 		GX2SwapScanBuffers();
 		uint32_t swaps = 0, flips = 0; OSTime lastFlip = 0, lastVsync = 0;
 		GX2GetSwapStatus(&swaps, &flips, &lastFlip, &lastVsync);
+		#if defined(PORT_GAME_SMG)
+		if (sms_wiiu_pipe5_overlap_enabled()) {
+			s_pipe5OverlapDiag.swaps = swaps;
+			s_pipe5OverlapDiag.flips = flips;
+		}
+		#endif
 		sms_wiiu_pipe5_trace(P5T_SWAP, swaps);
 	}
 	if (d5s) afterSwap = GX2GetLastSubmittedTimeStamp();
@@ -797,6 +875,34 @@ extern "C" void sms_wiiu_pipe5_service_present_complete(void)
 	#if !defined(PORT_GAME_SMG)
 	return;
 	#else
+	if (sms_wiiu_pipe5_overlap_enabled()) {
+		if (!s_pipe5FrameEnded || s_pipe5Presented ||
+		    s_pipe5PresentedGameFrame == s_pipe5GameFrame) {
+			++s_pipe5OverlapDiag.duplicate;
+			smg_gphase_note_pipe5_bad_frame();
+			sms_wiiu_pipe5_trace(P5T_HAZARD, 3);
+			return;
+		}
+		const uint64_t submitted = GX2GetLastSubmittedTimeStamp();
+		if (!submitted) {
+			++s_pipe5OverlapDiag.missing;
+			sms_wiiu_pipe5_overlap_fallback("timestamp");
+			s_pipe5Fallback = true;
+			return;
+		}
+		const uint64_t age = s_pipe5OverlapQueuedAt && wut_OSGetTime_stub() >= s_pipe5OverlapQueuedAt
+			? uint64_t(OSTicksToMicroseconds(wut_OSGetTime_stub() - s_pipe5OverlapQueuedAt)) : 0;
+		++s_pipe5OverlapDiag.presentSubmitted;
+		++s_pipe5OverlapDiag.owned;
+		s_pipe5OverlapDiag.lastSubmitted = submitted;
+		s_pipe5OverlapDiag.presentCallers++;
+		if (age > s_pipe5OverlapDiag.maxInFlightAgeUs)
+			s_pipe5OverlapDiag.maxInFlightAgeUs = age;
+		s_pipe5OverlapDiag.maxAgeUs = s_pipe5OverlapDiag.maxInFlightAgeUs;
+		s_pipe5Presented = true;
+		s_pipe5PresentedGameFrame = s_pipe5GameFrame;
+		return;
+	}
 	if (!sms_wiiu_pipe5_enabled() || !s_pipe5FrameEnded || s_pipe5Presented ||
 	    s_pipe5PresentedGameFrame == s_pipe5GameFrame) {
 		WHBLogPrintf("SMS Wii U: [pipe5] duplicate or out-of-order present completion");
@@ -806,6 +912,68 @@ extern "C" void sms_wiiu_pipe5_service_present_complete(void)
 	}
 	s_pipe5Presented = true;
 	s_pipe5PresentedGameFrame = s_pipe5GameFrame;
+	#endif
+}
+
+extern "C" void sms_wiiu_pipe5_overlap_queued(uint64_t sequence, int rendered)
+{
+	#if defined(PORT_GAME_SMG)
+	if (!sms_wiiu_pipe5_overlap_enabled()) return;
+	++s_pipe5OverlapDiag.queued;
+	s_pipe5OverlapQueuedSequence = sequence;
+	s_pipe5OverlapQueuedAt = wut_OSGetTime_stub();
+	(void)rendered;
+	#else
+	(void)sequence; (void)rendered;
+	#endif
+}
+
+extern "C" void sms_wiiu_pipe5_overlap_worker_boundary_done(uint64_t sequence)
+{
+	#if defined(PORT_GAME_SMG)
+	if (!sms_wiiu_pipe5_overlap_enabled()) return;
+	if (sequence != s_pipe5OverlapQueuedSequence) {
+		++s_pipe5OverlapDiag.outOfOrder;
+		return;
+	}
+	++s_pipe5OverlapDiag.workerBoundaryDone;
+	#else
+	(void)sequence;
+	#endif
+}
+
+extern "C" void sms_wiiu_pipe5_overlap_retired(uint64_t sequence)
+{
+	#if defined(PORT_GAME_SMG)
+	if (!sms_wiiu_pipe5_overlap_enabled()) return;
+	if (sequence != s_pipe5OverlapQueuedSequence) {
+		++s_pipe5OverlapDiag.outOfOrder;
+		return;
+	}
+	++s_pipe5OverlapDiag.retired;
+	s_pipe5OverlapDiag.lastRetired = GX2GetRetiredTimeStamp();
+	if (s_pipe5OverlapQueuedAt && wut_OSGetTime_stub() >= s_pipe5OverlapQueuedAt) {
+		const uint64_t overlap = uint64_t(OSTicksToMicroseconds(wut_OSGetTime_stub() - s_pipe5OverlapQueuedAt));
+		if (overlap > s_pipe5OverlapDiag.overlapUs)
+			s_pipe5OverlapDiag.overlapUs = overlap;
+	}
+	#else
+	(void)sequence;
+	#endif
+}
+
+extern "C" void sms_wiiu_pipe5_overlap_fallback(const char* reason)
+{
+	#if defined(PORT_GAME_SMG)
+	if (!sms_wiiu_pipe5_overlap_enabled()) return;
+	++s_pipe5OverlapDiag.fallback;
+	if (reason && std::strcmp(reason, "scene") == 0) ++s_pipe5OverlapDiag.fallbackScene;
+	else if (reason && std::strcmp(reason, "xfb") == 0) ++s_pipe5OverlapDiag.fallbackXfb;
+	else if (reason && std::strcmp(reason, "queue") == 0) ++s_pipe5OverlapDiag.fallbackQueue;
+	else if (reason && std::strcmp(reason, "missing-present") == 0) ++s_pipe5OverlapDiag.fallbackMissing;
+	else ++s_pipe5OverlapDiag.fallbackOther;
+	#else
+	(void)reason;
 	#endif
 }
 
@@ -830,10 +998,21 @@ extern "C" int sms_wiiu_pipe5_end_frame(int rendered, int bufferMode)
 	}
 	s_pipe5FrameEnded = true;
 	++s_pipe5GameFrame;
+	s_pipe5Rendered = rendered != 0;
 #if defined(PORT_GAME_SMG)
+	if (sms_wiiu_pipe5_overlap_enabled() && rendered)
+		++s_pipe5OverlapDiag.renderedFrames;
 	smg_gphase_note_pipe5_game_frame(rendered != 0);
 #endif
 	const int result = sms_wiiu_gx2_renderer_pipe5_end_frame(rendered, bufferMode);
+	if (sms_wiiu_pipe5_overlap_enabled()) {
+		if (result == SmsWiiuPipe5Fallback) {
+			s_pipe5Fallback = true;
+			sms_wiiu_pipe5_trace(P5T_FALLBACK, 1);
+		}
+		sms_wiiu_pipe5_trace(P5T_END_OUT, 0);
+		return result;
+	}
 	if (result == SmsWiiuPipe5Fallback || !sceneReady ||
 	    (result == SmsWiiuPipe5OverlapOwned &&
 	     (!s_pipe5Presented || s_pipe5PresentedGameFrame != s_pipe5GameFrame))) {
@@ -860,6 +1039,46 @@ extern "C" void sms_wiiu_pipe5_consume_frame(void)
 	if (!sms_wiiu_pipe5_enabled() || !s_pipe5FrameEnded || !s_gfx_initialized ||
 		!ProcUIInForeground() || !s_was_foreground)
 		return;
+	if (sms_wiiu_pipe5_overlap_enabled()) {
+		/* The worker's WAIT_END_FRAME handshake is the ownership transfer.  It
+		 * is serviced once here, before renderer_begin can claim the other
+		 * arena; no VI callback or gfx_frame path may consume this ticket. */
+		gx2prod::waitPending(gx2prod::kWaitEndFrame);
+		gx2prod::service();
+		const bool presented = s_pipe5Presented;
+		bool fallback = s_pipe5Fallback;
+		if (s_pipe5Rendered && !presented && !fallback) {
+			++s_pipe5OverlapDiag.missing;
+			sms_wiiu_pipe5_overlap_fallback("missing-present");
+			fallback = true;
+		}
+		const uint64_t sequence = s_pipe5GameFrame;
+		sms_wiiu_pipe5_trace(P5T_CONSUME, uint32_t(sequence));
+		s_pipe5FrameEnded = false;
+		s_pipe5Presented = false;
+		s_pipe5Fallback = false;
+		s_pipe5Rendered = false;
+		if (fallback) {
+			sms_wiiu_gx2_target_present();
+			if (SMS_WIIU_PIPELINED_PRESENT) present_finish_pipelined("fallback");
+			else WHBGfxFinishRender();
+		}
+		if (presented || fallback) {
+			const int64_t beginStart = wut_OSGetTime_stub();
+			if (SMS_WIIU_PIPELINED_PRESENT) present_begin_pipelined();
+			else WHBGfxBeginRender();
+			s_presentBegin += wut_OSGetTime_stub() - beginStart;
+		}
+		if (sequence % 30 == 0)
+			pipe5OverlapReport();
+		// Non-rendered tickets retire their renderer frame too.  Reopen it
+		// even though they have no swap to wait for, or the next draw is lost.
+		sms_wiiu_gx2_texture_pack_pump();
+		sms_wiiu_gx2_target_begin();
+		sms_wiiu_gx2_renderer_begin();
+		s_frame_open = true;
+		return;
+	}
 
 	const bool presented = s_pipe5Presented;
 	const bool fallback = s_pipe5Fallback;
@@ -1097,6 +1316,9 @@ extern "C" void sms_wiiu_gfx_frame(void)
 		sms_wiiu_gx2_target_begin();
 		sms_wiiu_gx2_renderer_begin();
 		s_frame_open = true;
+	#if defined(PORT_GAME_SMG)
+		sms_wiiu_gx2_log_allocations("acquire");
+	#endif
 	}
 	if (sms_wiiu_pipe5_enabled()) {
 		/* The game loop consumes the producer boundary.  VIFlush may pump it

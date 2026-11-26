@@ -28,6 +28,7 @@ extern "C" {
 int smg_wiiu_warp_pending(void);
 const char* smg_wiiu_warp_galaxy(void);
 int smg_wiiu_warp_scenario(void);
+int smg_wiiu_warp_start(void);
 void smg_wiiu_warp_consume(void);
 void port_log(const char*, ...);
 }
@@ -1066,12 +1067,19 @@ void StorySequenceExecutor::overwriteGalaxyNameAfterLoading(GalaxyMoveArgument* 
     }
 
 #if defined(PORT_GAME_SMG) && defined(TARGET_WIIU)
-    if (smg_wiiu_warp_pending() && MR::isEqualString(pMoveArgument->mStageName, "PeachCastleGardenGalaxy")) {
+    // A fresh file now starts at Gateway (HeavensDoorGalaxy) with the intro skipped, so the warp takes either start
+    // (2026-11-16: the Observatory warp never fired on alpha 2).
+    if (smg_wiiu_warp_pending() && (MR::isEqualString(pMoveArgument->mStageName, "PeachCastleGardenGalaxy") ||
+                                    MR::isEqualString(pMoveArgument->mStageName, "HeavensDoorGalaxy"))) {
         const char* galaxy = smg_wiiu_warp_galaxy();
         const ScenarioData* data = ScenarioDataFunction::getScenarioDataParser()->getScenarioData(galaxy);
         if (data != nullptr) {
             pMoveArgument->mStageName = data->mGalaxyName;
             pMoveArgument->mScenarioNo = smg_wiiu_warp_scenario();
+            if (smg_wiiu_warp_start() > 0)
+                pMoveArgument->mIDInfo = JMapIdInfo(smg_wiiu_warp_start(), 0);
+            port_log("[warp] applied stage=%s scenario=%d start=%d zone=%d", pMoveArgument->mStageName,
+                     (int)pMoveArgument->mScenarioNo, (int)pMoveArgument->mIDInfo._0, (int)pMoveArgument->mIDInfo.mZoneID);
             s_warp_demo_skip = true;
         } else {
             port_log("[warp] unknown galaxy");

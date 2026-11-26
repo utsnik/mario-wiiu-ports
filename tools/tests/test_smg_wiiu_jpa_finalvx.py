@@ -51,6 +51,14 @@ def source_contracts() -> None:
     assert draw.index("DCFlushRange") < draw.index("GX2DrawIndexedEx")
     assert "GX2Invalidate(GX2_INVALIDATE_MODE_ATTRIBUTE_BUFFER" in draw
     assert draw.index("gx2DlOpenForDraw") < draw.index("prepareDrawState")
+    assert draw.count("gx2DlOpenForDraw()") >= 2
+
+    compare_start = renderer.index("void jpaFinalVxSubmit")
+    compare = renderer[compare_start:renderer.index("extern \"C\" int sms_wiiu_jpa_finalvx_enabled", compare_start)]
+    for needle in ("SMS_WIIU_JPA_FINALVX_TEX0_STQ", "projected-format", "vertex-count",
+                   "index-count", "vertex-bytes", "index-bytes", "memcmp(s_batch.vertices",
+                   "memcmp(s_batch.indices"):
+        assert needle in compare
 
     for needle in ("runs=", "particles=", "vertices=", "bytes=", "fallback vat=",
                    "slot-full=", "slot-busy=", "record-full=", "dl-cache=", "check-split="):

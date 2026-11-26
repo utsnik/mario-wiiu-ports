@@ -22,6 +22,11 @@ void sms_wiiu_jpa_finalvx_fallback(unsigned reason);
 void sms_wiiu_jpa_finalvx_check_run(void);
 void sms_wiiu_jpa_finalvx_check_mismatch(const char* field);
 void sms_wiiu_jpa_finalvx_report(void);
+void sms_wiiu_jpa_async_job(unsigned particles);
+void sms_wiiu_jpa_async_helper_busy(unsigned micros);
+void sms_wiiu_jpa_async_worker_wait(unsigned micros);
+void sms_wiiu_jpa_async_fallback(unsigned reason);
+void sms_wiiu_jpa_async_report(void);
 #ifdef __cplusplus
 }
 
@@ -52,5 +57,14 @@ enum SmsWiiuJpaFinalVxFallbackReason {
 	SMS_WIIU_JPA_FINALVX_FALLBACK_WORKER_DLOPEN,
 	SMS_WIIU_JPA_FINALVX_FALLBACK_WORKER_DLPENDING,
 	SMS_WIIU_JPA_FINALVX_FALLBACK_REASON_COUNT,
+};
+
+enum SmsWiiuJpaAsyncFallbackReason {
+	SMS_WIIU_JPA_ASYNC_FALLBACK_HELPER_START = 0,
+	SMS_WIIU_JPA_ASYNC_FALLBACK_QUEUE_FULL,
+	SMS_WIIU_JPA_ASYNC_FALLBACK_PAYLOAD,
+	SMS_WIIU_JPA_ASYNC_FALLBACK_SLOT_BUSY,
+	SMS_WIIU_JPA_ASYNC_FALLBACK_CORE,
+	SMS_WIIU_JPA_ASYNC_FALLBACK_REASON_COUNT,
 };
 #endif

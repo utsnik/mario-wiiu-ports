@@ -449,11 +449,19 @@ bool start_async()
 	s_async.replyStarted = true;
 	s_async.active = true;
 	sms_wiiu_OSResumeThread(&s_async.replyThread);
+	/* Galaxy mixes on core 2 (AX's core) by default: on core 0 the mixer preempts
+	 * the gx2prod worker (Honeyhive A/B 2026-11-21: 52.97 vs 52.34 fps, 3+3 runs).
+	 * SD marker nomixcore2 keeps it on core 0.  Other games keep core 0. */
+#if defined(PORT_GAME_SMG)
+	const bool mixCore2 = sms_wiiu_sd_marker("nomixcore2") == 0;
+#else
+	const bool mixCore2 = false;
+#endif
 	if (!wut_OSCreateThread(&s_async.mixerThread, mixer_thread, 0,
 	                        reinterpret_cast<char*>(&s_async),
 	                        s_async.mixerStack + sizeof(s_async.mixerStack),
 	                        sizeof(s_async.mixerStack), kMixerPriority,
-	                        OS_THREAD_ATTRIB_AFFINITY_CPU0)) {
+	                        mixCore2 ? (1u << 2) : OS_THREAD_ATTRIB_AFFINITY_CPU0)) {
 		s_async.active = false;
 		send_ptr(&s_async.replyQueue, nullptr);
 		sms_wiiu_OSJoinThread(&s_async.replyThread, nullptr);
@@ -478,7 +486,11 @@ bool start_async()
 	s_async.mixerStarted = true;
 	s_async.active = true;
 	#endif
+#ifdef TARGET_WIIU
+	port_log("[audio] DSP HLE mode: asynchronous (mixer core %d, replies core 1)\n", mixCore2 ? 2 : 0);
+#else
 	port_log("[audio] DSP HLE mode: asynchronous (mixer core 0, replies core 1)\n");
+#endif
 	return true;
 }
 

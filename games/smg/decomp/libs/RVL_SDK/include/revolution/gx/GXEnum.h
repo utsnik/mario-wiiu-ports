@@ -392,7 +392,8 @@ typedef enum _GXCompCnt {
   GX_CLR_RGB = 0,
   GX_CLR_RGBA = 1,
   GX_TEX_S = 0,
-  GX_TEX_ST = 1
+  GX_TEX_ST = 1,
+  GX_TEX_STQ = 2
 } GXCompCnt;
 
 typedef enum _GXTevRegID {

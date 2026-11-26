@@ -8,6 +8,7 @@
 #include "JSystem/JParticle/JPAResourceManager.hpp"
 #if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
 #include "wiiu/drawown.h"
+#include "../../../../include/wiiu/jpa_async.h"
 #endif
 
 JPAEmitterManager::JPAEmitterManager(u32 i_ptclNum, u32 i_emtrNum, JKRHeap* pHeap, u8 i_gidMax, u8 i_ridMax) {
@@ -58,7 +59,23 @@ JPABaseEmitter* JPAEmitterManager::createSimpleEmitterID(JGeometry::TVec3< f32 >
     return NULL;
 }
 
+#if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
+/* Profiler scope (profiler.cpp): 1 = particle draw, 2 = particle calc. */
+extern "C" volatile u32 sms_wiiu_prof_scope;
+namespace {
+struct ProfScope {
+    u32 mPrev;
+    explicit ProfScope(u32 scope) : mPrev(sms_wiiu_prof_scope) { sms_wiiu_prof_scope = scope; }
+    ~ProfScope() { sms_wiiu_prof_scope = mPrev; }
+};
+}  // namespace
+#endif
+
 void JPAEmitterManager::calc(u8 group_id) {
+#if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
+    sms_wiiu_jpa_async_join();
+    ProfScope profScope(2);
+#endif
     JSULink< JPABaseEmitter >* pNext = NULL;
     for (JSULink< JPABaseEmitter >* pLink = pEmtrUseList[group_id].getFirst(); pLink != pEmtrUseList[group_id].getEnd(); pLink = pNext) {
         pNext = pLink->getNext();
@@ -72,6 +89,7 @@ void JPAEmitterManager::calc(u8 group_id) {
 
 void JPAEmitterManager::draw(JPADrawInfo const* drawInfo, u8 group_id) {
 #if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
+    ProfScope profScope(1);
     sms_wiiu_drawown_push_kind(SMS_WIIU_DRAWOWN_JPA);
 #endif
     drawInfo->getCamMtx(pWd->mPosCamMtx);
@@ -109,6 +127,9 @@ void JPAEmitterManager::draw(JPADrawInfo const* drawInfo, u8 group_id) {
 }
 
 void JPAEmitterManager::forceDeleteEmitter(JPABaseEmitter* emtr) {
+#if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
+    sms_wiiu_jpa_async_join();
+#endif
     emtr->deleteAllParticle();
     emtr->setStatus(0x300);
     pEmtrUseList[emtr->getGroupID()].remove(&emtr->mLink);

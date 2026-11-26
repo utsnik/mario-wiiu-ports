@@ -1,6 +1,8 @@
 #include "Game/Scene/GameScene.hpp"
 #if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
 extern "C" void smg_wiiu_gpucat_mark(int begin, int category);
+extern "C" int smg_wiiu_warp_teleport(float* xyz);
+extern "C" void smg_wiiu_warp_teleport_done(void);
 #endif
 #include "Game/Player/MarioAccess.hpp"
 #include "Game/LiveActor/HitSensor.hpp"
@@ -210,6 +212,24 @@ void GameScene::update() {
 #endif
     mPauseCtrl->updateNerve();
     updateNerve();
+#if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
+    {
+        // Warp marker teleport (test shortcut): once play has run 3 s with no demo or talk, move Mario once.
+        static int sFreeFrames = 0;
+        float tp[3];
+        if (smg_wiiu_warp_teleport(tp)) {
+            if (isNerve(GET_NERVE(GameScene, GameSceneAction)) && !MR::isStageFileSelect() && !MR::isDemoActive() && !MR::isSystemTalking()) {
+                if (++sFreeFrames >= 180) {
+                    smg_wiiu_warp_teleport_done();
+                    MR::setPlayerPosAndWait(TVec3f(tp[0], tp[1], tp[2]));
+                    port_log("[warp] teleported to %.1f %.1f %.1f", tp[0], tp[1], tp[2]);
+                }
+            } else {
+                sFreeFrames = 0;
+            }
+        }
+    }
+#endif
 #ifdef TARGET_PC
     {
         // Debug: PETARI_STAGE="Galaxy[:scenario]" enters that galaxy once

@@ -81,6 +81,10 @@ extern "C" {
 WPADExtensionCallback WPADSetExtensionCallback(s32, WPADExtensionCallback);
 WPADConnectCallback WPADSetConnectCallback(s32, WPADConnectCallback);
 s32 WPADProbe(s32, u32*);
+void WPADControlMotor(s32, u32);
+#if defined(TARGET_WIIU)
+void __wrap_WPADControlMotor(s32, u32);
+#endif
 }
 """
 
@@ -120,6 +124,9 @@ enum {
 };
 
 extern "C" {
+int64_t sms_wiiu_OSGetTime(void);
+uint32_t sms_wiiu_spin_frames_since_press(void);
+void sms_wiiu_input_stop_motors(void);
 void KPADInit(void);
 void KPADReset(void);
 void KPADSetAccParam(int32_t, float, float);
@@ -130,6 +137,10 @@ void KPADSetPosParam(int32_t, float, float);
 void KPADSetSensorHeight(int32_t, float);
 s32 KPADRead(int32_t, KPADStatus*, uint32_t);
 uint32_t KPADReadEx(int32_t, KPADStatus*, uint32_t, KPADError*);
+#if defined(TARGET_WIIU)
+void __wrap_KPADInit(void);
+uint32_t __wrap_KPADReadEx(int32_t, KPADStatus*, uint32_t, KPADError*);
+#endif
 }
 """
 
@@ -142,6 +153,7 @@ typedef int VPADChan;
 typedef enum VPADReadError {
     VPAD_READ_SUCCESS = 0,
     VPAD_READ_NO_SAMPLES = -1,
+    VPAD_READ_ERROR = -2,
 } VPADReadError;
 enum {
     VPAD_CHAN_0 = 0,
@@ -160,6 +172,7 @@ enum {
     VPAD_BUTTON_ZR = 0x0040,
     VPAD_BUTTON_L = 0x0020,
     VPAD_BUTTON_R = 0x0010,
+    VPAD_BUTTON_STICK_R = 0x00020000,
 };
 typedef struct VPADVec2D { float x, y; } VPADVec2D;
 typedef struct VPADVec3D { float x, y, z; } VPADVec3D;
@@ -182,6 +195,8 @@ extern "C" int32_t VPADRead(VPADChan, VPADStatus*, uint32_t, VPADReadError*);
 extern "C" void VPADInit(void);
 extern "C" void VPADGetTPCalibratedPoint(VPADChan, VPADTouchData*,
                                            const VPADTouchData*);
+extern "C" void VPADControlMotor(VPADChan, const uint8_t*, uint32_t);
+extern "C" void VPADStopMotor(VPADChan);
 """
 
 
@@ -192,10 +207,12 @@ HARNESS = r"""
 #include <cstdarg>
 #include <cstdlib>
 #include <cstring>
+#include <cmath>
 #include <string>
 
 static uint32_t g_field;
 static uint32_t g_vpad_hold;
+static bool g_vpad_error;
 static float g_stick_x;
 static float g_stick_y;
 static float g_right_stick_x;
@@ -207,9 +224,21 @@ static uint16_t g_touch_validity;
 static float g_gyro_x;
 static float g_gyro_y;
 static int g_calibrated_calls;
+static int g_vpad_motor_calls;
+static int g_vpad_stop_calls;
+static int g_real_motor_calls;
+static int g_last_real_motor_chan;
+static uint32_t g_last_real_motor_command;
 static std::string g_root;
 static std::string g_log;
 static volatile unsigned char g_stack_sink;
+extern "C" { volatile int sms_wiiu_shot_request = 0; }
+extern "C" int sms_wiiu_sd_marker(const char*);
+
+static bool g_menu_context;
+namespace MR {
+bool isStarPointer2PTransparencyMode() { return g_menu_context; }
+}
 
 extern "C" const char* sms_wiiu_app_root(void) { return g_root.c_str(); }
 extern "C" int sms_wiiu_sd_marker(const char* name) {
@@ -220,6 +249,11 @@ extern "C" int sms_wiiu_sd_marker(const char* name) {
     return 1;
 }
 extern "C" uint32_t sms_wiiu_frame_count(void) { return g_field; }
+extern "C" int64_t sms_wiiu_OSGetTime(void) {
+    static int64_t ticks = 0;
+    ticks += 1035937;
+    return ticks;
+}
 extern "C" void port_log(const char* fmt, ...) {
     char line[512];
     va_list args;
@@ -233,6 +267,10 @@ extern "C" int32_t VPADRead(VPADChan, VPADStatus* status, uint32_t count,
                               VPADReadError* error) {
     if (!status || !count) {
         if (error) *error = VPAD_READ_NO_SAMPLES;
+        return 0;
+    }
+    if (g_vpad_error) {
+        if (error) *error = VPAD_READ_ERROR;
         return 0;
     }
     std::memset(status, 0, sizeof(*status));
@@ -256,6 +294,82 @@ extern "C" void VPADGetTPCalibratedPoint(VPADChan, VPADTouchData* output,
     ++g_calibrated_calls;
     *output = *input;
 }
+extern "C" void VPADControlMotor(VPADChan, const uint8_t* pattern, uint32_t length) {
+    if (!pattern || length != 120) std::abort();
+    ++g_vpad_motor_calls;
+}
+extern "C" void VPADStopMotor(VPADChan) { ++g_vpad_stop_calls; }
+
+#if defined(TARGET_WIIU)
+extern "C" void __real_KPADInit(void) {}
+extern "C" void __real_WPADInit(void) {}
+extern "C" void __real_KPADReset(void) {}
+extern "C" void __real_KPADSetAccParam(int32_t, float, float) {}
+extern "C" void __real_KPADSetBtnRepeat(int32_t, float, float) {}
+extern "C" void __real_KPADSetDistParam(int32_t, float, float) {}
+extern "C" void __real_KPADSetHoriParam(int32_t, float, float) {}
+extern "C" void __real_KPADSetPosParam(int32_t, float, float) {}
+extern "C" void __real_KPADSetSensorHeight(int32_t, float) {}
+static int g_real_mode;
+static bool g_real_buttons = true;
+static bool g_real_stick = true;
+static bool g_real_shake;
+
+static void put_float(unsigned char* bytes, size_t offset, float value) {
+    std::memcpy(bytes + offset, &value, sizeof(value));
+}
+static void put_u32(unsigned char* bytes, size_t offset, uint32_t value) {
+    std::memcpy(bytes + offset, &value, sizeof(value));
+}
+
+extern "C" uint32_t __real_KPADReadEx(int32_t chan, void* data, uint32_t count,
+                                       int32_t* error) {
+    if (!data || !count || chan != WPAD_CHAN0 || !g_real_mode) {
+        if (error) *error = g_real_mode ? -2 : KPAD_ERROR_NO_SAMPLES;
+        return 0;
+    }
+    unsigned char* bytes = static_cast<unsigned char*>(data);
+    std::memset(bytes, 0, 0xf0);
+    if (g_real_mode != 3 && g_real_buttons) {
+        put_u32(bytes, 0x00, 0x0800u);
+        put_u32(bytes, 0x04, 0x0800u);
+    }
+    put_float(bytes, 0x0c, 0.5f);
+    put_float(bytes, 0x10, -1.0f);
+    put_float(bytes, 0x14, 0.25f);
+    put_float(bytes, 0x18, 1.1f);
+    put_float(bytes, 0x1c, g_real_shake ? 1.75f : 0.25f);
+    put_float(bytes, 0x20, 0.5f);
+    put_float(bytes, 0x24, -0.5f);
+    put_float(bytes, 0x28, 0.05f);
+    put_float(bytes, 0x2c, -0.03f);
+    put_float(bytes, 0x30, 0.06f);
+    put_float(bytes, 0x34, 1.0f);
+    bytes[0x5c] = g_real_mode == 3 ? 0x1f : 0x01;
+    bytes[0x5d] = 0;
+    bytes[0x5e] = g_real_mode == 2 ? 0 : 2;
+    bytes[0x5f] = g_real_mode == 3 ? 0x16 : 0x05;
+    if (g_real_mode == 3) {
+        put_u32(bytes, 0x60, 0x10u | 0x08u | 0x20u);
+        put_u32(bytes, 0x64, 0x10u);
+        put_float(bytes, 0x6c, 0.5f);
+        put_float(bytes, 0x70, -0.25f);
+        put_float(bytes, 0x74, 0.5f);
+    } else {
+        put_u32(bytes, 0x7c, g_real_buttons ? 0x2000u | 0x4000u | 0x0005u : 0x0005u);
+        put_u32(bytes, 0x80, g_real_buttons ? 0x2000u | 0x4000u : 0);
+        put_float(bytes, 0x60, g_real_stick ? -0.75f : 0.0f);
+        put_float(bytes, 0x64, g_real_stick ? 0.25f : 0.0f);
+    }
+    if (error) *error = KPAD_ERROR_OK;
+    return 1;
+}
+extern "C" void __real_WPADControlMotor(int32_t chan, uint32_t command) {
+    ++g_real_motor_calls;
+    g_last_real_motor_chan = chan;
+    g_last_real_motor_command = command;
+}
+#endif
 
 static void fail(const char* message) {
     std::fprintf(stderr, "input-host: FAIL: %s\n", message);
@@ -264,6 +378,10 @@ static void fail(const char* message) {
 
 static void check(bool condition, const char* message) {
     if (!condition) fail(message);
+}
+
+static void near(float actual, float expected, const char* message) {
+    check(std::fabs(actual - expected) < 0.01f, message);
 }
 
 static void clobber_stack() {
@@ -276,7 +394,11 @@ static void clobber_stack() {
 static KPADStatus read_status() {
     KPADStatus status{};
     KPADError error = KPAD_ERROR_NO_SAMPLES;
+#if defined(TARGET_WIIU)
+    check(__wrap_KPADReadEx(WPAD_CHAN0, &status, 1, &error) == 1, "KPADReadEx sample");
+#else
     check(KPADReadEx(WPAD_CHAN0, &status, 1, &error) == 1, "KPADReadEx sample");
+#endif
     check(error == KPAD_ERROR_OK, "KPADReadEx status");
     return status;
 }
@@ -284,7 +406,8 @@ static KPADStatus read_status() {
 static int g_extension_calls;
 static int g_connect_calls;
 static void extension_callback(int32_t chan, int32_t result) {
-    check(chan == WPAD_CHAN0 && result == WPAD_DEV_FREESTYLE, "extension callback");
+    check(chan == WPAD_CHAN0 && (result == WPAD_DEV_FREESTYLE || result == 2 || result == 31),
+          "extension callback");
     ++g_extension_calls;
 }
 static void connect_callback(int32_t chan, int32_t result) {
@@ -295,7 +418,12 @@ static void connect_callback(int32_t chan, int32_t result) {
 int main(int argc, char** argv) {
     check(argc == 2, "usage");
     g_root = std::string(argv[1]) + "/";
+    const bool tap_shoot = sms_wiiu_sd_marker("notapshoot") == 0;
+#if defined(TARGET_WIIU)
+    __wrap_KPADInit();
+#else
     KPADInit();
+#endif
     WPADSetConnectCallback(WPAD_CHAN0, connect_callback);
     WPADSetExtensionCallback(WPAD_CHAN0, extension_callback);
 
@@ -370,6 +498,14 @@ int main(int argc, char** argv) {
     check(status.ex_status.fs.stick.x < -0.7f, "VPAD stick mapping");
     check(status.trig & WPAD_BUTTON_A, "VPAD trigger mapping");
 
+    g_vpad_hold = 0;
+    g_stick_x = 0.05f;
+    g_stick_y = -0.11f;
+    g_field = 21;
+    status = read_status();
+    check(status.ex_status.fs.stick.x == 0.0f && status.ex_status.fs.stick.y == 0.0f,
+          "resting GamePad stick deadzone");
+
     g_vpad_hold = VPAD_BUTTON_A | VPAD_BUTTON_B | VPAD_BUTTON_X | VPAD_BUTTON_Y |
                   VPAD_BUTTON_ZR | VPAD_BUTTON_ZL | VPAD_BUTTON_L;
     g_stick_x = 0.25f;
@@ -379,18 +515,39 @@ int main(int argc, char** argv) {
     g_gyro_y = 0.0f;
     g_field = 25;
     status = read_status();
-    check((status.hold & (WPAD_BUTTON_A | WPAD_BUTTON_B | WPAD_BUTTON_1 |
-                          WPAD_BUTTON_2 | WPAD_BUTTON_Z | WPAD_BUTTON_C)) ==
-              (WPAD_BUTTON_A | WPAD_BUTTON_B | WPAD_BUTTON_1 | WPAD_BUTTON_2 |
-               WPAD_BUTTON_Z | WPAD_BUTTON_C),
+    check((status.hold & (WPAD_BUTTON_A | WPAD_BUTTON_B | WPAD_BUTTON_Z |
+                          WPAD_BUTTON_C)) ==
+              (WPAD_BUTTON_A | WPAD_BUTTON_B | WPAD_BUTTON_Z | WPAD_BUTTON_C) &&
+              !(status.hold & (WPAD_BUTTON_1 | WPAD_BUTTON_2)),
           "GamePad A/ZR/ZL/L/Y/X mapping");
     check(status.ex_status.fs.stick.x > 0.2f && status.ex_status.fs.stick.y < -0.4f,
           "GamePad left-stick mapping");
+    check((status.hold & WPAD_BUTTON_HOME) == 0, "unpressed HOME stays clear");
+    check(sms_wiiu_spin_frames_since_press() == 0,
+          "GamePad Y/X starts a spin without Wii button 1/2");
     std::puts("input-host: PASS: GamePad A/ZR/ZL/L/Y/X and left-stick mappings");
 
+    g_vpad_hold = VPAD_BUTTON_UP | VPAD_BUTTON_DOWN | VPAD_BUTTON_LEFT |
+                  VPAD_BUTTON_RIGHT | VPAD_BUTTON_PLUS | VPAD_BUTTON_MINUS |
+                  VPAD_BUTTON_HOME;
+    g_stick_x = 1.0f;
+    g_stick_y = -1.0f;
+    g_field = 26;
+    status = read_status();
+    check((status.hold & (WPAD_BUTTON_UP | WPAD_BUTTON_DOWN | WPAD_BUTTON_LEFT |
+                          WPAD_BUTTON_RIGHT | WPAD_BUTTON_PLUS | WPAD_BUTTON_MINUS |
+                          WPAD_BUTTON_HOME)) ==
+              (WPAD_BUTTON_UP | WPAD_BUTTON_DOWN | WPAD_BUTTON_LEFT |
+               WPAD_BUTTON_RIGHT | WPAD_BUTTON_PLUS | WPAD_BUTTON_MINUS |
+               WPAD_BUTTON_HOME), "GamePad D-pad, system, and menu mapping");
+    near(status.ex_status.fs.stick.x, 1.0f, "full right stick coordinate");
+    near(status.ex_status.fs.stick.y, -1.0f, "full down stick coordinate");
+    check(sms_wiiu_spin_frames_since_press() == 1,
+          "spin ages after Y/X release");
+
     g_vpad_hold = 0;
-    g_touch_x = 427;
-    g_touch_y = 240;
+    g_touch_x = 640;
+    g_touch_y = 360;
     g_touch_touched = 1;
     g_touch_validity = VPAD_VALID;
     g_gyro_x = 0.75f;
@@ -407,6 +564,22 @@ int main(int argc, char** argv) {
         ++touch_log_count;
     check(touch_log_count == 1, "touch source diagnostic is edge-triggered");
 
+    g_touch_x = 0;
+    g_touch_y = 0;
+    status = read_status();
+    near(status.pos.x, -1.0f, "touch left edge converts to normalized x");
+    near(status.pos.y, -1.0f, "touch top edge converts to normalized y");
+    g_touch_x = 1280;
+    g_touch_y = 720;
+    status = read_status();
+    near(status.pos.x, 1.0f, "touch right edge converts to normalized x");
+    near(status.pos.y, 1.0f, "touch bottom edge converts to normalized y");
+    g_touch_x = 640;
+    g_touch_y = 360;
+    status = read_status();
+    near(status.pos.x, 0.0f, "touch returns to horizontal center");
+    near(status.pos.y, 0.0f, "touch returns to vertical center");
+
     g_touch_touched = 0;
     g_touch_validity = 1;
     g_gyro_x = 2.0f;
@@ -421,8 +594,8 @@ int main(int argc, char** argv) {
     g_right_stick_y = -1.0f;
     g_field = 32;
     status = read_status();
-    check(status.dpd_valid_fg == 2 && status.pos.x > 0.02f && status.pos.x < 0.03f &&
-              status.pos.y > 0.02f && status.pos.y < 0.03f,
+    check(status.dpd_valid_fg == 2 && status.pos.x > 0.02f && status.pos.x < 1.0f &&
+              status.pos.y > 0.02f && status.pos.y < 1.0f,
           "right stick starts a normalized pointer");
     g_right_stick_x = 0.0f;
     g_right_stick_y = 0.0f;
@@ -430,6 +603,24 @@ int main(int argc, char** argv) {
     status = read_status();
     check(status.pos.x > 0.02f && status.pos.y > 0.02f,
           "right-stick pointer persists after release");
+    g_touch_touched = 1;
+    g_touch_validity = VPAD_VALID;
+    g_touch_x = 0;
+    g_touch_y = 360;
+    g_right_stick_x = 1.0f;
+    g_right_stick_y = 0.0f;
+    status = read_status();
+    near(status.pos.x, -1.0f, "touch overrides moving right stick");
+    near(status.pos.y, 0.0f, "touch retakes pointer vertical center");
+    g_touch_touched = 0;
+    g_touch_validity = 1;
+    g_right_stick_x = 0.0f;
+    status = read_status();
+    check(status.pos.x < -0.9f && ((status.trig & WPAD_BUTTON_B) != 0) == tap_shoot,
+          "touch tap stays at the touched spot and follows the shoot toggle");
+    for (int frame = 0; frame < 3; ++frame)
+        status = read_status();
+    check(status.pos.x < -0.9f, "pointer stays where the finger lifted (no snap back to the stick)");
     g_field = 34;
     KPADStatus five_frame_status{};
     for (int frame = 0; frame < 5; ++frame) {
@@ -441,7 +632,8 @@ int main(int argc, char** argv) {
     g_gyro_y = -0.25f;
     g_field = 38;
     status = read_status();
-    check(status.pos.x > 0.02f && status.pos.y > 0.02f &&
+    check(std::fabs(status.pos.x - five_frame_status.pos.x) < 0.001f &&
+              std::fabs(status.pos.y - five_frame_status.pos.y) < 0.001f &&
               (status.hold & (WPAD_BUTTON_A | WPAD_BUTTON_B | WPAD_BUTTON_Z |
                               WPAD_BUTTON_C)) == 0,
           "R does not disturb the right-stick pointer or Wii buttons");
@@ -453,6 +645,192 @@ int main(int argc, char** argv) {
     status = read_status();
     check((status.hold & WPAD_BUTTON_A) && !(status.trig & WPAD_BUTTON_A),
           "pointer A is not a repeating trigger");
+
+    near((300.0f - 16.4988f) / 1247.0023f * 2.0f - 1.0f,
+         -0.545308f, "DRC mapping uses the 16:9 viewport in calibrated 1280x720 units");
+    g_vpad_hold = 0;
+    g_touch_x = 300;
+    g_touch_y = 180;
+    g_touch_touched = 1;
+    g_touch_validity = VPAD_VALID;
+    g_field = 41;
+    status = read_status();
+    g_touch_touched = 0;
+    g_touch_validity = 1;
+    g_field = 42;
+    status = read_status();
+    check(((status.trig & WPAD_BUTTON_B) != 0) == tap_shoot &&
+              (status.trig & WPAD_BUTTON_A) == 0,
+          "short gameplay tap routes to the setting-controlled B trigger");
+    near(status.pos.x, -0.545673f, "gameplay tap keeps the touched pointer x");
+
+    g_menu_context = true;
+    g_touch_x = 700;
+    g_touch_y = 120;
+    g_touch_touched = 1;
+    g_touch_validity = VPAD_VALID;
+    g_field = 43;
+    status = read_status();
+    g_touch_touched = 0;
+    g_touch_validity = 1;
+    g_field = 44;
+    status = read_status();
+    check((status.trig & WPAD_BUTTON_A) && !(status.trig & WPAD_BUTTON_B),
+          "short menu tap routes to A through the game state predicate");
+    g_menu_context = false;
+
+    g_touch_x = 300;
+    g_touch_y = 200;
+    g_touch_touched = 1;
+    g_touch_validity = VPAD_VALID;
+    g_field = 45;
+    status = read_status();
+    g_touch_x = 320;
+    g_field = 46;
+    status = read_status();
+    g_touch_touched = 0;
+    g_touch_validity = 1;
+    g_field = 47;
+    status = read_status();
+    check(!(status.trig & (WPAD_BUTTON_A | WPAD_BUTTON_B)),
+          "moving touch drag is pointer-only");
+
+    g_right_stick_x = 0.0f;
+    g_right_stick_y = 0.0f;
+    for (g_field = 48; g_field < 270; ++g_field)
+        status = read_status();
+    check(status.dpd_valid_fg == 0, "pointer auto-hides after 3.5 seconds");
+    g_right_stick_x = 1.0f;
+    g_field = 270;
+    status = read_status();
+    check(status.dpd_valid_fg == 2, "right-stick movement immediately unhides pointer");
+    g_right_stick_x = 0.0f;
+#if defined(TARGET_WIIU)
+    g_vpad_hold = 0;
+    g_stick_x = 0.0f;
+    g_stick_y = 0.0f;
+    g_right_stick_x = 0.0f;
+    g_right_stick_y = 0.0f;
+    g_real_mode = 1;
+    g_field = 50;
+    status = read_status();
+    check(g_connect_calls == 2 && g_extension_calls == 2,
+          "real controller hot-plug callbacks");
+    check((status.hold & (WPAD_BUTTON_A | WPAD_BUTTON_Z | WPAD_BUTTON_C)) ==
+              (WPAD_BUTTON_A | WPAD_BUTTON_Z | WPAD_BUTTON_C),
+          "Wii Remote and Nunchuk buttons pass through");
+    check(!(status.hold & (WPAD_BUTTON_LEFT | WPAD_BUTTON_RIGHT | WPAD_BUTTON_UP |
+                           WPAD_BUTTON_DOWN)),
+          "Nunchuk stick emulation bits never reach the D-pad");
+    near(status.ex_status.fs.stick.x, -0.75f, "Nunchuk stick x pass-through");
+    near(status.ex_status.fs.stick.y, 0.25f, "Nunchuk stick y pass-through");
+    near(status.pos.x, 0.5f, "KPAD IR x normalized for 16:9 output");
+    near(status.pos.y, -0.5f, "KPAD IR y normalized for 16:9 output");
+    near(status.acc.x, 0.5f, "Wii Remote acceleration x pass-through");
+    check(status.acc_speed > 0.2f, "Wii Remote acceleration variation pass-through");
+    int real_motor_calls = g_real_motor_calls;
+    __wrap_WPADControlMotor(WPAD_CHAN0, WPAD_MOTOR_RUMBLE);
+    check(g_real_motor_calls == real_motor_calls + 1 &&
+              g_last_real_motor_chan == WPAD_CHAN0 &&
+              g_last_real_motor_command == WPAD_MOTOR_RUMBLE,
+          "real Wii Remote WPAD rumble forwards to wut");
+    __wrap_WPADControlMotor(WPAD_CHAN0, WPAD_MOTOR_STOP);
+    int real_stops = g_real_motor_calls;
+    sms_wiiu_input_stop_motors();
+    check(g_real_motor_calls == real_stops + 1 &&
+              g_last_real_motor_command == WPAD_MOTOR_STOP && g_vpad_stop_calls > 0,
+          "stop all motors on exit or foreground release");
+
+    g_vpad_hold = VPAD_BUTTON_X;
+    g_field = 51;
+    status = read_status();
+    check(sms_wiiu_spin_frames_since_press() == 0,
+          "GamePad X spins while a Wii Remote is connected");
+
+    g_vpad_hold = VPAD_BUTTON_B;
+    g_field = 52;
+    status = read_status();
+    check(status.hold & WPAD_BUTTON_B, "GamePad takes arbitration after newer input");
+    check(!(status.hold & WPAD_BUTTON_Z), "GamePad arbitration drops older Nunchuk hold");
+
+    g_real_buttons = false;
+    g_real_stick = false;
+    g_real_mode = 1;
+    g_vpad_hold = VPAD_BUTTON_B;
+    g_field = 53;
+    status = read_status();
+    check(status.hold & WPAD_BUTTON_B, "GamePad activity wins over a resting Wii Remote");
+    g_vpad_hold = 0;
+    g_field = 54;
+    status = read_status();
+    near(status.acc.x, 0.0f, "accelerometer noise does not steal player 1");
+
+    g_real_buttons = true;
+    g_real_stick = true;
+    g_vpad_hold = 0;
+    g_real_mode = 2;
+    g_field = 55;
+    status = read_status();
+    check(status.dpd_valid_fg == 0 && status.pos.x == 0.0f && status.pos.y == 0.0f,
+          "invalid IR does not produce a pointer");
+
+    g_real_mode = 3;
+    g_field = 56;
+    status = read_status();
+    check(status.hold & (WPAD_BUTTON_A | WPAD_BUTTON_B),
+          "Pro Controller A and ZR use GamePad shoot mapping");
+    check(!(status.hold & (WPAD_BUTTON_1 | WPAD_BUTTON_2)),
+          "Pro Controller X/Y are spin-only");
+    near(status.ex_status.fs.stick.x, 0.5f, "Pro Controller left stick x mapping");
+    check(sms_wiiu_spin_frames_since_press() == 0, "Pro Controller X/Y starts spin");
+
+    g_vpad_hold = VPAD_BUTTON_A;
+    g_vpad_error = false;
+    g_field = 57;
+    status = read_status();
+    check(status.hold & WPAD_BUTTON_A, "GamePad remains player 1 while readable");
+    g_vpad_error = true;
+    g_field = 58;
+    status = read_status();
+    check(status.hold & (WPAD_BUTTON_A | WPAD_BUTTON_B),
+          "Pro Controller takes player 1 when GamePad read errors");
+    near(status.ex_status.fs.stick.x, 0.5f,
+         "Pro Controller stick survives GamePad read error");
+    g_vpad_error = false;
+    g_vpad_hold = 0;
+
+    g_real_mode = 1;
+    g_real_buttons = false;
+    g_real_shake = false;
+    g_field = 59;
+    status = read_status();
+    g_real_shake = true;
+    g_field = 60;
+    status = read_status();
+    check(sms_wiiu_spin_frames_since_press() == 0, "synthetic Wii Remote shake starts spin");
+    check(g_log.find("[smg-input] shake chan 0 g=") != std::string::npos,
+          "Wii Remote shake is logged");
+    g_real_shake = false;
+    g_field = 61;
+    status = read_status();
+    check(sms_wiiu_spin_frames_since_press() == 1, "shake spin ages after release");
+
+    g_real_mode = 0;
+    g_real_buttons = true;
+    g_vpad_hold = VPAD_BUTTON_A;
+    g_field = 62;
+    status = read_status();
+    int gamepad_motor_calls = g_vpad_motor_calls;
+    __wrap_WPADControlMotor(WPAD_CHAN0, WPAD_MOTOR_RUMBLE);
+    check(g_vpad_motor_calls == gamepad_motor_calls + 1,
+          "GamePad WPAD rumble starts VPAD motor");
+    for (g_field = 100; g_field < 700; ++g_field)
+        status = read_status();
+    check(g_vpad_motor_calls >= gamepad_motor_calls + 2,
+          "held GamePad rumble is re-armed");
+    __wrap_WPADControlMotor(WPAD_CHAN0, WPAD_MOTOR_STOP);
+    check(g_vpad_stop_calls > 0, "GamePad WPAD stop stops VPAD motor");
+#endif
     std::puts("input-host: PASS: touchscreen/right-stick pointer; gyro off by default; five-frame DPD validity");
 
     check(g_log.find("[smg-input] autoplay: press a field 2") != std::string::npos,
@@ -472,6 +850,12 @@ int main(int argc, char** argv) {
               std::string::npos,
           "pointer y clamp log");
     check(g_log.find("unknown") != std::string::npos, "unknown-token log");
+    check(g_log.find("[smg-input] tap ") != std::string::npos &&
+              g_log.find("-> A") != std::string::npos &&
+              g_log.find("-> none") != std::string::npos,
+          "touch tap, menu routing, and drag diagnostics are bounded and logged");
+    check((g_log.find("touch_tap_shoot on") != std::string::npos) == tap_shoot,
+          "touch_tap_shoot follows the notapshoot marker");
     std::puts("input-host: PASS: real input.cpp; callbacks, edges, pointer, VPAD mapping");
     return 0;
 }
@@ -502,6 +886,7 @@ def host_check(provider: Path) -> str:
         compile_result = subprocess.run(
             [
                 "g++", "-std=c++17", "-Wall", "-Wextra", "-Werror",
+                "-DTARGET_WIIU",
                 "-I", str(include), "-I", str(provider.parent),
                 str(provider), str(harness), "-o", str(executable),
             ],
@@ -513,15 +898,29 @@ def host_check(provider: Path) -> str:
                 "host harness compile failed:\n"
                 + compile_result.stdout + compile_result.stderr
             )
-        run_result = subprocess.run(
-            [str(executable), str(root)], capture_output=True, text=True
-        )
-        output = run_result.stdout + run_result.stderr
-        if run_result.returncode:
-            raise RuntimeError(
-                f"host harness failed ({run_result.returncode}):\n{output.rstrip()}"
+
+        def run_harness(test_root: Path) -> str:
+            result = subprocess.run(
+                [str(executable), str(test_root)], capture_output=True, text=True
             )
-        return output.rstrip()
+            output = result.stdout + result.stderr
+            if result.returncode:
+                raise RuntimeError(
+                    f"host harness failed ({result.returncode}) for {test_root}:\n"
+                    + output.rstrip()
+                )
+            return output.rstrip()
+
+        output = run_harness(root)
+        disabled_root = root / "notapshoot-test"
+        disabled_root.mkdir()
+        (disabled_root / "autopress").write_text("", encoding="utf-8")
+        (disabled_root / "smg-autoplay").write_text(
+            (root / "smg-autoplay").read_text(encoding="utf-8"), encoding="utf-8"
+        )
+        (disabled_root / "notapshoot").write_text("", encoding="utf-8")
+        disabled_output = run_harness(disabled_root)
+        return output + "\n" + disabled_output
 
 
 def main() -> int:
@@ -587,7 +986,7 @@ def main() -> int:
         output = host_check(args.provider)
     except RuntimeError as exc:
         return fail(str(exc))
-    print("input: PASS: connected Wii Remote+Nunchuk; A/B/stick autoplay mapped")
+    print("input: PASS: emulated KPAD Nunchuk; A/B/stick autoplay mapped")
     print(output)
     return 0
 

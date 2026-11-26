@@ -23,6 +23,8 @@
 
 #if defined(PORT_GAME_SMG)
 extern "C" void sms_wiiu_jpa_diag_stage_tick(void);
+// Set by scoped game code (JPAEmitterManager draw = 1, calc = 2) for [prof] sc.
+extern "C" { volatile uint32_t sms_wiiu_prof_scope = 0; }
 extern "C" void sms_wiiu_jpa_diag_flush(void);
 #endif
 
@@ -52,6 +54,8 @@ constexpr uint32_t kLeafSlots = 1024;
 constexpr uint32_t kCallSlots = 1024;
 constexpr uint32_t kThreads = 16;
 constexpr uint32_t kIncSlots = 4096;
+constexpr uint32_t kScopes = 2;
+constexpr uint32_t kScopeSlots = 1024;
 constexpr uint32_t kStackStartOffset = 0x394;  // OSThread::stackStart (the top)
 constexpr uint32_t kStackEndOffset = 0x398;    // OSThread::stackEnd (the bottom)
 
@@ -76,6 +80,10 @@ struct Table {
 	// is blocked or waiting).
 	uint32_t bkPc[kIncSlots], bkCount[kIncSlots];
 	uint32_t blocked;
+	// Main-thread leaf PCs while sms_wiiu_prof_scope is set (1 = particle
+	// draw, 2 = particle calc): what a scoped subsystem spends its time in.
+	uint32_t scPc[kScopes][kScopeSlots], scCount[kScopes][kScopeSlots];
+	uint32_t scTotal[kScopes], scDropped;
 };
 
 alignas(64) uint8_t s_alarm[0x80];
@@ -113,18 +121,36 @@ inline bool code_addr(uint32_t a) { return a >= 0x01000000u && a < 0x10000000u &
 
 inline bool code_addr_(uint32_t a) { return a >= 0x01000000u && a < 0x10000000u && !(a & 3); }
 
+// A recursive function (J3DJoint::recursiveCalc, lyt Pane::Draw) has one stack
+// frame per level: count each function once per sample, or its inclusive share
+// is multiplied by the recursion depth. Call sites of one function sit within
+// a few hundred bytes, so a return address that close to one already counted
+// is treated as the same function.
+inline bool seen_near(const uint32_t* seen, uint32_t n, uint32_t ret)
+{
+	for (uint32_t i = 0; i < n; ++i) {
+		const uint32_t d = seen[i] > ret ? seen[i] - ret : ret - seen[i];
+		if (d < 0x100u) return true;
+	}
+	return false;
+}
+
 void count_inclusive(Table& t, const uint8_t* ctx)
 {
 	const uint32_t top = *reinterpret_cast<const uint32_t*>(ctx + kStackStartOffset);
 	const uint32_t bottom = *reinterpret_cast<const uint32_t*>(ctx + kStackEndOffset);
 	uint32_t sp = *reinterpret_cast<const uint32_t*>(ctx + kSpOffset);
-	for (int depth = 0; depth < 32; ++depth) {
+	uint32_t seen[64];
+	uint32_t nseen = 0;
+	for (int depth = 0; depth < 64; ++depth) {
 		if (sp < bottom || sp + 8 > top || (sp & 3)) return;
 		const uint32_t next = *reinterpret_cast<const volatile uint32_t*>(sp);
 		if (next <= sp || next + 8 > top) return;
 		const uint32_t ret = *reinterpret_cast<const volatile uint32_t*>(next + 4);
 		sp = next;
 		if (!code_addr_(ret)) continue;
+		if (seen_near(seen, nseen, ret)) continue;
+		seen[nseen++] = ret;
 		uint32_t slot = (ret >> 2) * 2654435761u % kIncSlots;
 		for (uint32_t probe = 0;; ++probe, slot = (slot + 1) % kIncSlots) {
 			if (probe == 32) { ++t.incDropped; break; }
@@ -501,7 +527,8 @@ void replay_records(Table& t, uint32_t idx)
 		++t.samples;
 		if (r.main) {
 			++t.main;
-			for (uint32_t d = 0; d < r.depth; ++d) count_inclusive_ret(t, r.ret[d]);
+			for (uint32_t d = 0; d < r.depth; ++d)
+				if (!seen_near(r.ret, d, r.ret[d])) count_inclusive_ret(t, r.ret[d]);
 		}
 		uint32_t tid = 0;
 		for (; tid < kThreads; ++tid) {
@@ -536,6 +563,17 @@ void slow_frame_end(uint32_t logicUs)
 
 #endif
 
+void count_scope(Table& t, uint32_t scope, uint32_t pc)
+{
+	++t.scTotal[scope];
+	uint32_t slot = slot_of(pc, kScopeSlots);
+	for (uint32_t probe = 0; probe < 32; ++probe, slot = (slot + 1) % kScopeSlots) {
+		if (t.scPc[scope][slot] == pc) { ++t.scCount[scope][slot]; return; }
+		if (!t.scPc[scope][slot]) { t.scPc[scope][slot] = pc; t.scCount[scope][slot] = 1; return; }
+	}
+	++t.scDropped;
+}
+
 void sample(Table& t, void* mainThread, void* context)
 {
 #if defined(PORT_GAME_SMG)
@@ -546,6 +584,8 @@ void sample(Table& t, void* mainThread, void* context)
 	if (context == mainThread) {
 		++t.main;
 		count_inclusive(t, static_cast<const uint8_t*>(context));
+		const uint32_t scope = sms_wiiu_prof_scope - 1u;
+		if (scope < kScopes) count_scope(t, scope, pc);
 	}
 	uint32_t tid = 0;
 	for (; tid < kThreads; ++tid) {
@@ -561,8 +601,13 @@ void sample(Table& t, void* mainThread, void* context)
 	++t.dropped;
 }
 
+// Set while a report is being written: resolving ~250 symbols stalls the main
+// thread for 10+ s, and those samples swamped the next table (93.6% in
+// sms_wiiu_profiler_tick, Honeyhive 2026-11-20).  Drop them.
+volatile bool s_reporting;
 void on_alarm(void*, void* context)
 {
+	if (s_reporting) return;
 	Table& t = s_tables[s_active & 1];
 	sample(t, s_mainThread, context);
 #if defined(PORT_GAME_SMG)
@@ -626,6 +671,40 @@ struct Func {
 };
 
 void dump_raw(const char* prefix, const char* tag, uint32_t* pcs, uint32_t* counts, uint32_t slots, uint8_t* tids, uint32_t wantTid, int maxN);
+
+void report_scopes(Table& t)
+{
+	static const char* const kNames[kScopes] = {"jpadraw", "jpacalc"};
+	for (uint32_t sc = 0; sc < kScopes; ++sc) {
+		static Func f[256];
+		uint32_t nf = 0;
+		for (uint32_t i = 0; i < kScopeSlots; ++i) {
+			if (!t.scPc[sc][i]) continue;
+			char name[64] = {};
+			wut_OSGetSymbolName(t.scPc[sc][i], name, sizeof(name));
+			uint32_t k = 0;
+			while (k < nf && std::strcmp(f[k].name, name) != 0) ++k;
+			if (k == nf) {
+				if (nf == 256) continue;
+				std::memcpy(f[k].name, name, sizeof(name));
+				f[k].count = 0;
+				++nf;
+			}
+			f[k].count += t.scCount[sc][i];
+		}
+		port_log("[prof] scope %s samples=%u of main=%u dropped=%u\n", kNames[sc], (unsigned)t.scTotal[sc],
+		         (unsigned)t.main, (unsigned)t.scDropped);
+		for (int rank = 0; rank < 40; ++rank) {
+			uint32_t best = nf;
+			for (uint32_t k = 0; k < nf; ++k)
+				if (f[k].count && (best == nf || f[k].count > f[best].count)) best = k;
+			if (best == nf) break;
+			port_log("[prof] sc %s %5.1f pct %s\n", kNames[sc],
+			         t.scTotal[sc] ? 100.0f * f[best].count / t.scTotal[sc] : 0.0f, f[best].name);
+			f[best].count = 0;
+		}
+	}
+}
 
 void report(Table& t)
 {
@@ -725,8 +804,9 @@ void report(Table& t)
 			}
 			inc[f].count += t.incCount[i];
 		}
+		report_scopes(t);
 		port_log("[prof] inclusive (of %u main-thread samples, dropped %u):\n", (unsigned)t.main, (unsigned)t.incDropped);
-		for (int rank = 0; rank < 45; ++rank) {
+		for (int rank = 0; rank < 90; ++rank) {
 			uint32_t best = ninc;
 			for (uint32_t f = 0; f < ninc; ++f)
 				if (inc[f].count && (best == ninc || inc[f].count > inc[best].count)) best = f;
@@ -829,6 +909,7 @@ extern "C" void sms_wiiu_profiler_tick(void)
 	sms_wiiu_jpa_diag_stage_tick();
 	if (++s_jpaWindowFrames == 30) {
 		sms_wiiu_jpa_finalvx_report();
+		sms_wiiu_jpa_async_report();
 		port_log("[jpa] particles=%u draws=%u splits=%u batched=%u rejType=%u rejCallback=%u rejPrj=%u rejIneligible=%u rejTex=%u rejColorRgb=%u rejColorAlpha=%u rejScale=%u rejPrjMode=%u rejBlendZ=%u rejChild=%u rejOther=%u t2=%u t3=%u t4=%u\n",
 		         (unsigned)s_jpaParticles, (unsigned)s_jpaDraws,
 		         (unsigned)s_jpaSplits, (unsigned)s_jpaBatched,
@@ -894,12 +975,19 @@ extern "C" void sms_wiiu_profiler_tick(void)
 		s_reportThisFrame = true;
 	}
 #endif
+	s_reporting = true;
+	__sync_synchronize();
 	report(s_tables[done]);
 	if (s_wrunning) {
 		const uint32_t wdone = s_wactive & 1;
 		s_wactive = wdone ^ 1;
 		report_worker(s_wtables[wdone]);
 	}
+	// Samples taken before the report started are kept; the stall itself is
+	// not, so start the next table clean of anything counted during it.
+	std::memset(&s_tables[s_active & 1], 0, sizeof(s_tables[0]));
+	__sync_synchronize();
+	s_reporting = false;
 }
 
 #if defined(PORT_GAME_SMG)
@@ -913,6 +1001,44 @@ volatile uint32_t s_jpaFinalVxCheckRuns, s_jpaFinalVxMismatches;
 volatile uint32_t s_jpaFinalVxFallbacks[SMS_WIIU_JPA_FINALVX_FALLBACK_REASON_COUNT];
 volatile uint32_t s_jpaFinalVxFirstMismatchSet;
 char s_jpaFinalVxFirstMismatch[64];
+volatile uint32_t s_jpaAsyncJobs, s_jpaAsyncParticles, s_jpaAsyncHelperBusyUs, s_jpaAsyncWorkerWaitUs;
+volatile uint32_t s_jpaAsyncFallbacks[SMS_WIIU_JPA_ASYNC_FALLBACK_REASON_COUNT];
+
+extern "C" void sms_wiiu_jpa_async_job(unsigned particles)
+{
+	__sync_fetch_and_add(&s_jpaAsyncJobs, 1);
+	__sync_fetch_and_add(&s_jpaAsyncParticles, particles);
+}
+extern "C" void sms_wiiu_jpa_async_helper_busy(unsigned micros)
+{
+	__sync_fetch_and_add(&s_jpaAsyncHelperBusyUs, micros);
+}
+extern "C" void sms_wiiu_jpa_async_worker_wait(unsigned micros)
+{
+	__sync_fetch_and_add(&s_jpaAsyncWorkerWaitUs, micros);
+}
+extern "C" void sms_wiiu_jpa_async_fallback(unsigned reason)
+{
+	if (reason < SMS_WIIU_JPA_ASYNC_FALLBACK_REASON_COUNT)
+		__sync_fetch_and_add(&s_jpaAsyncFallbacks[reason], 1);
+}
+extern "C" void sms_wiiu_jpa_async_report(void)
+{
+	bool active = s_jpaAsyncJobs || s_jpaAsyncParticles || s_jpaAsyncHelperBusyUs || s_jpaAsyncWorkerWaitUs;
+	for (unsigned i = 0; i < SMS_WIIU_JPA_ASYNC_FALLBACK_REASON_COUNT; ++i)
+		if (s_jpaAsyncFallbacks[i]) { active = true; break; }
+	if (!active) return;
+	port_log("[jpaasync] jobs=%u particles=%u helper-busy-us=%u worker-wait-us=%u fallback helper-start=%u queue-full=%u payload=%u slot-busy=%u core=%u\n",
+		(unsigned)__sync_lock_test_and_set(&s_jpaAsyncJobs, 0),
+		(unsigned)__sync_lock_test_and_set(&s_jpaAsyncParticles, 0),
+		(unsigned)__sync_lock_test_and_set(&s_jpaAsyncHelperBusyUs, 0),
+		(unsigned)__sync_lock_test_and_set(&s_jpaAsyncWorkerWaitUs, 0),
+		(unsigned)__sync_lock_test_and_set(&s_jpaAsyncFallbacks[SMS_WIIU_JPA_ASYNC_FALLBACK_HELPER_START], 0),
+		(unsigned)__sync_lock_test_and_set(&s_jpaAsyncFallbacks[SMS_WIIU_JPA_ASYNC_FALLBACK_QUEUE_FULL], 0),
+		(unsigned)__sync_lock_test_and_set(&s_jpaAsyncFallbacks[SMS_WIIU_JPA_ASYNC_FALLBACK_PAYLOAD], 0),
+		(unsigned)__sync_lock_test_and_set(&s_jpaAsyncFallbacks[SMS_WIIU_JPA_ASYNC_FALLBACK_SLOT_BUSY], 0),
+		(unsigned)__sync_lock_test_and_set(&s_jpaAsyncFallbacks[SMS_WIIU_JPA_ASYNC_FALLBACK_CORE], 0));
+}
 
 extern "C" void sms_wiiu_jpa_finalvx_run(unsigned particles, unsigned vertices, unsigned bytes)
 {

@@ -15,7 +15,8 @@ bool ShadowVolumeOval::isDraw() const {
     return controller->isProjected() && controller->isDraw();
 }
 
-void ShadowVolumeOval::loadModelDrawMtx() const {
+u32 ShadowVolumeOval::calcModelDrawMtx(ShadowVolumeModelDrawMtx* pMtx, u32 max) const {
+    if (!pMtx || max == 0) return 0;
     MtxPtr dropMtx;
     ShadowController* controller = getController();
     dropMtx = controller->_18;
@@ -50,7 +51,8 @@ void ShadowVolumeOval::loadModelDrawMtx() const {
     TVec3f localDirection;
     inverseMtx.mult(direction, localDirection);
 
-    TPos3f mtx;
+    TPos3f& mtx = pMtx[0].mMtx;
+    pMtx[0].mIndex = GX_PNMTX0;
     mtx.identity();
     MR::makeMtxUpNoSupport(&mtx, localDirection);
     mtx.concat(scaledMtx, mtx);
@@ -74,7 +76,7 @@ void ShadowVolumeOval::loadModelDrawMtx() const {
     mtx.setXDir(side);
     mtx.setZDir(front);
     PSMTXConcat(MR::getCameraViewMtx(), mtx, mtx);
-    GXLoadPosMtxImm(mtx, 0);
+    return 1;
 }
 
 void ShadowVolumeOval::setSize(const TVec3f& rSize) {

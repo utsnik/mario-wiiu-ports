@@ -1,4 +1,8 @@
 #include "Game/MapObj/EarthenPipe.hpp"
+#if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
+extern "C" int smg_wiiu_warp_teleport_pipe(const float* pos, const float* up);
+static const void* s_warp_forced_pipe;
+#endif
 #include "Game/AudioLib/AudBgmMgr.hpp"
 #include "Game/AudioLib/AudWrap.hpp"
 #include "Game/GameAudio/AudStageBgmTable.hpp"
@@ -116,6 +120,14 @@ void EarthenPipe::init(const JMapInfoIter& rIter) {
     PSMTXCopy(v24, mBottomJointMtx);
     MR::setBaseTRMtx(this, mTopJointMtx);
     MR::connectToSceneMapObjNoCalcAnimStrongLight(this);
+#if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
+    {
+        const float pos[3] = {_8C.x, _8C.y, _8C.z};
+        const float up[3] = {_98.x, _98.y, _98.z};
+        if (smg_wiiu_warp_teleport_pipe(pos, up))
+            s_warp_forced_pipe = this;
+    }
+#endif
 
     if (isWaterPipe) {
         initHitSensor(3);
@@ -230,6 +242,14 @@ bool EarthenPipe::isNerveShowUp() const {
 
 void EarthenPipe::exeWait() {
     if (MR::isValidSwitchA(this)) {
+#if defined(TARGET_WIIU) && defined(PORT_GAME_SMG)
+        // Warp test: turn the pipe's own switch on through the stage switch table (for Gateway pipe 6 that is
+        // global switch 1008, which the caged Luma sets when freed), so everything else on that switch reacts too.
+        if (s_warp_forced_pipe == this && !MR::isOnSwitchA(this)) {
+            MR::onSwitchA(this);
+            port_log("[pipe] warp test: switch A on");
+        }
+#endif
         if (MR::isOnSwitchA(this)) {
             if (!MR::isValidHitSensor(this, "binder")) {
                 MR::validateHitSensors(this);

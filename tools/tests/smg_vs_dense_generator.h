@@ -1,7 +1,7 @@
 /*
  * Host extraction of the generated-VS ALU path in gx2_renderer.cpp.
  *
- * This intentionally uses gx2_shader_inl.h's production packer macros.  The
+ * This intentionally uses latte_asm.h's production packer macros.  The
  * Python test checks the source snapshot hash and the source anchors below so
  * that this dependency-free extraction cannot silently drift from the Wii U
  * generator.
@@ -9,7 +9,7 @@
 #ifndef SMS_TEST_VS_DENSE_GENERATOR_H
 #define SMS_TEST_VS_DENSE_GENERATOR_H
 
-#include "gx2_shader_inl.h"
+#include "latte_asm.h"
 
 #include <cstdint>
 #include <initializer_list>
